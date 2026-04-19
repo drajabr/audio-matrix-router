@@ -299,6 +299,29 @@ function getDeviceLabelParts(label = "") {
   };
 }
 
+function collectConfiguredDeviceIds(matrixByView) {
+  const configuredInputIds = new Set();
+  const configuredOutputIds = new Set();
+
+  Object.entries(matrixByView?.device || {}).forEach(([key, conn]) => {
+    if (!conn?.on) return;
+    const [rowId, colId] = key.split("::");
+    if (rowId?.startsWith("dev:")) configuredInputIds.add(rowId.slice(4));
+    if (colId?.startsWith("dev:")) configuredOutputIds.add(colId.slice(4));
+  });
+
+  Object.entries(matrixByView?.channel || {}).forEach(([key, conn]) => {
+    if (!conn?.on) return;
+    const [rowId, colId] = key.split("::");
+    const rowParsed = parseChannelId(rowId);
+    const colParsed = parseChannelId(colId);
+    if (rowParsed?.deviceId) configuredInputIds.add(rowParsed.deviceId);
+    if (colParsed?.deviceId) configuredOutputIds.add(colParsed.deviceId);
+  });
+
+  return { configuredInputIds, configuredOutputIds };
+}
+
 class AudioMatrixManager {
   constructor() {
     this.context = null;
@@ -663,6 +686,24 @@ export default function App({ runtime = "web" }) {
     modeRef.current = viewMode;
   }, [viewMode]);
 
+  const { configuredInputIds, configuredOutputIds } = useMemo(
+    () => collectConfiguredDeviceIds(matrixByView),
+    [matrixByView],
+  );
+
+  const routedInputs = useMemo(() => {
+    const next = inputs.filter((d) => configuredInputIds.has(d.deviceId));
+    return configuredInputIds.size > 0 ? next : [];
+  }, [inputs, configuredInputIds]);
+
+  const routedOutputs = useMemo(() => {
+    const next = outputs.filter((d) => configuredOutputIds.has(d.deviceId));
+    return configuredOutputIds.size > 0 ? next : [];
+  }, [outputs, configuredOutputIds]);
+
+  const visibleInputs = showAllDevices ? inputs : routedInputs;
+  const visibleOutputs = showAllDevices ? outputs : routedOutputs;
+
   useEffect(() => {
     const root = document.documentElement;
     const background = BACKGROUND_PRESETS[backgroundIndex] || BACKGROUND_PRESETS[0];
@@ -768,7 +809,7 @@ export default function App({ runtime = "web" }) {
 
   const rows = useMemo(() => {
     if (viewMode === "device") {
-      return inputs.map((input) => {
+      return visibleInputs.map((input) => {
         const rawLabel = inputLabels[input.deviceId] || input.label;
         const parts = getDeviceLabelParts(rawLabel);
         return {
@@ -783,7 +824,7 @@ export default function App({ runtime = "web" }) {
       });
     }
 
-    return inputs.flatMap((input) => {
+    return visibleInputs.flatMap((input) => {
       const rawLabel = inputLabels[input.deviceId] || input.label;
       const parts = getDeviceLabelParts(rawLabel);
       return [
@@ -811,11 +852,11 @@ export default function App({ runtime = "web" }) {
         },
       ];
     });
-  }, [inputs, inputLabels, viewMode, inputMasterId]);
+  }, [visibleInputs, inputLabels, viewMode, inputMasterId]);
 
   const cols = useMemo(() => {
     if (viewMode === "device") {
-      return outputs.map((output) => {
+      return visibleOutputs.map((output) => {
         const rawLabel = outputLabels[output.deviceId] || output.label;
         const parts = getDeviceLabelParts(rawLabel);
         return {
@@ -830,7 +871,7 @@ export default function App({ runtime = "web" }) {
       });
     }
 
-    return outputs.flatMap((output) => {
+    return visibleOutputs.flatMap((output) => {
       const rawLabel = outputLabels[output.deviceId] || output.label;
       const parts = getDeviceLabelParts(rawLabel);
       return [
@@ -858,7 +899,7 @@ export default function App({ runtime = "web" }) {
         },
       ];
     });
-  }, [outputs, outputLabels, viewMode, outputMasterId]);
+  }, [visibleOutputs, outputLabels, viewMode, outputMasterId]);
 
   const cellSize = viewMode === "channel" ? CHANNEL_CELL_SIZE : DEVICE_CELL_SIZE;
 
@@ -959,9 +1000,9 @@ export default function App({ runtime = "web" }) {
       return;
     }
 
-    if (inputs.length === 0 || outputs.length === 0) return;
+    if (routedInputs.length === 0 || routedOutputs.length === 0) return;
 
-    await managerRef.current.setup(inputs, outputs, mode);
+    await managerRef.current.setup(routedInputs, routedOutputs, mode);
     applyMatrixToEngine(mode, nextMatrixByView[mode] || {});
 
     try {
@@ -1015,9 +1056,6 @@ export default function App({ runtime = "web" }) {
       const orderedInputs = sortByOrder(discoveredInputs, savedInputOrder);
       const orderedOutputs = sortByOrder(discoveredOutputs, savedOutputOrder);
 
-      const configuredInputIds = new Set();
-      const configuredOutputIds = new Set();
-
       const currentMatrixByView = matrixRef.current || {};
       const activeDeviceMatrix =
         Object.keys(currentMatrixByView.device || {}).length > 0
@@ -1027,67 +1065,22 @@ export default function App({ runtime = "web" }) {
         Object.keys(currentMatrixByView.channel || {}).length > 0
           ? currentMatrixByView.channel
           : saved?.matrixByView?.channel || {};
-
-      Object.entries(activeDeviceMatrix).forEach(([key, conn]) => {
-        if (!conn?.on) return;
-        const [rowId, colId] = key.split("::");
-        if (rowId?.startsWith("dev:")) configuredInputIds.add(rowId.slice(4));
-        if (colId?.startsWith("dev:")) configuredOutputIds.add(colId.slice(4));
-      });
-
-      Object.entries(activeChannelMatrix).forEach(([key, conn]) => {
-        if (!conn?.on) return;
-        const [rowId, colId] = key.split("::");
-        const rowParsed = parseChannelId(rowId);
-        const colParsed = parseChannelId(colId);
-        if (rowParsed?.deviceId) configuredInputIds.add(rowParsed.deviceId);
-        if (colParsed?.deviceId) configuredOutputIds.add(colParsed.deviceId);
-      });
-
-      let visibleInputs = showAllDevices
-        ? orderedInputs
-        : orderedInputs.filter((d) => configuredInputIds.has(d.deviceId));
-      let visibleOutputs = showAllDevices
-        ? orderedOutputs
-        : orderedOutputs.filter((d) => configuredOutputIds.has(d.deviceId));
-
-      if (!showAllDevices && (visibleInputs.length === 0 || visibleOutputs.length === 0)) {
-        visibleInputs = [];
-        visibleOutputs = [];
-      }
-
-      const visibleRowIds = new Set([
-        ...visibleInputs.map((d) => `dev:${d.deviceId}`),
-        ...visibleInputs.flatMap((d) => [`ch:${d.deviceId}:0`, `ch:${d.deviceId}:1`]),
-      ]);
-      const visibleColIds = new Set([
-        ...visibleOutputs.map((d) => `dev:${d.deviceId}`),
-        ...visibleOutputs.flatMap((d) => [`ch:${d.deviceId}:0`, `ch:${d.deviceId}:1`]),
-      ]);
-
-      if (
-        selectedCell &&
-        (!visibleRowIds.has(selectedCell.rowId) || !visibleColIds.has(selectedCell.colId))
-      ) {
-        setSelectedCell(null);
-      }
-
-      setInputs(visibleInputs);
-      setOutputs(visibleOutputs);
+      setInputs(orderedInputs);
+      setOutputs(orderedOutputs);
       devicesDiscoveredRef.current = true;
 
       const nextInputLabels = createLabelMap(discoveredInputs, {}, "Input");
       const nextOutputLabels = createLabelMap(discoveredOutputs, {}, "Output");
 
-      const deviceRows = visibleInputs.map((i) => ({ id: `dev:${i.deviceId}` }));
-      const deviceCols = visibleOutputs.map((o) => ({ id: `dev:${o.deviceId}` }));
+      const deviceRows = orderedInputs.map((i) => ({ id: `dev:${i.deviceId}` }));
+      const deviceCols = orderedOutputs.map((o) => ({ id: `dev:${o.deviceId}` }));
 
-      const channelRows = visibleInputs.flatMap((i) => [
+      const channelRows = orderedInputs.flatMap((i) => [
         { id: `ch:${i.deviceId}:0` },
         { id: `ch:${i.deviceId}:1` },
       ]);
 
-      const channelCols = visibleOutputs.flatMap((o) => [
+      const channelCols = orderedOutputs.flatMap((o) => [
         { id: `ch:${o.deviceId}:0` },
         { id: `ch:${o.deviceId}:1` },
       ]);
@@ -1127,8 +1120,8 @@ export default function App({ runtime = "web" }) {
       matrixRef.current = nextMatrixByView;
       modeRef.current = nextViewMode;
 
-      const nextInputMaster = visibleInputs.some((d) => d.deviceId === saved?.inputMasterId) ? saved?.inputMasterId || "" : "";
-      const nextOutputMaster = visibleOutputs.some((d) => d.deviceId === saved?.outputMasterId) ? saved?.outputMasterId || "" : "";
+      const nextInputMaster = orderedInputs.some((d) => d.deviceId === saved?.inputMasterId) ? saved?.inputMasterId || "" : "";
+      const nextOutputMaster = orderedOutputs.some((d) => d.deviceId === saved?.outputMasterId) ? saved?.outputMasterId || "" : "";
       setInputMasterId(nextInputMaster);
       setOutputMasterId(nextOutputMaster);
       if (nextInputMaster) pushInputMasterToNative(nextInputMaster);
@@ -1147,8 +1140,12 @@ export default function App({ runtime = "web" }) {
       };
       persistState(snapshot);
 
-      if (powerOn) {
-        await managerRef.current.setup(visibleInputs, visibleOutputs, nextViewMode);
+      const discoveredConfigured = collectConfiguredDeviceIds(nextMatrixByView);
+      const activeInputs = orderedInputs.filter((d) => discoveredConfigured.configuredInputIds.has(d.deviceId));
+      const activeOutputs = orderedOutputs.filter((d) => discoveredConfigured.configuredOutputIds.has(d.deviceId));
+
+      if (powerOn && activeInputs.length > 0 && activeOutputs.length > 0) {
+        await managerRef.current.setup(activeInputs, activeOutputs, nextViewMode);
         applyMatrixToEngine(nextViewMode, nextMatrixByView[nextViewMode]);
 
         try {
@@ -1241,7 +1238,7 @@ export default function App({ runtime = "web" }) {
     return () => {
       navigator.mediaDevices?.removeEventListener?.("devicechange", onDeviceChange);
     };
-  }, [showAllDevices]);
+  }, []);
 
   useEffect(() => {
     if (!devicesDiscoveredRef.current) return;
@@ -1341,7 +1338,7 @@ export default function App({ runtime = "web" }) {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [rows, cols, inputs, outputs]);
+  }, [rows, cols, routedInputs, routedOutputs]);
 
   useEffect(() => {
     if (inputs.length === 0 || outputs.length === 0) return;
