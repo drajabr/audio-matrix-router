@@ -3,6 +3,8 @@
 Audio Router Matrix is a Windows desktop patchbay for WASAPI devices.
 It lets you route any input channel to any output channel using a live crosspoint matrix, with per-route gain, phase inversion, and real-time level metering.
 
+<img width="1586" height="993" alt="image" src="https://github.com/user-attachments/assets/27f9f121-070b-4cb7-b756-6a1084f602a3" />
+
 ## What This Tool Does
 
 - Builds a channel-level routing matrix across selected input and output devices.
