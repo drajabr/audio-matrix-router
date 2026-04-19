@@ -1471,6 +1471,8 @@ export default function App({ runtime = "web" }) {
   }, []);
 
   const updateConnection = (rowId, colId, updater) => {
+    if (locked) return;
+
     const key = getCellKey(rowId, colId);
     let shouldReloadForMasterSwitch = false;
     let nextInputMasterId = inputMasterId;
@@ -1588,6 +1590,8 @@ export default function App({ runtime = "web" }) {
   };
 
   const toggleCell = (rowId, colId) => {
+    if (locked) return;
+
     if (selectedCell?.rowId === rowId && selectedCell?.colId === colId) {
       updateConnection(rowId, colId, (prev) => ({
         ...prev,
@@ -2252,6 +2256,7 @@ export default function App({ runtime = "web" }) {
                           openTileMenuForCell(event, row.id, col.id);
                         }}
                         title={`${row.label} -> ${col.label}`}
+                        disabled={locked}
                       >
                         {Math.abs(state.gainDb || 0) >= 0.5 ? (
                           <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${Math.round(state.gainDb)}dB`}</span>
@@ -2271,6 +2276,7 @@ export default function App({ runtime = "web" }) {
                             }
                             title="Flip phase"
                             aria-label="Flip phase"
+                            disabled={locked}
                           >
                             Ø
                           </button>

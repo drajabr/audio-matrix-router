@@ -31,6 +31,10 @@
   --phase: #8b5cf6;
   --teal: #2dd4bf;
   --danger: #ef4444;
+  --radius-panel: 8px;
+  --radius-overlay: 6px;
+  --radius-tile: 5px;
+  --radius-micro: 4px;
 }
 
 * {
@@ -87,7 +91,7 @@ textarea {
 .rack-panel {
   border: 1px solid var(--line);
   background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 84%, transparent), color-mix(in srgb, var(--panel) 92%, black 8%));
-  border-radius: 8px;
+  border-radius: var(--radius-panel);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04), 0 8px 24px rgba(0, 0, 0, 0.35);
@@ -178,7 +182,7 @@ textarea {
   flex-shrink: 0;
   width: 44px;
   height: 44px;
-  border-radius: 10px;
+  border-radius: var(--radius-overlay);
   border: 1px solid color-mix(in srgb, var(--line) 88%, white 12%);
   background: color-mix(in srgb, var(--surface) 86%, black 14%);
   color: #d6deea;
@@ -233,7 +237,7 @@ textarea {
   height: 50px;
   min-height: 50px;
   padding: 3px 52px 3px 3px;
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: linear-gradient(180deg, var(--surface-raised), var(--panel-deep));
   transition: opacity 140ms ease, transform 140ms ease, width 140ms ease, padding 140ms ease, border-color 140ms ease;
@@ -287,7 +291,7 @@ textarea {
   width: 44px;
   min-width: 44px;
   height: 44px;
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -320,7 +324,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: color-mix(in srgb, var(--surface) 88%, black 12%);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
@@ -336,7 +340,7 @@ textarea {
 
 .quick-picker-option {
   height: 44px;
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: color-mix(in srgb, var(--surface) 88%, black 12%);
   color: var(--text);
@@ -364,7 +368,7 @@ textarea {
   flex-shrink: 0;
   width: 30px;
   height: 30px;
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   display: inline-flex;
   align-items: center;
@@ -427,7 +431,7 @@ textarea {
 .matrix-corner {
   border: 1px solid var(--line);
   background: color-mix(in srgb, var(--surface) 82%, black 18%);
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
 }
 
 .matrix-corner-content {
@@ -450,7 +454,7 @@ textarea {
 .corner-control-btn {
   width: 100%;
   height: 100%;
-  border-radius: 6px;
+  border-radius: var(--radius-tile);
   border: 1px solid color-mix(in srgb, var(--line) 86%, white 14%);
   background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 88%, white 5%), color-mix(in srgb, var(--panel) 90%, black 10%));
   color: var(--text-strong);
@@ -560,7 +564,7 @@ textarea {
   overflow: hidden;
   border: 1px solid var(--line-strong);
   background: color-mix(in srgb, var(--surface) 82%, black 18%);
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
   display: flex;
   align-items: stretch;
@@ -575,7 +579,7 @@ textarea {
   overflow: hidden;
   border: 1px solid var(--line-strong);
   background: color-mix(in srgb, var(--surface) 82%, black 18%);
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
   display: flex;
   flex-direction: column;
@@ -648,7 +652,7 @@ textarea {
 }
 
 .axis-split-cell {
-  border-radius: 4px;
+  border-radius: var(--radius-micro);
   border: 1px solid var(--line-strong);
   background: color-mix(in srgb, var(--surface) 88%, black 12%);
 }
@@ -763,7 +767,7 @@ textarea {
 }
 
 .card-meter-bg-row-split .meter-bar {
-  border-radius: 4px;
+  border-radius: var(--radius-micro);
   border: 0;
   background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent-hl) 32%, transparent));
 }
@@ -778,7 +782,7 @@ textarea {
 }
 
 .card-meter-bg-col-split .meter-bar {
-  border-radius: 4px;
+  border-radius: var(--radius-micro);
   border: 0;
   width: 100%;
   background: linear-gradient(0deg, color-mix(in srgb, var(--accent) 20%, transparent), color-mix(in srgb, var(--accent-hl) 32%, transparent));
@@ -854,7 +858,7 @@ textarea {
 .cell {
   width: 112px;
   height: 112px;
-  border-radius: 5px;
+  border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: color-mix(in srgb, var(--surface) 88%, black 12%);
   cursor: pointer;
@@ -918,7 +922,7 @@ textarea {
   align-items: center;
   gap: 6px;
   padding: 6px;
-  border-radius: 10px;
+  border-radius: var(--radius-overlay);
   border: 1px solid color-mix(in srgb, var(--line) 82%, white 18%);
   background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 94%, black 6%), color-mix(in srgb, var(--panel) 90%, black 10%));
   box-shadow: 0 14px 34px rgba(0, 0, 0, 0.44);
@@ -934,7 +938,7 @@ textarea {
   width: 36px;
   min-width: 36px;
   height: 36px;
-  border-radius: 8px;
+  border-radius: var(--radius-overlay);
   border: 1px solid color-mix(in srgb, var(--line) 86%, white 14%);
   background: color-mix(in srgb, var(--surface) 86%, black 14%);
   color: var(--text);
@@ -973,7 +977,7 @@ textarea {
   transform: translateX(-50%);
   width: 72px;
   height: 20px;
-  border-radius: 6px;
+  border-radius: var(--radius-overlay);
   border: 1px solid color-mix(in srgb, var(--line) 82%, white 18%);
   background: color-mix(in srgb, var(--surface) 88%, black 12%);
   color: var(--text);
@@ -1014,7 +1018,7 @@ textarea {
 
 .inline-editor {
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--radius-overlay);
   padding: 8px;
   background: color-mix(in srgb, var(--panel) 78%, transparent);
   display: flex;
