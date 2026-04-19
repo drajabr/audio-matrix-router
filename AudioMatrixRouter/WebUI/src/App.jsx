@@ -611,6 +611,7 @@ export default function App({ runtime = "web" }) {
   });
   const [tileMenuCell, setTileMenuCell] = useState(null);
   const [gainAdjustCell, setGainAdjustCell] = useState(null);
+  const [transientMuteAll, setTransientMuteAll] = useState(false);
 
   const [viewMode, setViewMode] = useState("device");
   const [inputs, setInputs] = useState([]);
@@ -928,6 +929,7 @@ export default function App({ runtime = "web" }) {
   const detailCell = selectedCell || masterDetailCell;
   const selectedKey = detailCell ? getCellKey(detailCell.rowId, detailCell.colId) : "";
   const selectedConnection = selectedKey ? activeMatrix[selectedKey] || makeDefaultConnection() : null;
+  const isHoverDetail = !!selectedCell;
 
   const persistState = (next) => {
     try {
@@ -938,7 +940,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const resolveLinearGain = (connection) => {
-    if (!connection.on || connection.muted) return 0;
+    if (!connection.on || connection.muted || transientMuteAll) return 0;
     const direction = connection.phaseInverted ? -1 : 1;
     return dbToLinear(connection.gainDb) * direction;
   };
@@ -1347,6 +1349,11 @@ export default function App({ runtime = "web" }) {
     rebuildAudioGraph(viewMode, matrixRef.current);
     setSelectedCell(null);
   }, [viewMode]);
+
+  useEffect(() => {
+    if (!powerOn) return;
+    applyMatrixToEngine(viewMode, matrixRef.current[viewMode] || {});
+  }, [transientMuteAll, powerOn, viewMode]);
 
   useEffect(() => {
     if (!selectedCell) return;
@@ -1799,10 +1806,19 @@ export default function App({ runtime = "web" }) {
 
   const selectedSourceSplit = selectedSource ? getRowSplitLevels(selectedSource) : [0, 0];
   const selectedDestinationSplit = selectedDestination ? getColSplitLevels(selectedDestination) : [0, 0];
+  const hasAnyActiveRoute = Object.values(activeMatrix).some((conn) => conn.on);
+  const muteButtonIsMuted = isHoverDetail
+    ? !!selectedConnection?.muted
+    : transientMuteAll;
   const latencyLabel = latencyMs != null ? `${latencyMs}ms` : "n/a";
   const jitterLabel = jitterMs != null ? `${jitterMs}ms` : "n/a";
   const bufferLabel = bufferMs != null ? `${bufferMs}ms` : "n/a";
   const clockLabel = clockKhz != null ? `${clockKhz}kHz` : "n/a";
+
+  const handleTransientMuteAllToggle = () => {
+    if (!hasAnyActiveRoute) return;
+    setTransientMuteAll((prev) => !prev);
+  };
 
   const handleRootClick = (event) => {
     if (event.target.closest(".matrix-grid")) return;
@@ -2236,18 +2252,16 @@ export default function App({ runtime = "web" }) {
         <div className="dock-col dock-center">
             <button
               type="button"
-              className={`mute-btn ${selectedConnection.muted ? "muted" : ""}`}
-              disabled={!selectedConnection.on}
-              onClick={() =>
-                selectedConnection.on &&
-                updateConnection(detailCell.rowId, detailCell.colId, {
-                  ...selectedConnection,
-                  muted: !selectedConnection.muted,
-                })
-              }
-              title={selectedConnection.on ? "Toggle mute" : "Turn route on to use mute"}
+              className={`mute-btn ${muteButtonIsMuted ? "muted" : ""}`}
+              disabled={!hasAnyActiveRoute}
+              onClick={handleTransientMuteAllToggle}
+              title={isHoverDetail
+                ? `Tile mute: ${selectedConnection?.muted ? "muted" : "unmuted"}. Click for transient mute all.`
+                : transientMuteAll
+                  ? "Transient mute all is ON. Click to restore previous mute state."
+                  : "Global mute status is OFF. Click for transient mute all."}
             >
-              {selectedConnection.muted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+              {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
             </button>
         </div>
 
