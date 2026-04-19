@@ -1927,7 +1927,7 @@ export default function App({ runtime = "web" }) {
   };
 
   return (
-    <div className="studio-root" onClick={handleRootClick}>
+    <div className={`studio-root${locked ? " is-locked" : ""}`} onClick={handleRootClick}>
       <header className="topbar rack-panel">
         <div className="brand-block">
           <span className="brand-grid-icon" aria-hidden="true">

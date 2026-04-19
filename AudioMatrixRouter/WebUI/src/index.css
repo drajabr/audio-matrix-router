@@ -156,15 +156,15 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 56px;
-  padding: 3px 8px;
+  min-width: 46px;
+  padding: 2px 6px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--line));
   background: color-mix(in srgb, var(--accent) 16%, var(--surface));
   color: color-mix(in srgb, var(--text) 92%, var(--accent-hl));
-  font-size: var(--font-size-2xs);
+  font-size: calc(var(--font-size-2xs) * 0.92);
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
@@ -523,6 +523,17 @@ textarea {
 
 .sort-handle:active {
   cursor: grabbing;
+}
+
+.studio-root.is-locked .sort-handle,
+.studio-root.is-locked .sort-handle:active,
+.studio-root.is-locked .cell,
+.studio-root.is-locked .grid-source-width-handle,
+.studio-root.is-locked .grid-dest-height-handle,
+.studio-root.is-locked .source-width-handle,
+.studio-root.is-locked .dest-height-handle,
+.studio-root.is-locked .corner-control-btn:disabled {
+  cursor: default;
 }
 
 .row-main {
@@ -1122,10 +1133,10 @@ textarea {
 }
 
 .dock-card {
-  border: 1px solid var(--line);
-  background: color-mix(in srgb, var(--panel) 78%, transparent);
-  border-radius: 6px;
-  padding: 8px;
+  border: 0;
+  background: transparent;
+  border-radius: 0;
+  padding: 0;
   overflow: hidden;
   display: flex;
   flex-direction: row;

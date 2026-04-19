@@ -50,3 +50,17 @@ if (Test-Path $exePath) {
   (Get-Item $exePath).LastWriteTime = Get-Date
 }
 Get-Item $exePath | Select-Object FullName, LastWriteTime, Length | Format-List
+
+Write-Host ''
+Write-Host 'Building windows mode for local preview (root base path)...'
+Push-Location $webUiPath
+npm run build:windows
+Pop-Location
+
+Write-Host ''
+Write-Host 'Starting local preview server...'
+Write-Host '(Press Ctrl+C to stop the server)'
+Write-Host ''
+Push-Location $webUiPath
+npm run preview
+Pop-Location

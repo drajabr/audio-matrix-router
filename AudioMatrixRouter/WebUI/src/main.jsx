@@ -15,23 +15,13 @@ ReactDOM.createRoot(document.getElementById("root")).render(
 
 if ("serviceWorker" in navigator) {
   window.addEventListener("load", async () => {
-    if (isNativeHost) {
-      // Native host serves local assets; service worker can keep stale bundles.
-      const registrations = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(registrations.map((registration) => registration.unregister()));
-      return;
-    }
-
-    if (import.meta.env.PROD) {
-      const swUrl = `${import.meta.env.BASE_URL}sw.js`;
-      navigator.serviceWorker.register(swUrl).catch((error) => {
-        console.warn("Service worker registration failed", error);
-      });
-      return;
-    }
-
-    // In development, stale SW caches can cause blank pages after deploy/preview runs.
+    // Keep service workers disabled for this app to avoid stale cached bundles on Pages.
     const registrations = await navigator.serviceWorker.getRegistrations();
     await Promise.all(registrations.map((registration) => registration.unregister()));
+
+    if ("caches" in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((key) => caches.delete(key)));
+    }
   });
 }
