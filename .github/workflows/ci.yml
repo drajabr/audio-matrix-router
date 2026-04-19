@@ -44,22 +44,15 @@ jobs:
           release_requested=false
           app_version="$current_version"
 
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            changed_files="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
+            if echo "$changed_files" | grep -qx "VERSION"; then
+              release_requested=true
+            fi
+          fi
+
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.release }}" == "true" ]]; then
-            version_core="${current_version#v}"
-            IFS='.' read -r major minor patch <<< "$version_core"
-            next_patch=$((patch + 1))
-            app_version="v${major}.${minor}.${next_patch}"
             release_requested=true
-
-            printf '%s\n' "$app_version" > VERSION
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add VERSION
-            git commit -m "chore: bump version to $app_version"
-            git tag "$app_version"
-            git push origin HEAD:main
-            git push origin "$app_version"
           fi
 
           echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
@@ -160,6 +153,20 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
+        if: needs.version.outputs.release_requested == 'true'
+        env:
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
+        shell: pwsh
+        run: |
+          $existingTag = git ls-remote --tags origin "refs/tags/$env:APP_VERSION"
+          if ([string]::IsNullOrWhiteSpace($existingTag)) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$env:APP_VERSION"
+            git push origin "$env:APP_VERSION"
+          }
+
+      - name: Publish GitHub Release
         if: needs.version.outputs.release_requested == 'true'
         uses: softprops/action-gh-release@v2
         with:
