@@ -55,12 +55,20 @@ Write-Host ''
 Write-Host 'Building windows mode for local preview (root base path)...'
 Push-Location $webUiPath
 npm run build:windows
+if ($LASTEXITCODE -ne 0) {
+  Write-Host 'ERROR: Windows build failed.'
+  Pop-Location
+  exit 1
+}
 Pop-Location
 
 Write-Host ''
-Write-Host 'Starting local preview server...'
-Write-Host '(Press Ctrl+C to stop the server)'
+Write-Host 'Starting local preview server on http://localhost:4173'
+Write-Host 'Press Ctrl+C to stop.'
 Write-Host ''
 Push-Location $webUiPath
-npm run preview
-Pop-Location
+try {
+  npm run preview
+} finally {
+  Pop-Location
+}

@@ -45,8 +45,8 @@ public sealed class MainForm : Form
         _forceStartMinimized = forceStartMinimized;
         Text = "Audio Router Matrix";
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new System.Drawing.Size(1000, 700);
-        Size = new System.Drawing.Size(1480, 940);
+        MinimumSize = new System.Drawing.Size(1100, 750);
+        Size = new System.Drawing.Size(1600, 1000);
         _trayAppIcon = LoadAppIcon();
         try
         {

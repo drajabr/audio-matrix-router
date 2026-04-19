@@ -207,9 +207,9 @@ textarea {
   position: relative;
   flex-shrink: 0;
   margin-left: auto;
-  width: 44px;
-  height: 40px;
-  min-height: 40px;
+  width: 50px;
+  height: 50px;
+  min-height: 50px;
   overflow: visible;
 }
 
@@ -229,11 +229,11 @@ textarea {
 .ui-quick-controls {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  height: 40px;
-  min-height: 40px;
-  padding: 3px 44px 3px 3px;
-  border-radius: 12px;
+  gap: 6px;
+  height: 50px;
+  min-height: 50px;
+  padding: 3px 52px 3px 3px;
+  border-radius: 5px;
   border: 1px solid var(--line-strong);
   background: linear-gradient(180deg, var(--surface-raised), var(--panel-deep));
   transition: opacity 140ms ease, transform 140ms ease, width 140ms ease, padding 140ms ease, border-color 140ms ease;
@@ -247,13 +247,13 @@ textarea {
 .ui-quick-controls.is-collapsed {
   opacity: 0;
   pointer-events: none;
-  width: 40px;
-  min-width: 40px;
-  height: 40px;
-  min-height: 40px;
+  width: 50px;
+  min-width: 50px;
+  height: 50px;
+  min-height: 50px;
   top: 0;
   right: 0;
-  padding: 0 40px 0 0;
+  padding: 0 50px 0 0;
   border-color: transparent;
   overflow: hidden;
   box-shadow: none;
@@ -269,27 +269,29 @@ textarea {
 }
 
 .icon-btn {
-  border: 1px solid color-mix(in srgb, var(--line) 88%, white 12%);
-  background: color-mix(in srgb, var(--surface) 86%, black 14%);
+  border: 1px solid var(--line-strong);
+  background: color-mix(in srgb, var(--surface) 88%, black 12%);
   color: var(--text);
   cursor: pointer;
-  transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
+  opacity: 0.62;
+  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease;
 }
 
 .icon-btn:hover {
-  border-color: color-mix(in srgb, var(--accent) 54%, var(--line));
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
   transform: translateY(-1px);
 }
 
 .icon-btn--square {
-  width: 34px;
-  min-width: 34px;
-  height: 34px;
-  border-radius: 10px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  border-radius: 5px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: var(--font-size-md);
+  font-size: var(--font-size-lg);
 }
 
 .icon-btn--theme-dot::before {
@@ -302,26 +304,30 @@ textarea {
 }
 
 .icon-btn.is-on {
-  border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
-  color: color-mix(in srgb, var(--accent-hl) 88%, white 12%);
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
+  color: var(--text-on-accent);
 }
 
 .quick-control-picker {
   position: absolute;
   top: calc(100% + 8px);
   left: 0;
-  right: 0;
-  width: 100%;
-  min-width: 100%;
+  right: auto;
+  width: 300px;
   padding: 8px;
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: 6px;
-  border-radius: 12px;
-  border: 1px solid color-mix(in srgb, var(--line) 82%, white 18%);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 96%, black 4%), color-mix(in srgb, var(--panel) 92%, black 8%));
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  background: color-mix(in srgb, var(--surface) 88%, black 12%);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
   z-index: 2500;
   pointer-events: auto;
+  max-height: 460px;
+  overflow-y: auto;
 }
 
 .quick-control-picker.is-collapsed {
@@ -329,30 +335,37 @@ textarea {
 }
 
 .quick-picker-option {
-  border: 1px solid transparent;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--surface) 78%, transparent);
+  height: 44px;
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  background: color-mix(in srgb, var(--surface) 88%, black 12%);
   color: var(--text);
-  padding: 8px 10px;
-  display: grid;
-  grid-template-columns: 26px minmax(0, 1fr);
+  display: flex;
+  flex-direction: row;
   align-items: center;
-  gap: 10px;
-  text-align: left;
+  gap: 6px;
   cursor: pointer;
+  opacity: 0.62;
+  transition: border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+  padding: 0 8px;
+  text-align: left;
+  width: 100%;
 }
 
 .quick-picker-option:hover,
 .quick-picker-option.is-active {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  background: color-mix(in srgb, var(--accent) 18%, var(--surface));
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
 }
 
 .qp-swatch {
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  flex-shrink: 0;
+  width: 30px;
+  height: 30px;
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -366,6 +379,10 @@ textarea {
   text-overflow: ellipsis;
   white-space: nowrap;
   text-transform: capitalize;
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text-strong);
 }
 
 .error-banner {
