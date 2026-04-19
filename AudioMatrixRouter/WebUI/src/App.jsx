@@ -727,6 +727,15 @@ export default function App({ runtime = "web" }) {
     localStorage.setItem(ACCENT_KEY, accent.key);
     localStorage.setItem(FONT_KEY, font.key);
     localStorage.setItem(FONT_SIZE_KEY, fontSize.key);
+
+    if (devicesDiscoveredRef.current) {
+      persistState(buildPersistedState({
+        backgroundKey: background.key,
+        accentKey: accent.key,
+        fontKey: font.key,
+        fontSizeKey: fontSize.key,
+      }));
+    }
   }, [backgroundIndex, accentIndex, fontIndex, fontSizeIndex]);
 
   useEffect(() => {
@@ -1258,6 +1267,7 @@ export default function App({ runtime = "web" }) {
 
   const handleReloadDevices = async (event) => {
     event?.stopPropagation?.();
+    if (locked) return;
     setSelectedCell(null);
     setTileMenuCell(null);
     setGainAdjustCell(null);
@@ -1990,6 +2000,7 @@ export default function App({ runtime = "web" }) {
               gridAutoRows: `${cellSize}px`,
             }}
             onMouseLeave={() => {
+              if (locked) return;
               if (!tileMenuCell && !gainAdjustCell) {
                 setSelectedCell(null);
               }
@@ -2001,7 +2012,7 @@ export default function App({ runtime = "web" }) {
                   type="button"
                   className="corner-control-btn corner-control-tl"
                   onClick={handleReloadDevices}
-                  disabled={isReloadingDevices}
+                  disabled={locked || isReloadingDevices}
                   title="Restart and reload devices"
                   aria-label="Restart and reload devices"
                 >
@@ -2009,10 +2020,20 @@ export default function App({ runtime = "web" }) {
                 </button>
                 <button
                   type="button"
+                  className={`corner-control-btn corner-control-tr ${locked ? "active" : ""}`}
+                  onClick={handleToggleLock}
+                  title={locked ? "Unlock matrix" : "Lock matrix"}
+                  aria-label={locked ? "Unlock matrix" : "Lock matrix"}
+                >
+                  <span aria-hidden="true">{locked ? "🔒" : "🔓"}</span>
+                </button>
+                <button
+                  type="button"
                   className={`corner-control-btn corner-control-br ${viewMode === "channel" ? "active" : ""}`}
                   aria-label="Toggle channel view"
                   title={viewMode === "channel" ? "Switch to Device View" : "Switch to Channel View"}
                   onClick={handleToggleViewMode}
+                  disabled={locked}
                 >
                   <span aria-hidden="true">⌗</span>
                 </button>
@@ -2024,6 +2045,7 @@ export default function App({ runtime = "web" }) {
                   }}
                   title={showAllDevices ? "Hide unconfigured devices" : "Show all discovered devices"}
                   aria-label="Toggle all device visibility"
+                  disabled={locked}
                 >
                   <span aria-hidden="true">≣</span>
                 </button>
@@ -2033,6 +2055,7 @@ export default function App({ runtime = "web" }) {
                   onClick={togglePowerState}
                   title={powerOn ? "Power on (click to power off)" : "Power off (click to power on)"}
                   aria-label="Toggle power"
+                  disabled={locked}
                 >
                   <span aria-hidden="true">⏻</span>
                 </button>
@@ -2074,7 +2097,7 @@ export default function App({ runtime = "web" }) {
                   ].filter(Boolean).join(" ")}
                   title={`${col.fullLabel || col.label}\nDouble-click to set output master`}
                   style={span > 1 ? { gridColumn: `span ${span}` } : undefined}
-                  draggable
+                  draggable={!locked}
                   onDragStart={beginSortDrag("destination", col.outputDeviceId)}
                   onDragEnd={endSortDrag("destination")}
                   onDragOver={overSortTarget("destination", col.outputDeviceId)}
@@ -2125,7 +2148,7 @@ export default function App({ runtime = "web" }) {
                   ].filter(Boolean).join(" ")}
                   title={`${row.fullLabel || row.label}\nDouble-click to set input master`}
                   style={row.isChannelStart ? { gridRow: "span 2" } : undefined}
-                  draggable
+                  draggable={!locked}
                   onDragStart={beginSortDrag("source", row.deviceId)}
                   onDragEnd={endSortDrag("source")}
                   onDragOver={overSortTarget("source", row.deviceId)}
@@ -2177,7 +2200,11 @@ export default function App({ runtime = "web" }) {
                           selectedCell && col.id === selectedCell.colId && "active-col",
                         ].filter(Boolean).join(" ")}
                         style={{ width: `${cellSize}px`, height: `${cellSize}px` }}
-                        onMouseEnter={() => setSelectedCell({ rowId: row.id, colId: col.id })}
+                        onMouseEnter={() => {
+                          if (!locked) {
+                            setSelectedCell({ rowId: row.id, colId: col.id });
+                          }
+                        }}
                         onClick={() =>
                           updateConnection(row.id, col.id, {
                             ...state,
@@ -2186,6 +2213,7 @@ export default function App({ runtime = "web" }) {
                           })
                         }
                         onContextMenu={(event) => {
+                          if (locked) return;
                           event.preventDefault();
                           event.stopPropagation();
                           setSelectedCell({ rowId: row.id, colId: col.id });
@@ -2217,7 +2245,7 @@ export default function App({ runtime = "web" }) {
                             title="Flip phase"
                             aria-label="Flip phase"
                           >
-                            ⌗
+                            Ø
                           </button>
 
                           <div className="tile-gain-wrap">
@@ -2230,6 +2258,7 @@ export default function App({ runtime = "web" }) {
                                 )
                               }
                               onWheel={(event) => {
+                                if (locked) return;
                                 if (!isGainAdjustOpen) return;
                                 event.preventDefault();
                                 event.stopPropagation();
@@ -2237,6 +2266,7 @@ export default function App({ runtime = "web" }) {
                               }}
                               title="Edit gain"
                               aria-label="Edit gain"
+                              disabled={locked}
                             >
                               {`${Math.round(state.gainDb || 0)} dB`}
                             </button>
@@ -2248,6 +2278,7 @@ export default function App({ runtime = "web" }) {
                                   onClick={() => adjustGainForCell(row.id, col.id, 1)}
                                   title="Increase gain"
                                   aria-label="Increase gain"
+                                  disabled={locked}
                                 >
                                   ▲
                                 </button>
@@ -2257,6 +2288,7 @@ export default function App({ runtime = "web" }) {
                                   onClick={() => adjustGainForCell(row.id, col.id, -1)}
                                   title="Decrease gain"
                                   aria-label="Decrease gain"
+                                  disabled={locked}
                                 >
                                   ▼
                                 </button>
@@ -2276,6 +2308,7 @@ export default function App({ runtime = "web" }) {
                             }
                             title="Toggle mute"
                             aria-label="Toggle mute"
+                            disabled={locked}
                           >
                             M
                           </button>
