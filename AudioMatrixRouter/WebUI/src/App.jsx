@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Volume2, VolumeX } from "lucide-react";
 
+const APP_VERSION = __APP_VERSION__;
 const STORAGE_KEY = "audio-router-matrix-v3";
 const DB_MIN = -60;
 const DB_MAX = 12;
@@ -1611,6 +1612,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const beginSortDrag = (axis, deviceId) => (event) => {
+    if (locked) return;
     event.dataTransfer.effectAllowed = "move";
     setDragSortState({
       axis,
@@ -1620,6 +1622,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const overSortTarget = (axis, deviceId) => (event) => {
+    if (locked) return;
     if (dragSortState.axis !== axis || !dragSortState.draggedId) return;
 
     event.preventDefault();
@@ -1642,6 +1645,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const dropSortTarget = (axis) => (event) => {
+    if (locked) return;
     if (dragSortState.axis !== axis || !dragSortState.draggedId) return;
     event.preventDefault();
     setDragSortState({ axis: "", draggedId: "", overId: "" });
@@ -1653,6 +1657,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const handleToggleViewMode = () => {
+    if (locked) return;
     setViewMode((prevMode) => {
       const nextMode = prevMode === "channel" ? "device" : "channel";
 
@@ -1686,6 +1691,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const handleInputLabelDoubleClick = (rowId) => {
+    if (locked) return;
     const sourceId = viewMode === "device" ? rowId.slice(4) : rowId.split(":")[1];
     setInputMaster(sourceId, true);
     if (powerOn) {
@@ -1694,6 +1700,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const handleOutputLabelDoubleClick = (colId) => {
+    if (locked) return;
     const sourceId = outputDeviceFromColId(colId);
     setOutputMaster(sourceId, true);
     if (powerOn) {
@@ -1713,10 +1720,25 @@ export default function App({ runtime = "web" }) {
   };
 
   const togglePowerState = async () => {
+    if (locked) return;
     const next = !powerOn;
     setPowerOn(next);
     if (hasNativeBridge) {
       window.__nativeBridgeInvoke(next ? "startEngine" : "stopEngine", {}).catch(() => {});
+    }
+  };
+
+  const handleToggleLock = async () => {
+    const nextLocked = !locked;
+    setLocked(nextLocked);
+
+    if (!hasNativeBridge) return;
+
+    try {
+      const state = await window.__nativeBridgeInvoke("setLocked", { locked: nextLocked });
+      setLocked(!!state?.locked);
+    } catch (_) {
+      setLocked(!nextLocked);
     }
   };
 
@@ -1758,6 +1780,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const adjustGainForCell = (rowId, colId, stepDb) => {
+    if (locked) return;
     const key = getCellKey(rowId, colId);
     const state = activeMatrix[key] || makeDefaultConnection();
     updateConnection(rowId, colId, {
@@ -1768,6 +1791,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const openTileMenuForCell = (event, rowId, colId) => {
+    if (locked) return;
     const menuHeightEstimate = 130;
     const nearBottom = event.clientY > window.innerHeight - menuHeightEstimate;
     setTileMenuCell({ rowId, colId, dropUp: nearBottom });
@@ -1918,7 +1942,10 @@ export default function App({ runtime = "web" }) {
             <span />
           </span>
           <div>
-            <h1>Audio Matrix Patch</h1>
+            <div className="brand-title-row">
+              <h1>Audio Matrix Patch</h1>
+              <span className="brand-version-pill">{APP_VERSION}</span>
+            </div>
             <p>{contextState === "running" ? `Running${latencyMs != null ? ` · ${latencyMs}ms` : ""}` : "Standby"}</p>
           </div>
         </div>
