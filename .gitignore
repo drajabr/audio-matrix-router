@@ -1,0 +1,12 @@
+bin/
+obj/
+out/
+artifacts/
+build/
+.intermediate/
+.vs/
+*.user
+*.suo
+config.json
+AudioMatrixRouter/WebUI/node_modules/
+AudioMatrixRouter/WebUI/dist/

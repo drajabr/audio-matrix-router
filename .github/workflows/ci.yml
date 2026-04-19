@@ -1,0 +1,96 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  web-preview:
+    name: Build Web Preview
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: AudioMatrixRouter/WebUI
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: AudioMatrixRouter/WebUI/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web preview
+        run: npm run build:web
+
+      - name: Upload web preview artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-preview-dist
+          path: AudioMatrixRouter/WebUI/dist
+          if-no-files-found: error
+
+  windows-portable:
+    name: Build Windows Portable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: AudioMatrixRouter/WebUI/package-lock.json
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install web dependencies
+        working-directory: AudioMatrixRouter/WebUI
+        run: npm ci
+
+      - name: Build web UI
+        working-directory: AudioMatrixRouter/WebUI
+        run: npm run build
+
+      - name: Restore .NET dependencies
+        run: dotnet restore AudioMatrixRouter/AudioMatrixRouter.csproj
+
+      - name: Publish portable binary
+        run: >-
+          dotnet publish AudioMatrixRouter/AudioMatrixRouter.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:PublishTrimmed=false
+          -p:Platform=x64
+          -o artifacts/windows-portable
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path artifacts/windows-portable/* -DestinationPath artifacts/audio-router-matrix-win-x64-portable.zip -Force
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-router-matrix-win-x64-portable
+          path: artifacts/audio-router-matrix-win-x64-portable.zip
+          if-no-files-found: error

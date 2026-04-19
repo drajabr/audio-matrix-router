@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'AudioMatrixRouter'">
+    <BaseOutputPath>$(MSBuildThisFileDirectory)build\desktop\</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory).intermediate\obj\</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>
