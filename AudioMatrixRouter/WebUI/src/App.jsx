@@ -628,6 +628,7 @@ export default function App({ runtime = "web" }) {
   const [activeQuickPicker, setActiveQuickPicker] = useState("");
   const [startupAtBoot, setStartupAtBoot] = useState(false);
   const [showAllDevices, setShowAllDevices] = useState(false);
+  const [locked, setLocked] = useState(false);
   const [powerOn, setPowerOn] = useState(() => {
     if (typeof window === "undefined") return true;
     return localStorage.getItem(POWER_ON_KEY) !== "0";
@@ -730,18 +731,39 @@ export default function App({ runtime = "web" }) {
 
   useEffect(() => {
     localStorage.setItem(QUICK_CONTROLS_COLLAPSED_KEY, controlsCollapsed ? "1" : "0");
+    if (devicesDiscoveredRef.current) {
+      persistState(buildPersistedState({ controlsCollapsed }));
+    }
   }, [controlsCollapsed]);
 
   useEffect(() => {
     localStorage.setItem(POWER_ON_KEY, powerOn ? "1" : "0");
+    if (devicesDiscoveredRef.current) {
+      persistState(buildPersistedState({ powerOn }));
+    }
   }, [powerOn]);
 
   useEffect(() => {
+    if (!devicesDiscoveredRef.current) return;
+    persistState(buildPersistedState({ showAllDevices, locked }));
+  }, [showAllDevices, locked]);
+
+  useEffect(() => {
     if (!hasNativeBridge) return;
+    window.__nativeBridgeInvoke("getState", {})
+      .then((state) => setLocked(!!state?.locked))
+      .catch(() => {});
     window.__nativeBridgeInvoke("getStartupAtBoot")
       .then((value) => setStartupAtBoot(!!value))
       .catch(() => {});
   }, [hasNativeBridge]);
+
+  useEffect(() => {
+    if (!locked) return;
+    setSelectedCell(null);
+    setTileMenuCell(null);
+    setGainAdjustCell(null);
+  }, [locked]);
 
   useEffect(() => {
     const onClick = (event) => {
@@ -972,11 +994,56 @@ export default function App({ runtime = "web" }) {
   const selectedConnection = selectedKey ? activeMatrix[selectedKey] || makeDefaultConnection() : null;
   const isHoverDetail = !!selectedCell;
 
+  const buildPersistedState = (overrides = {}) => ({
+    backgroundKey: BACKGROUND_PRESETS[backgroundIndex]?.key,
+    accentKey: ACCENT_PRESETS[accentIndex]?.key,
+    fontKey: FONT_PRESETS[fontIndex]?.key,
+    fontSizeKey: FONT_SIZE_PRESETS[fontSizeIndex]?.key,
+    controlsCollapsed,
+    showAllDevices,
+    powerOn,
+    locked,
+    inputLabels,
+    outputLabels,
+    inputMasterId,
+    outputMasterId,
+    viewMode,
+    labelSizing,
+    matrixByView,
+    inputOrder: inputs.map((d) => d.deviceId),
+    outputOrder: outputs.map((d) => d.deviceId),
+    ...overrides,
+  });
+
   const persistState = (next) => {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
     } catch (_) {
       // no-op
+    }
+
+    if (hasNativeBridge) {
+      window.__nativeBridgeInvoke("setUiPreferences", { json: JSON.stringify(next) }).catch(() => {});
+    }
+  };
+
+  const loadPersistedState = async () => {
+    if (hasNativeBridge) {
+      try {
+        const raw = await window.__nativeBridgeInvoke("getUiPreferences", {});
+        if (typeof raw === "string" && raw.trim()) {
+          return JSON.parse(raw);
+        }
+      } catch (_) {
+        // Fall through to local storage fallback.
+      }
+    }
+
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      return null;
     }
   };
 
@@ -1017,6 +1084,29 @@ export default function App({ runtime = "web" }) {
     try {
       setIsReloadingDevices(true);
       setError("");
+      const saved = await loadPersistedState();
+
+      if (saved?.backgroundKey) {
+        const backgroundMatch = BACKGROUND_PRESETS.findIndex((p) => p.key === saved.backgroundKey);
+        if (backgroundMatch >= 0) setBackgroundIndex(backgroundMatch);
+      }
+      if (saved?.accentKey) {
+        const accentMatch = ACCENT_PRESETS.findIndex((p) => p.key === saved.accentKey);
+        if (accentMatch >= 0) setAccentIndex(accentMatch);
+      }
+      if (saved?.fontKey) {
+        const fontMatch = FONT_PRESETS.findIndex((p) => p.key === saved.fontKey);
+        if (fontMatch >= 0) setFontIndex(fontMatch);
+      }
+      if (saved?.fontSizeKey) {
+        const fontSizeMatch = FONT_SIZE_PRESETS.findIndex((p) => p.key === saved.fontSizeKey);
+        if (fontSizeMatch >= 0) setFontSizeIndex(fontSizeMatch);
+      }
+      if (typeof saved?.controlsCollapsed === "boolean") setControlsCollapsed(saved.controlsCollapsed);
+      if (typeof saved?.showAllDevices === "boolean") setShowAllDevices(saved.showAllDevices);
+      if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
+      if (!hasNativeBridge && typeof saved?.locked === "boolean") setLocked(saved.locked);
+
       await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
 
       const devices = await navigator.mediaDevices.enumerateDevices();
@@ -1033,14 +1123,6 @@ export default function App({ runtime = "web" }) {
           deviceId: d.deviceId,
           label: d.label || `Output ${i + 1}`,
         }));
-
-      let saved = null;
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) saved = JSON.parse(raw);
-      } catch (_) {
-        saved = null;
-      }
 
       const savedInputOrder = saved?.inputOrder || [];
       const savedOutputOrder = saved?.outputOrder || [];
@@ -1069,8 +1151,8 @@ export default function App({ runtime = "web" }) {
       setOutputs(orderedOutputs);
       devicesDiscoveredRef.current = true;
 
-      const nextInputLabels = createLabelMap(discoveredInputs, {}, "Input");
-      const nextOutputLabels = createLabelMap(discoveredOutputs, {}, "Output");
+      const nextInputLabels = createLabelMap(discoveredInputs, saved?.inputLabels || {}, "Input");
+      const nextOutputLabels = createLabelMap(discoveredOutputs, saved?.outputLabels || {}, "Output");
 
       const deviceRows = orderedInputs.map((i) => ({ id: `dev:${i.deviceId}` }));
       const deviceCols = orderedOutputs.map((o) => ({ id: `dev:${o.deviceId}` }));
@@ -1127,7 +1209,15 @@ export default function App({ runtime = "web" }) {
       if (nextInputMaster) pushInputMasterToNative(nextInputMaster);
       if (nextOutputMaster) pushOutputMasterToNative(nextOutputMaster);
 
-      const snapshot = {
+      const snapshot = buildPersistedState({
+        backgroundKey: saved?.backgroundKey || BACKGROUND_PRESETS[backgroundIndex]?.key,
+        accentKey: saved?.accentKey || ACCENT_PRESETS[accentIndex]?.key,
+        fontKey: saved?.fontKey || FONT_PRESETS[fontIndex]?.key,
+        fontSizeKey: saved?.fontSizeKey || FONT_SIZE_PRESETS[fontSizeIndex]?.key,
+        controlsCollapsed: typeof saved?.controlsCollapsed === "boolean" ? saved.controlsCollapsed : controlsCollapsed,
+        showAllDevices: typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : showAllDevices,
+        powerOn: typeof saved?.powerOn === "boolean" ? saved.powerOn : powerOn,
+        locked: hasNativeBridge ? locked : !!saved?.locked,
         inputLabels: nextInputLabels,
         outputLabels: nextOutputLabels,
         inputMasterId: nextInputMaster,
@@ -1137,7 +1227,7 @@ export default function App({ runtime = "web" }) {
         matrixByView: nextMatrixByView,
         inputOrder: orderedInputs.map((d) => d.deviceId),
         outputOrder: orderedOutputs.map((d) => d.deviceId),
-      };
+      });
       persistState(snapshot);
 
       const discoveredConfigured = collectConfiguredDeviceIds(nextMatrixByView);
@@ -1210,12 +1300,7 @@ export default function App({ runtime = "web" }) {
     setSelectedCell(null);
 
     persistState({
-      viewMode,
-      inputLabels,
-      outputLabels,
-      inputMasterId,
-      outputMasterId,
-      labelSizing,
+      ...buildPersistedState(),
       matrixByView: nextMatrixByView,
       inputOrder: inputs.map((d) => d.deviceId),
       outputOrder: outputs.map((d) => d.deviceId),
@@ -1255,12 +1340,7 @@ export default function App({ runtime = "web" }) {
     if (!devicesDiscoveredRef.current) return;
     
     persistState({
-      viewMode,
-      inputLabels,
-      outputLabels,
-      inputMasterId,
-      outputMasterId,
-      labelSizing,
+      ...buildPersistedState(),
       matrixByView,
       inputOrder: inputs.map((d) => d.deviceId),
       outputOrder: outputs.map((d) => d.deviceId),
@@ -1482,12 +1562,9 @@ export default function App({ runtime = "web" }) {
       managerRef.current.setCrosspointGain(viewMode, rowId, colId, resolveLinearGain(nextConnection));
 
       persistState({
-        viewMode,
-        inputLabels,
-        outputLabels,
+        ...buildPersistedState(),
         inputMasterId: nextInputMasterId,
         outputMasterId: nextOutputMasterId,
-        labelSizing,
         matrixByView: next,
       });
 
@@ -1579,12 +1656,8 @@ export default function App({ runtime = "web" }) {
 
           matrixRef.current = nextMatrix;
           persistState({
+            ...buildPersistedState(),
             viewMode: nextMode,
-            inputLabels,
-            outputLabels,
-            inputMasterId,
-            outputMasterId,
-            labelSizing,
             matrixByView: nextMatrix,
           });
 
@@ -1592,12 +1665,8 @@ export default function App({ runtime = "web" }) {
         });
       } else {
         persistState({
+          ...buildPersistedState(),
           viewMode: nextMode,
-          inputLabels,
-          outputLabels,
-          inputMasterId,
-          outputMasterId,
-          labelSizing,
           matrixByView: matrixRef.current,
         });
       }

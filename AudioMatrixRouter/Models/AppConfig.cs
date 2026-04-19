@@ -31,6 +31,7 @@ public class AppConfig
     public List<DeviceConfig> OutputDevices { get; set; } = [];
     public List<CrosspointConfig> Crosspoints { get; set; } = [];
     public bool Locked { get; set; }
+    public string UiPreferencesJson { get; set; } = "";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -67,12 +68,13 @@ public class AppConfig
         catch { }
     }
 
-    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized)
+    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, string uiPreferencesJson)
     {
         var config = new AppConfig
         {
             Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized },
-            Locked = locked
+            Locked = locked,
+            UiPreferencesJson = uiPreferencesJson ?? ""
         };
 
         foreach (var d in engine.InputDevices)

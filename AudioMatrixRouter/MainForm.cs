@@ -32,6 +32,7 @@ public sealed class MainForm : Form
     private bool _allowRealClose;
     private readonly bool _forceStartMinimized;
     private bool _startMinimizedFromConfig;
+    private string _uiPreferencesJson = "";
     private const string StartupRunEntryName = "AudioMatrixRouter";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -272,6 +273,7 @@ public sealed class MainForm : Form
         {
             loadedConfig.ApplyToEngine(_engine);
             _locked = loadedConfig.Locked;
+            _uiPreferencesJson = loadedConfig.UiPreferencesJson ?? "";
 
             if (loadedConfig.Window.Width > 0 && loadedConfig.Window.Height > 0)
             {
@@ -330,7 +332,7 @@ public sealed class MainForm : Form
         }
 
         var startMinimized = WindowState == FormWindowState.Minimized || !Visible || !ShowInTaskbar;
-        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized);
+        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _uiPreferencesJson);
         config.Save();
     }
 
@@ -445,6 +447,18 @@ public sealed class MainForm : Form
                     _locked = request.Params.TryGetProperty("locked", out var lockValue) && lockValue.GetBoolean();
                     ScheduleSave();
                     await SendResultAsync(request.Id, BuildUiState());
+                    return;
+
+                case "getUiPreferences":
+                    await SendResultAsync(request.Id, _uiPreferencesJson);
+                    return;
+
+                case "setUiPreferences":
+                    _uiPreferencesJson = request.Params.TryGetProperty("json", out var uiJsonValue)
+                        ? uiJsonValue.GetString() ?? string.Empty
+                        : string.Empty;
+                    ScheduleSave();
+                    await SendResultAsync(request.Id, true);
                     return;
 
                 case "clearRoutes":
