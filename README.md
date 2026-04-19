@@ -104,9 +104,8 @@ Saved fields include:
 
 ## CI/CD
 
-- Build workflow: .github/workflows/ci.yml
-- Pages workflow: .github/workflows/pages.yml
-- Release workflow: .github/workflows/release.yml
+- Build and release workflow: .github/workflows/ci.yml
+- Pages deployment workflow: .github/workflows/pages.yml
 
 GitHub Pages base path is resolved from repository name during CI so assets load correctly for current and renamed repos.
 
