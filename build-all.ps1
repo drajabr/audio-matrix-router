@@ -7,9 +7,20 @@ $webOut = Join-Path $buildRoot 'web'
 $desktopOut = Join-Path $buildRoot 'desktop'
 $webUiPath = Join-Path $PSScriptRoot 'AudioMatrixRouter\WebUI'
 $desktopProject = Join-Path $PSScriptRoot 'AudioMatrixRouter\AudioMatrixRouter.csproj'
+$desktopConfigPath = Join-Path $desktopOut 'config.json'
+$preservedConfig = $null
 
 Write-Host 'Stopping running desktop processes...'
 Get-Process AudioMatrixRouter, msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+if (Test-Path $desktopConfigPath) {
+  try {
+    $preservedConfig = Get-Content $desktopConfigPath -Raw
+    Write-Host 'Preserved existing desktop config.json'
+  } catch {
+    Write-Host 'Warning: Could not preserve existing config.json; continuing with clean build.'
+  }
+}
 
 Write-Host 'Cleaning build output folders...'
 if (Test-Path $buildRoot) {
@@ -32,6 +43,15 @@ Pop-Location
 Write-Host 'Publishing desktop app...'
 dotnet clean $desktopProject -c Release
 dotnet publish $desktopProject -c Release -r win-x64 --self-contained false -o $desktopOut -p:UseSharedCompilation=false -t:Rebuild
+
+if ($null -ne $preservedConfig -and -not (Test-Path $desktopConfigPath)) {
+  try {
+    Set-Content -Path $desktopConfigPath -Value $preservedConfig -Encoding UTF8
+    Write-Host 'Restored preserved desktop config.json'
+  } catch {
+    Write-Host 'Warning: Failed to restore preserved config.json.'
+  }
+}
 
 Write-Host 'Removing nested build trees from desktop output...'
 @('Release', 'Debug', 'x64') | ForEach-Object {

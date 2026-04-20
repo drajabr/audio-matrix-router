@@ -706,6 +706,16 @@ export default function App({ runtime = "web" }) {
   const visibleInputs = showAllDevices ? inputs : routedInputs;
   const visibleOutputs = showAllDevices ? outputs : routedOutputs;
 
+  const monitoredInputs = useMemo(() => {
+    if (locked) return routedInputs;
+    return showAllDevices ? inputs : routedInputs;
+  }, [locked, showAllDevices, inputs, routedInputs]);
+
+  const monitoredOutputs = useMemo(() => {
+    if (locked) return routedOutputs;
+    return showAllDevices ? outputs : routedOutputs;
+  }, [locked, showAllDevices, outputs, routedOutputs]);
+
   useEffect(() => {
     const root = document.documentElement;
     const background = BACKGROUND_PRESETS[backgroundIndex] || BACKGROUND_PRESETS[0];
@@ -955,6 +965,64 @@ export default function App({ runtime = "web" }) {
     window.__nativeBridgeInvoke("setOutputMasterDevice", { deviceId }).catch(() => {});
   };
 
+  const syncConnectionToNative = async (mode, rowId, colId, connection) => {
+    if (!hasNativeBridge) return;
+
+    const state = await window.__nativeBridgeInvoke("getState", {});
+    const nativeInputs = Array.isArray(state?.inputs) ? state.inputs : [];
+    const nativeOutputs = Array.isArray(state?.outputs) ? state.outputs : [];
+
+    const active = !!connection?.on && !connection?.muted;
+    const baseGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
+
+    const routeCalls = [];
+
+    if (mode === "channel") {
+      const rowParsed = parseChannelId(rowId);
+      const colParsed = parseChannelId(colId);
+      if (!rowParsed || !colParsed) return;
+
+      const inputDevice = nativeInputs.find((d) => d.deviceId === rowParsed.deviceId);
+      const outputDevice = nativeOutputs.find((d) => d.deviceId === colParsed.deviceId);
+      if (!inputDevice || !outputDevice) return;
+
+      const inCh = (inputDevice.offset || 0) + rowParsed.channelIndex;
+      const outCh = (outputDevice.offset || 0) + colParsed.channelIndex;
+
+      routeCalls.push(window.__nativeBridgeInvoke("setCrosspoint", {
+        inCh,
+        outCh,
+        active,
+        gainDb: baseGainDb,
+      }));
+    } else {
+      const inputDeviceId = rowId.startsWith("dev:") ? rowId.slice(4) : "";
+      const outputDeviceId = colId.startsWith("dev:") ? colId.slice(4) : "";
+      if (!inputDeviceId || !outputDeviceId) return;
+
+      const inputDevice = nativeInputs.find((d) => d.deviceId === inputDeviceId);
+      const outputDevice = nativeOutputs.find((d) => d.deviceId === outputDeviceId);
+      if (!inputDevice || !outputDevice) return;
+
+      const inChannels = Array.from({ length: inputDevice.channels || 0 }, (_, i) => i);
+      const outChannels = Array.from({ length: outputDevice.channels || 0 }, (_, i) => i);
+      const routes = buildDeviceToChannelRouteMatrix(inChannels, outChannels);
+
+      routes.forEach((route) => {
+        routeCalls.push(window.__nativeBridgeInvoke("setCrosspoint", {
+          inCh: (inputDevice.offset || 0) + route.inChannel,
+          outCh: (outputDevice.offset || 0) + route.outChannel,
+          active,
+          gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+        }));
+      });
+    }
+
+    if (routeCalls.length > 0) {
+      await Promise.all(routeCalls);
+    }
+  };
+
   const setInputMaster = (deviceId, syncNative = true) => {
     if (!deviceId) return;
     setInputMasterId(deviceId);
@@ -1077,9 +1145,9 @@ export default function App({ runtime = "web" }) {
       return;
     }
 
-    if (routedInputs.length === 0 || routedOutputs.length === 0) return;
+    if (monitoredInputs.length === 0 || monitoredOutputs.length === 0) return;
 
-    await managerRef.current.setup(routedInputs, routedOutputs, mode);
+    await managerRef.current.setup(monitoredInputs, monitoredOutputs, mode);
     applyMatrixToEngine(mode, nextMatrixByView[mode] || {});
 
     try {
@@ -1241,11 +1309,13 @@ export default function App({ runtime = "web" }) {
       persistState(snapshot);
 
       const discoveredConfigured = collectConfiguredDeviceIds(nextMatrixByView);
-      const activeInputs = orderedInputs.filter((d) => discoveredConfigured.configuredInputIds.has(d.deviceId));
-      const activeOutputs = orderedOutputs.filter((d) => discoveredConfigured.configuredOutputIds.has(d.deviceId));
+      const discoveredRoutedInputs = orderedInputs.filter((d) => discoveredConfigured.configuredInputIds.has(d.deviceId));
+      const discoveredRoutedOutputs = orderedOutputs.filter((d) => discoveredConfigured.configuredOutputIds.has(d.deviceId));
+      const setupInputs = locked ? discoveredRoutedInputs : (showAllDevices ? orderedInputs : discoveredRoutedInputs);
+      const setupOutputs = locked ? discoveredRoutedOutputs : (showAllDevices ? orderedOutputs : discoveredRoutedOutputs);
 
-      if (powerOn && activeInputs.length > 0 && activeOutputs.length > 0) {
-        await managerRef.current.setup(activeInputs, activeOutputs, nextViewMode);
+      if (powerOn && setupInputs.length > 0 && setupOutputs.length > 0) {
+        await managerRef.current.setup(setupInputs, setupOutputs, nextViewMode);
         applyMatrixToEngine(nextViewMode, nextMatrixByView[nextViewMode]);
 
         try {
@@ -1349,6 +1419,13 @@ export default function App({ runtime = "web" }) {
 
   useEffect(() => {
     if (!devicesDiscoveredRef.current) return;
+    if (!powerOn) return;
+    if (monitoredInputs.length === 0 || monitoredOutputs.length === 0) return;
+    rebuildAudioGraph(viewMode, matrixRef.current);
+  }, [inputs, outputs, locked, showAllDevices, monitoredInputs, monitoredOutputs]);
+
+  useEffect(() => {
+    if (!devicesDiscoveredRef.current) return;
     
     persistState({
       ...buildPersistedState(),
@@ -1378,44 +1455,31 @@ export default function App({ runtime = "web" }) {
 
   useEffect(() => {
     const tick = () => {
-      const currentMode = modeRef.current;
-      const currentMatrix = matrixRef.current[currentMode] || {};
-      const activeSet = new Set();
-      Object.entries(currentMatrix).forEach(([key, conn]) => {
-        if (conn.on && !conn.muted) {
-          const [rowId, colId] = key.split("::");
-          activeSet.add(rowId);
-          activeSet.add(colId);
-        }
-      });
-
       const nextInput = {};
       rows.forEach((row) => {
-        nextInput[row.id] = activeSet.has(row.id) ? managerRef.current.getInputLevel(row.id) : 0;
+        nextInput[row.id] = managerRef.current.getInputLevel(row.id);
       });
 
-      if (currentMode === "device") {
+      if (modeRef.current === "device") {
         inputs.forEach((input) => {
-          const deviceActive = activeSet.has(`dev:${input.deviceId}`);
           const leftId = `ch:${input.deviceId}:0`;
           const rightId = `ch:${input.deviceId}:1`;
-          nextInput[leftId] = deviceActive ? managerRef.current.getInputLevel(leftId) : 0;
-          nextInput[rightId] = deviceActive ? managerRef.current.getInputLevel(rightId) : 0;
+          nextInput[leftId] = managerRef.current.getInputLevel(leftId);
+          nextInput[rightId] = managerRef.current.getInputLevel(rightId);
         });
       }
 
       const nextOutput = {};
       cols.forEach((col) => {
-        nextOutput[col.id] = activeSet.has(col.id) ? managerRef.current.getOutputLevel(col.id) : 0;
+        nextOutput[col.id] = managerRef.current.getOutputLevel(col.id);
       });
 
-      if (currentMode === "device") {
+      if (modeRef.current === "device") {
         outputs.forEach((output) => {
-          const deviceActive = activeSet.has(`dev:${output.deviceId}`);
           const leftId = `ch:${output.deviceId}:0`;
           const rightId = `ch:${output.deviceId}:1`;
-          nextOutput[leftId] = deviceActive ? managerRef.current.getOutputLevel(leftId) : 0;
-          nextOutput[rightId] = deviceActive ? managerRef.current.getOutputLevel(rightId) : 0;
+          nextOutput[leftId] = managerRef.current.getOutputLevel(leftId);
+          nextOutput[rightId] = managerRef.current.getOutputLevel(rightId);
         });
       }
 
@@ -1477,12 +1541,14 @@ export default function App({ runtime = "web" }) {
     let shouldReloadForMasterSwitch = false;
     let nextInputMasterId = inputMasterId;
     let nextOutputMasterId = outputMasterId;
+    let updatedConnection = null;
 
     setMatrixByView((prev) => {
       const currentModeMatrix = prev[viewMode] || {};
       const currentConnection = currentModeMatrix[key] || makeDefaultConnection();
       const rawNextConnection = typeof updater === "function" ? updater(currentConnection) : updater;
       const nextConnection = sanitizeConnection(rawNextConnection);
+      updatedConnection = nextConnection;
 
       if (nextConnection.on) {
         const pair = getDevicePairFromRoute(rowId, colId);
@@ -1583,6 +1649,10 @@ export default function App({ runtime = "web" }) {
 
       return next;
     });
+
+    if (hasNativeBridge && updatedConnection) {
+      syncConnectionToNative(viewMode, rowId, colId, updatedConnection).catch(() => {});
+    }
 
     if (shouldReloadForMasterSwitch && powerOn) {
       rebuildAudioGraph(viewMode, matrixRef.current);

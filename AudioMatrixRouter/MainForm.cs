@@ -203,7 +203,18 @@ public sealed class MainForm : Form
 
     private async Task InitializeWebViewAsync()
     {
-        await _webView.EnsureCoreWebView2Async();
+        var envOptions = new CoreWebView2EnvironmentOptions
+        {
+            AdditionalBrowserArguments = string.Join(" ",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--enable-gpu-rasterization",
+                "--enable-zero-copy")
+        };
+
+        var webViewEnv = await CoreWebView2Environment.CreateAsync(options: envOptions);
+        await _webView.EnsureCoreWebView2Async(webViewEnv);
 
         _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
         _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
@@ -480,6 +491,16 @@ public sealed class MainForm : Form
                     if (!_locked)
                     {
                         _engine.SetCrosspoint(inCh, outCh, active, gainDb);
+
+                        if (active && !_engine.IsRunning)
+                        {
+                            _engine.Start();
+                        }
+                        else if (!active && _engine.IsRunning && !_engine.RoutingMatrix.HasAnyCrosspoints())
+                        {
+                            _engine.Stop();
+                        }
+
                         ScheduleSave();
                     }
 
