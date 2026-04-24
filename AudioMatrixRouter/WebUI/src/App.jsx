@@ -654,6 +654,7 @@ export default function App({ runtime = "web" }) {
   const [tileMenuCell, setTileMenuCell] = useState(null);
   const [gainAdjustCell, setGainAdjustCell] = useState(null);
   const [transientMuteAll, setTransientMuteAll] = useState(false);
+  const [showResizeGuides, setShowResizeGuides] = useState(false);
 
   const [viewMode, setViewMode] = useState("device");
   const [inputs, setInputs] = useState([]);
@@ -2277,13 +2278,26 @@ export default function App({ runtime = "web" }) {
       <main className="main-layout">
         <section className="matrix-wrap rack-panel">
           <div
-            className={`matrix-grid${selectedCell ? " has-selection" : ""}`}
+            className={`matrix-grid${selectedCell ? " has-selection" : ""}${showResizeGuides ? " show-resize-guides" : ""}`}
             style={{
               gridTemplateColumns: `${scaledSourceWidth}px repeat(${Math.max(cols.length, 1)}, ${scaledCellSize}px)`,
               gridTemplateRows: `${scaledDestinationHeight}px`,
               gridAutoRows: `${scaledCellSize}px`,
             }}
+            onMouseMove={(event) => {
+              const rect = event.currentTarget.getBoundingClientRect();
+              const x = event.clientX - rect.left;
+              const y = event.clientY - rect.top;
+              const threshold = 18;
+              const nearSourceAxis = Math.abs(x - scaledSourceWidth) <= threshold;
+              const nearDestAxis = Math.abs(y - scaledDestinationHeight) <= threshold;
+              const nextVisible = nearSourceAxis || nearDestAxis;
+              if (nextVisible !== showResizeGuides) {
+                setShowResizeGuides(nextVisible);
+              }
+            }}
             onMouseLeave={() => {
+              setShowResizeGuides(false);
               if (locked) return;
               if (!tileMenuCell && !gainAdjustCell) {
                 setSelectedCell(null);
@@ -2294,13 +2308,12 @@ export default function App({ runtime = "web" }) {
               <div className="corner-controls" role="group" aria-label="Matrix quick controls">
                 <button
                   type="button"
-                  className="corner-control-btn corner-control-tl"
-                  onClick={handleReloadDevices}
-                  disabled={isReloadingDevices}
-                  title="Restart and reload devices"
-                  aria-label="Restart and reload devices"
+                  className={`corner-control-btn corner-control-tl ${powerOn ? "active" : ""}`}
+                  onClick={togglePowerState}
+                  title={powerOn ? "Power on (click to power off)" : "Power off (click to power on)"}
+                  aria-label="Toggle power"
                 >
-                  <span aria-hidden="true">↻</span>
+                  <span aria-hidden="true">⏻</span>
                 </button>
                 <button
                   type="button"
@@ -2344,26 +2357,27 @@ export default function App({ runtime = "web" }) {
                 </button>
                 <button
                   type="button"
-                  className={`corner-control-btn corner-control-mid ${powerOn ? "active" : ""}`}
-                  onClick={togglePowerState}
-                  title={powerOn ? "Power on (click to power off)" : "Power off (click to power on)"}
-                  aria-label="Toggle power"
+                  className={`corner-control-btn corner-control-mid ${isReloadingDevices ? "active" : ""}`}
+                  onClick={handleReloadDevices}
+                  disabled={isReloadingDevices}
+                  title="Restart and reload devices"
+                  aria-label="Restart and reload devices"
                 >
-                  <span aria-hidden="true">⏻</span>
+                  <span aria-hidden="true">↻</span>
                 </button>
               </div>
             </div>
             <button
               type="button"
               className="resize-handle grid-resize-handle grid-source-width-handle"
-              style={{ left: `${scaledSourceWidth - 6}px` }}
+              style={{ left: `${scaledSourceWidth + 1}px` }}
               onMouseDown={beginResizeSourceWidth}
               aria-label="Resize source label width"
             />
             <button
               type="button"
               className="resize-handle grid-resize-handle grid-dest-height-handle"
-              style={{ top: `${scaledDestinationHeight - 6}px` }}
+              style={{ top: `${scaledDestinationHeight + 1}px` }}
               onMouseDown={beginResizeDestinationHeight}
               aria-label="Resize destination label height"
             />
@@ -2663,7 +2677,7 @@ export default function App({ runtime = "web" }) {
         </div>
 
         <div className="dock-col dock-card">
-          <div className="card-main-copy card-main-copy-split is-right">
+          <div className="card-main-copy card-main-copy-split">
             <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true">
               <span className="meter-bar meter-bar-l" style={{ width: `${Math.round(selectedDestinationSplit[0] * 100)}%` }} />
               <span className="meter-bar meter-bar-r" style={{ width: `${Math.round(selectedDestinationSplit[1] * 100)}%` }} />
