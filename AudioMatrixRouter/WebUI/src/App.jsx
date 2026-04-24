@@ -1339,7 +1339,6 @@ export default function App({ runtime = "web" }) {
 
   const handleReloadDevices = async (event) => {
     event?.stopPropagation?.();
-    if (locked) return;
     setSelectedCell(null);
     setTileMenuCell(null);
     setGainAdjustCell(null);
@@ -1795,7 +1794,6 @@ export default function App({ runtime = "web" }) {
   };
 
   const togglePowerState = async () => {
-    if (locked) return;
     const next = !powerOn;
     setPowerOn(next);
     if (hasNativeBridge) {
@@ -2114,7 +2112,7 @@ export default function App({ runtime = "web" }) {
                   type="button"
                   className="corner-control-btn corner-control-tl"
                   onClick={handleReloadDevices}
-                  disabled={locked || isReloadingDevices}
+                  disabled={isReloadingDevices}
                   title="Restart and reload devices"
                   aria-label="Restart and reload devices"
                 >
@@ -2157,7 +2155,6 @@ export default function App({ runtime = "web" }) {
                   onClick={togglePowerState}
                   title={powerOn ? "Power on (click to power off)" : "Power off (click to power on)"}
                   aria-label="Toggle power"
-                  disabled={locked}
                 >
                   <span aria-hidden="true">⏻</span>
                 </button>
