@@ -69,6 +69,9 @@ public class RingBuffer
     public bool Write(float[] data, int offset, int frameCount)
     {
         int samples = frameCount * _channels;
+        if (samples <= 0) return true;
+        if (samples >= _capacity) return false;
+
         int wp = _writePos;
 
         int maxUnread = 0;
@@ -79,10 +82,25 @@ public class RingBuffer
                 int unread = (wp - rp + _capacity) % _capacity;
                 if (unread > maxUnread) maxUnread = unread;
             }
-        }
 
-        int free = _capacity - 1 - maxUnread;
-        if (samples > free) return false; // overflow
+            int free = _capacity - 1 - maxUnread;
+            if (samples > free)
+            {
+                // Realtime policy: if a consumer lags too far behind, drop its oldest samples
+                // so producer never stalls all outputs.
+                int allowedUnread = _capacity - 1 - samples;
+                var keys = new List<string>(_consumerReadPos.Keys);
+                foreach (var key in keys)
+                {
+                    int rp = _consumerReadPos[key];
+                    int unread = (wp - rp + _capacity) % _capacity;
+                    if (unread <= allowedUnread) continue;
+
+                    int advance = unread - allowedUnread;
+                    _consumerReadPos[key] = (rp + advance) % _capacity;
+                }
+            }
+        }
 
         for (int i = 0; i < samples; i++)
         {

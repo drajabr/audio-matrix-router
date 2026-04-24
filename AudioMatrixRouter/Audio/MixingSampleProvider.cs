@@ -5,8 +5,9 @@ namespace AudioMatrixRouter.Audio;
 
 public sealed class OutputSyncCoordinator
 {
-    private const double MaxPpmCorrection = 200.0;
-    private const double RatioSmoothing = 0.15;
+    private const double MaxPpmCorrection = 40.0;
+    private const double RatioSmoothing = 0.03;
+    private const int WarmupFrames = 48000 * 2;
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
@@ -57,6 +58,12 @@ public sealed class OutputSyncCoordinator
                 return;
             }
 
+            if (state.FramesRendered < WarmupFrames)
+            {
+                state.Ratio = 1.0;
+                return;
+            }
+
             if (!_states.TryGetValue(_masterConsumerId, out var masterState))
             {
                 return;
@@ -64,7 +71,7 @@ public sealed class OutputSyncCoordinator
 
             long frameError = masterState.FramesRendered - state.FramesRendered;
             double maxRatioDelta = MaxPpmCorrection / 1_000_000.0;
-            double target = 1.0 + Math.Clamp(frameError * 1e-7, -maxRatioDelta, maxRatioDelta);
+            double target = 1.0 + Math.Clamp(frameError * 2e-8, -maxRatioDelta, maxRatioDelta);
             state.Ratio += (target - state.Ratio) * RatioSmoothing;
         }
     }
@@ -85,6 +92,7 @@ public sealed class OutputSyncCoordinator
 /// </summary>
 public class MixingSampleProvider : ISampleProvider
 {
+    private const double ResampleEpsilon = 0.00005;
     private readonly RoutingMatrix _matrix;
     private readonly List<CaptureSource> _sources;
     private readonly int _outputChannelOffset;
@@ -154,9 +162,20 @@ public class MixingSampleProvider : ISampleProvider
         if (frames <= 0) return 0;
 
         double ratio = _syncCoordinator.GetConsumerRatio(_consumerId);
-        double desiredSourceFrames = frames * ratio + _sourceFrameAccumulator;
-        int sourceFrames = Math.Max(1, (int)Math.Floor(desiredSourceFrames));
-        _sourceFrameAccumulator = desiredSourceFrames - sourceFrames;
+        bool requiresResample = Math.Abs(ratio - 1.0) >= ResampleEpsilon;
+
+        int sourceFrames;
+        if (requiresResample)
+        {
+            double desiredSourceFrames = frames * ratio + _sourceFrameAccumulator;
+            sourceFrames = Math.Max(1, (int)Math.Floor(desiredSourceFrames));
+            _sourceFrameAccumulator = desiredSourceFrames - sourceFrames;
+        }
+        else
+        {
+            sourceFrames = frames;
+            _sourceFrameAccumulator = 0;
+        }
 
         int sourceSamples = sourceFrames * _outputChannels;
         if (_mixBuffer.Length < sourceSamples)
@@ -213,7 +232,7 @@ public class MixingSampleProvider : ISampleProvider
             src.Buffer.ReadForConsumer(_consumerId, _sourceTempBuffer, 0, framesRead);
         }
 
-        if (sourceFrames == frames)
+        if (!requiresResample || sourceFrames == frames)
         {
             for (int i = 0; i < count; i++)
             {
