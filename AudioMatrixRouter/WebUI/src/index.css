@@ -1032,11 +1032,11 @@ textarea {
 .inline-editor {
   border: 1px solid var(--line);
   border-radius: var(--radius-overlay);
-  padding: 8px;
+  padding: 6px;
   background: color-mix(in srgb, var(--panel) 78%, transparent);
   display: flex;
   align-items: stretch;
-  gap: 12px;
+  gap: 10px;
   flex-wrap: nowrap;
   flex-shrink: 0;
 }
@@ -1047,6 +1047,9 @@ textarea {
 
 .inline-editor.docked {
   margin-top: 10px;
+  height: 112px;
+  min-height: 112px;
+  max-height: 112px;
   overflow-x: auto;
   overflow-y: hidden;
 }
@@ -1202,8 +1205,8 @@ textarea {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  justify-content: center;
+  gap: 6px;
+  justify-content: flex-start;
 }
 
 .card-main-copy-split {
@@ -1213,6 +1216,70 @@ textarea {
   padding: 8px;
   background: color-mix(in srgb, var(--panel) 76%, transparent);
   min-width: 0;
+}
+
+.card-main-copy-split.is-right .detail-name-stack {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.detail-name-stack {
+  position: relative;
+  z-index: 2;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding-top: 18px;
+}
+
+.detail-name-main {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  line-height: 1.04;
+  color: var(--text-strong);
+}
+
+.detail-name-sub {
+  display: block;
+  width: 100%;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: var(--font-size-2xs);
+  line-height: 1.1;
+}
+
+.detail-master-badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 14px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: calc(var(--font-size-2xs) * 0.88);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--text-on-accent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18);
+}
+
+.card-main-copy-split.is-right .detail-master-badge {
+  left: auto;
+  right: 6px;
 }
 
 .card-metrics-box {
@@ -1269,14 +1336,7 @@ textarea {
   text-align: right;
 }
 
-.detail-line {
-  margin: 2px 0 0;
-  font-size: var(--font-size-2xs);
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+
 
 .v-label-spacer {
   flex: 1;

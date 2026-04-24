@@ -60,6 +60,8 @@ const FONT_SIZE_PRESETS = [
   { key: "3", label: "3", size: "16px" },
   { key: "4", label: "4", size: "17px" },
   { key: "5", label: "5", size: "18px" },
+  { key: "6", label: "6", size: "20px" },
+  { key: "7", label: "7", size: "22px" },
 ];
 
 const UI_SCALE_PRESETS = [
@@ -2220,6 +2222,9 @@ export default function App({ runtime = "web" }) {
               <button type="button" className="icon-btn icon-btn--square" title="Select UI scale" aria-label="Select UI scale" onClick={(event) => cyclePicker("uiScale", event)}>{UI_SCALE_PRESETS[uiScaleIndex]?.label || "MD"}</button>
             </div>
             <div className="quick-control-item">
+              <button type="button" className="icon-btn icon-btn--square" title="Select capture buffer" aria-label="Select capture buffer" onClick={(event) => cyclePicker("captureBuffer", event)}>{`${captureBufferMs}ms`}</button>
+            </div>
+            <div className="quick-control-item">
               <button
                 type="button"
                 className={`icon-btn icon-btn--square ${startupAtBoot ? "is-on" : ""}`}
@@ -2608,7 +2613,6 @@ export default function App({ runtime = "web" }) {
         </section>
       </main>
 
-      {detailCell && selectedConnection ? (
       <div className="inline-editor docked rack-panel">
         <div className="dock-col dock-card">
           <div className="card-main-copy card-main-copy-split">
@@ -2616,8 +2620,11 @@ export default function App({ runtime = "web" }) {
               <span className="meter-bar meter-bar-l" style={{ width: `${Math.round(selectedSourceSplit[0] * 100)}%` }} />
               <span className="meter-bar meter-bar-r" style={{ width: `${Math.round(selectedSourceSplit[1] * 100)}%` }} />
             </div>
-            <p>{selectedSource?.label || "Source"}</p>
-            {selectedSource?.hardwareLabel ? <p className="detail-line">{selectedSource.hardwareLabel}</p> : null}
+            {selectedSource?.isMaster ? <span className="detail-master-badge">MASTER</span> : null}
+            <div className="detail-name-stack">
+              <span className="detail-name-main">{selectedSource?.label || "Source"}</span>
+              {selectedSource?.hardwareLabel ? <span className="detail-name-sub">{selectedSource.hardwareLabel}</span> : null}
+            </div>
           </div>
           <div className="card-metrics-box">
             <div className="metric-tile">
@@ -2659,13 +2666,16 @@ export default function App({ runtime = "web" }) {
         </div>
 
         <div className="dock-col dock-card">
-          <div className="card-main-copy card-main-copy-split">
+          <div className="card-main-copy card-main-copy-split is-right">
             <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true">
               <span className="meter-bar meter-bar-l" style={{ width: `${Math.round(selectedDestinationSplit[0] * 100)}%` }} />
               <span className="meter-bar meter-bar-r" style={{ width: `${Math.round(selectedDestinationSplit[1] * 100)}%` }} />
             </div>
-            <p>{selectedDestination?.label || "Destination"}</p>
-            {selectedDestination?.hardwareLabel ? <p className="detail-line">{selectedDestination.hardwareLabel}</p> : null}
+            {selectedDestination?.isMaster ? <span className="detail-master-badge">MASTER</span> : null}
+            <div className="detail-name-stack">
+              <span className="detail-name-main">{selectedDestination?.label || "Destination"}</span>
+              {selectedDestination?.hardwareLabel ? <span className="detail-name-sub">{selectedDestination.hardwareLabel}</span> : null}
+            </div>
           </div>
           <div className="card-metrics-box">
             <div className="metric-tile">
@@ -2679,7 +2689,6 @@ export default function App({ runtime = "web" }) {
           </div>
         </div>
       </div>
-      ) : null}
     </div>
   );
 }
