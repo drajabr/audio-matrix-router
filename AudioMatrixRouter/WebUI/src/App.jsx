@@ -2253,21 +2253,6 @@ export default function App({ runtime = "web" }) {
                 </button>
               ))}
             </div>
-            <div className="quick-drawer-inline-setting" role="group" aria-label="Audio capture buffer setting">
-              <span className="quick-drawer-inline-label">Buffer</span>
-              <button
-                type="button"
-                className="quick-drawer-inline-btn"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  cycleCaptureBuffer();
-                }}
-                title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
-                aria-label="Cycle capture buffer size"
-              >
-                {`${captureBufferMs}ms`}
-              </button>
-            </div>
           </div>
           <button
             type="button"
@@ -2328,6 +2313,15 @@ export default function App({ runtime = "web" }) {
                 </button>
                 <button
                   type="button"
+                  className="corner-control-btn corner-control-buffer corner-control-btn--buffer"
+                  onClick={cycleCaptureBuffer}
+                  title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
+                  aria-label="Cycle capture buffer size"
+                >
+                  <span aria-hidden="true">{`${captureBufferMs}`}</span>
+                </button>
+                <button
+                  type="button"
                   className={`corner-control-btn corner-control-br ${viewMode === "channel" ? "active" : ""}`}
                   aria-label="Toggle channel view"
                   title={viewMode === "channel" ? "Switch to Device View" : "Switch to Channel View"}
@@ -2362,14 +2356,14 @@ export default function App({ runtime = "web" }) {
             <button
               type="button"
               className="resize-handle grid-resize-handle grid-source-width-handle"
-              style={{ left: `${labelSizing.sourceWidth - 3}px` }}
+              style={{ left: `${scaledSourceWidth - 6}px` }}
               onMouseDown={beginResizeSourceWidth}
               aria-label="Resize source label width"
             />
             <button
               type="button"
               className="resize-handle grid-resize-handle grid-dest-height-handle"
-              style={{ top: `${labelSizing.destinationHeight - 3}px` }}
+              style={{ top: `${scaledDestinationHeight - 6}px` }}
               onMouseDown={beginResizeDestinationHeight}
               aria-label="Resize destination label height"
             />
