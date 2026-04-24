@@ -1,5 +1,6 @@
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using System.Threading;
 
 namespace AudioMatrixRouter.Audio;
 
@@ -13,6 +14,8 @@ public class ActiveDevice
     public MixingSampleProvider? MixProvider { get; set; }
     public bool IsMasterDevice { get; set; }
     public int OutputDelayMs { get; set; }
+    public string ConsumerId { get; set; } = string.Empty;
+    public long InputOverflowCount;
 }
 
 public class AudioEngine : IDisposable
@@ -22,6 +25,15 @@ public class AudioEngine : IDisposable
     private readonly List<ActiveDevice> _outputDevices = [];
     private readonly RoutingMatrix _routingMatrix = new();
     private bool _running;
+    private OutputSyncCoordinator? _syncCoordinator;
+
+    private readonly record struct RoutedCrosspoint(
+        string InputDeviceId,
+        int InputLocalChannel,
+        string OutputDeviceId,
+        int OutputLocalChannel,
+        bool Active,
+        float GainDb);
 
     public event Action? DevicesChanged;
     public event Action? StateChanged;
@@ -119,26 +131,34 @@ public class AudioEngine : IDisposable
     public void RemoveInputDevice(int index)
     {
         if (index < 0 || index >= _inputDevices.Count) return;
+        var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
         if (wasRunning) Stop();
         _inputDevices.RemoveAt(index);
         RecalcChannelOffsets();
-        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0) Start();
+        RestoreRoutedCrosspoints(routeSnapshot);
+        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
     }
 
     public void RemoveOutputDevice(int index)
     {
         if (index < 0 || index >= _outputDevices.Count) return;
+        var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
         if (wasRunning) Stop();
         _outputDevices.RemoveAt(index);
         RecalcChannelOffsets();
-        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0) Start();
+        RestoreRoutedCrosspoints(routeSnapshot);
+        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
     }
 
     public void SetCrosspoint(int inCh, int outCh, bool active, float gainDb)
     {
-        _routingMatrix.SetCrosspoint(inCh, outCh, active, gainDb);
+        bool changed = _routingMatrix.SetCrosspoint(inCh, outCh, active, gainDb);
+        if (!changed)
+        {
+            return;
+        }
 
         if (active)
         {
@@ -162,6 +182,27 @@ public class AudioEngine : IDisposable
         }
 
         _routingMatrix.Publish();
+    }
+
+    public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb)> updates)
+    {
+        int changed = _routingMatrix.SetCrosspoints(updates);
+        if (changed > 0)
+        {
+            if (!_inputDevices.Any(d => d.IsMasterDevice))
+            {
+                var firstActiveInput = _inputDevices.FirstOrDefault();
+                if (firstActiveInput != null) SetInputMasterDevice(firstActiveInput.Info.Id);
+            }
+
+            if (!_outputDevices.Any(d => d.IsMasterDevice))
+            {
+                var firstActiveOutput = _outputDevices.FirstOrDefault();
+                if (firstActiveOutput != null) SetOutputMasterDevice(firstActiveOutput.Info.Id);
+            }
+        }
+
+        return changed;
     }
 
     private ActiveDevice? FindInputDeviceByChannel(int inCh)
@@ -194,6 +235,9 @@ public class AudioEngine : IDisposable
 
         try
         {
+            var masterOutput = GetOutputMasterDevice() ?? _outputDevices.First();
+            _syncCoordinator = new OutputSyncCoordinator(masterOutput.Info.Id);
+
             // Setup captures
             foreach (var dev in _inputDevices)
             {
@@ -201,6 +245,7 @@ public class AudioEngine : IDisposable
                 if (mmDevice == null) continue;
 
                 dev.RingBuffer = new RingBuffer(dev.Info.SampleRate * 2, dev.Info.Channels);
+                dev.InputOverflowCount = 0;
                 dev.Capture = new WasapiCapture(mmDevice, true, 10); // 10ms buffer, event-driven
                 dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
                 dev.Capture.DataAvailable += (s, e) =>
@@ -210,7 +255,10 @@ public class AudioEngine : IDisposable
                     int frames = floatCount / dev.Info.Channels;
                     var floats = new float[floatCount];
                     Buffer.BlockCopy(e.Buffer, 0, floats, 0, e.BytesRecorded);
-                    dev.RingBuffer.Write(floats, 0, frames);
+                    if (!dev.RingBuffer.Write(floats, 0, frames))
+                    {
+                        Interlocked.Increment(ref dev.InputOverflowCount);
+                    }
                 };
                 dev.Capture.StartRecording();
             }
@@ -226,9 +274,16 @@ public class AudioEngine : IDisposable
                 var mmDevice = _enumerator.GetDevice(dev.Info.Id);
                 if (mmDevice == null) continue;
 
+                dev.ConsumerId = dev.Info.Id;
+
                 dev.MixProvider = new MixingSampleProvider(
                     _routingMatrix, sources,
-                    dev.GlobalChannelOffset, dev.Info.Channels, dev.Info.SampleRate, dev.OutputDelayMs);
+                    dev.GlobalChannelOffset,
+                    dev.Info.Channels,
+                    dev.Info.SampleRate,
+                    dev.OutputDelayMs,
+                    dev.ConsumerId,
+                    _syncCoordinator);
 
                 dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, 10);
                 dev.Render.Init(dev.MixProvider);
@@ -276,8 +331,12 @@ public class AudioEngine : IDisposable
             try { dev.Render?.Stop(); } catch { }
             try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
+            try { dev.MixProvider?.DetachConsumer(); } catch { }
             dev.MixProvider = null;
+            dev.ConsumerId = string.Empty;
         }
+
+        _syncCoordinator = null;
 
         _running = false;
         StateChanged?.Invoke();
@@ -309,13 +368,26 @@ public class AudioEngine : IDisposable
         var captureDevices = _enumerator.GetDevices(DataFlow.Capture);
         var renderDevices = _enumerator.GetDevices(DataFlow.Render);
 
-        bool changed = false;
+        bool changed = _inputDevices.Any(d => !captureDevices.Any(cd => cd.Id == d.Info.Id))
+            || _outputDevices.Any(d => !renderDevices.Any(rd => rd.Id == d.Info.Id));
+
+        if (!changed)
+        {
+            return;
+        }
+
+        var routeSnapshot = CaptureRoutedCrosspoints();
+        bool wasRunning = _running;
+        if (wasRunning)
+        {
+            Stop();
+        }
+
         for (int i = _inputDevices.Count - 1; i >= 0; i--)
         {
             if (!captureDevices.Any(d => d.Id == _inputDevices[i].Info.Id))
             {
                 _inputDevices.RemoveAt(i);
-                changed = true;
             }
         }
         for (int i = _outputDevices.Count - 1; i >= 0; i--)
@@ -323,11 +395,79 @@ public class AudioEngine : IDisposable
             if (!renderDevices.Any(d => d.Id == _outputDevices[i].Info.Id))
             {
                 _outputDevices.RemoveAt(i);
-                changed = true;
             }
         }
 
-        if (changed) RecalcChannelOffsets();
+        RecalcChannelOffsets();
+        RestoreRoutedCrosspoints(routeSnapshot);
+
+        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints())
+        {
+            Start();
+        }
+    }
+
+    private List<RoutedCrosspoint> CaptureRoutedCrosspoints()
+    {
+        var snapshot = new List<RoutedCrosspoint>();
+        var front = _routingMatrix.GetFrontBuffer();
+        if (front.Length == 0 || _routingMatrix.OutputChannels == 0)
+        {
+            return snapshot;
+        }
+
+        int outChannels = _routingMatrix.OutputChannels;
+        for (int inCh = 0; inCh < _routingMatrix.InputChannels; inCh++)
+        {
+            for (int outCh = 0; outCh < outChannels; outCh++)
+            {
+                int idx = inCh * outChannels + outCh;
+                if (idx < 0 || idx >= front.Length) continue;
+
+                var cp = front[idx];
+                if (!cp.Active) continue;
+
+                var inDevice = FindInputDeviceByChannel(inCh);
+                var outDevice = FindOutputDeviceByChannel(outCh);
+                if (inDevice == null || outDevice == null) continue;
+
+                int inLocal = inCh - inDevice.GlobalChannelOffset;
+                int outLocal = outCh - outDevice.GlobalChannelOffset;
+                if (inLocal < 0 || outLocal < 0) continue;
+
+                float gainDb = cp.Gain <= 0f ? -60f : 20f * MathF.Log10(cp.Gain);
+                snapshot.Add(new RoutedCrosspoint(
+                    inDevice.Info.Id,
+                    inLocal,
+                    outDevice.Info.Id,
+                    outLocal,
+                    cp.Active,
+                    gainDb));
+            }
+        }
+
+        return snapshot;
+    }
+
+    private void RestoreRoutedCrosspoints(IEnumerable<RoutedCrosspoint> snapshot)
+    {
+        _routingMatrix.ClearAll();
+
+        foreach (var route in snapshot)
+        {
+            var inDevice = _inputDevices.FirstOrDefault(d => d.Info.Id == route.InputDeviceId);
+            var outDevice = _outputDevices.FirstOrDefault(d => d.Info.Id == route.OutputDeviceId);
+            if (inDevice == null || outDevice == null) continue;
+
+            if (route.InputLocalChannel < 0 || route.InputLocalChannel >= inDevice.Info.Channels) continue;
+            if (route.OutputLocalChannel < 0 || route.OutputLocalChannel >= outDevice.Info.Channels) continue;
+
+            int inGlobal = inDevice.GlobalChannelOffset + route.InputLocalChannel;
+            int outGlobal = outDevice.GlobalChannelOffset + route.OutputLocalChannel;
+            _routingMatrix.SetCrosspoint(inGlobal, outGlobal, route.Active, route.GainDb);
+        }
+
+        _routingMatrix.Publish();
     }
 
     public void Dispose()

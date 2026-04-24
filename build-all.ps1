@@ -11,7 +11,35 @@ $desktopConfigPath = Join-Path $desktopOut 'config.json'
 $preservedConfig = $null
 
 Write-Host 'Stopping running desktop processes...'
-Get-Process AudioMatrixRouter, msedgewebview2 -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+$appPids = @((Get-Process AudioMatrixRouter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id))
+$processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+$descendantPids = @()
+
+if ($appPids.Count -gt 0 -and $processSnapshot.Count -gt 0) {
+  $queue = New-Object System.Collections.Generic.Queue[int]
+  foreach ($appPid in $appPids) {
+    $queue.Enqueue([int]$appPid)
+  }
+
+  while ($queue.Count -gt 0) {
+    $currentPid = $queue.Dequeue()
+    $children = $processSnapshot | Where-Object { $_.ParentProcessId -eq $currentPid }
+    foreach ($child in $children) {
+      $childPid = [int]$child.ProcessId
+      if ($descendantPids -notcontains $childPid) {
+        $descendantPids += $childPid
+        $queue.Enqueue($childPid)
+      }
+    }
+  }
+}
+
+$webViewChildPids = @($processSnapshot | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and ($descendantPids -contains [int]$_.ProcessId) } | Select-Object -ExpandProperty ProcessId)
+
+$pidsToStop = @($appPids + $webViewChildPids | Sort-Object -Unique)
+if ($pidsToStop.Count -gt 0) {
+  Stop-Process -Id $pidsToStop -Force -ErrorAction SilentlyContinue
+}
 
 if (Test-Path $desktopConfigPath) {
   try {

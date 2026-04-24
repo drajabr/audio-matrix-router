@@ -26,35 +26,90 @@ public class RoutingMatrix
     {
         lock (_writeLock)
         {
+            var oldFront = _front;
+            int oldIn = _inputChannels;
+            int oldOut = _outputChannels;
+
             _inputChannels = inputChannels;
             _outputChannels = outputChannels;
             _bufferA = new Crosspoint[inputChannels * outputChannels];
             _bufferB = new Crosspoint[inputChannels * outputChannels];
+
+            int copyIn = Math.Min(oldIn, inputChannels);
+            int copyOut = Math.Min(oldOut, outputChannels);
+            for (int inCh = 0; inCh < copyIn; inCh++)
+            {
+                for (int outCh = 0; outCh < copyOut; outCh++)
+                {
+                    int oldIdx = inCh * oldOut + outCh;
+                    int newIdx = inCh * outputChannels + outCh;
+                    if (oldIdx >= 0 && oldIdx < oldFront.Length)
+                    {
+                        _bufferA[newIdx] = oldFront[oldIdx];
+                        _bufferB[newIdx] = oldFront[oldIdx];
+                    }
+                }
+            }
+
             _front = _bufferA;
         }
     }
 
-    public void SetCrosspoint(int inCh, int outCh, bool active, float gainDb)
+    public bool SetCrosspoint(int inCh, int outCh, bool active, float gainDb)
     {
         lock (_writeLock)
         {
-            var back = GetBackBuffer();
+            var back = GetWritableBuffer();
             int idx = inCh * _outputChannels + outCh;
-            if (idx < 0 || idx >= back.Length) return;
+            if (idx < 0 || idx >= back.Length) return false;
+
+            float newGain = (!active || gainDb <= -60f) ? 0f : MathF.Pow(10f, gainDb / 20f);
+            bool changed = back[idx].Active != active || MathF.Abs(back[idx].Gain - newGain) > 0.000001f;
+            if (!changed) return false;
 
             back[idx].Active = active;
-            if (!active || gainDb <= -60f)
-                back[idx].Gain = 0f;
-            else
-                back[idx].Gain = MathF.Pow(10f, gainDb / 20f);
+            back[idx].Gain = newGain;
+            return true;
         }
+    }
+
+    public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb)> updates)
+    {
+        int changed = 0;
+        lock (_writeLock)
+        {
+            var back = GetWritableBuffer();
+            foreach (var update in updates)
+            {
+                int idx = update.InCh * _outputChannels + update.OutCh;
+                if (idx < 0 || idx >= back.Length) continue;
+
+                float newGain = (!update.Active || update.GainDb <= -60f)
+                    ? 0f
+                    : MathF.Pow(10f, update.GainDb / 20f);
+
+                bool isChanged = back[idx].Active != update.Active || MathF.Abs(back[idx].Gain - newGain) > 0.000001f;
+                if (!isChanged) continue;
+
+                back[idx].Active = update.Active;
+                back[idx].Gain = newGain;
+                changed++;
+            }
+
+            if (changed > 0)
+            {
+                _front = back;
+            }
+        }
+
+        return changed;
     }
 
     public void ToggleCrosspoint(int inCh, int outCh)
     {
         lock (_writeLock)
         {
-            var back = GetBackBuffer();
+            var back = GetWritableBuffer();
             int idx = inCh * _outputChannels + outCh;
             if (idx < 0 || idx >= back.Length) return;
 
@@ -77,13 +132,10 @@ public class RoutingMatrix
     /// <summary>UI thread reads for display.</summary>
     public Crosspoint GetCrosspoint(int inCh, int outCh)
     {
-        lock (_writeLock)
-        {
-            var back = GetBackBuffer();
-            int idx = inCh * _outputChannels + outCh;
-            if (idx < 0 || idx >= back.Length) return default;
-            return back[idx];
-        }
+        var front = _front;
+        int idx = inCh * _outputChannels + outCh;
+        if (idx < 0 || idx >= front.Length) return default;
+        return front[idx];
     }
 
     public float GetGainDb(int inCh, int outCh)
@@ -95,23 +147,42 @@ public class RoutingMatrix
 
     public bool HasAnyCrosspoints()
     {
-        lock (_writeLock)
-        {
-            var back = GetBackBuffer();
-            for (int i = 0; i < back.Length; i++)
-                if (back[i].Active) return true;
-            return false;
-        }
+        var front = _front;
+        for (int i = 0; i < front.Length; i++)
+            if (front[i].Active) return true;
+        return false;
     }
 
     public void ClearAll()
     {
         lock (_writeLock)
         {
-            var back = GetBackBuffer();
+            var back = GetWritableBuffer();
             Array.Clear(back, 0, back.Length);
             _front = back;
         }
+    }
+
+    private Crosspoint[] GetWritableBuffer()
+    {
+        var front = _front;
+        var back = ReferenceEquals(front, _bufferA) ? _bufferB : _bufferA;
+
+        if (back.Length != front.Length)
+        {
+            back = new Crosspoint[front.Length];
+            if (ReferenceEquals(front, _bufferA))
+                _bufferB = back;
+            else
+                _bufferA = back;
+        }
+
+        if (front.Length > 0)
+        {
+            Array.Copy(front, back, front.Length);
+        }
+
+        return back;
     }
 
     private Crosspoint[] GetBackBuffer()

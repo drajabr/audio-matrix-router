@@ -508,6 +508,43 @@ public sealed class MainForm : Form
                     return;
                 }
 
+                case "setCrosspoints":
+                {
+                    if (!_locked && request.Params.TryGetProperty("routes", out var routesElem) && routesElem.ValueKind == JsonValueKind.Array)
+                    {
+                        var updates = new List<(int InCh, int OutCh, bool Active, float GainDb)>();
+                        foreach (var route in routesElem.EnumerateArray())
+                        {
+                            int inCh = route.TryGetProperty("inCh", out var inElem) ? inElem.GetInt32() : -1;
+                            int outCh = route.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
+                            bool active = route.TryGetProperty("active", out var activeElem) && activeElem.GetBoolean();
+                            float gainDb = route.TryGetProperty("gainDb", out var gainElem) ? gainElem.GetSingle() : 0f;
+                            updates.Add((inCh, outCh, active, gainDb));
+                        }
+
+                        int changed = _engine.SetCrosspoints(updates);
+                        if (changed > 0)
+                        {
+                            if (_engine.RoutingMatrix.HasAnyCrosspoints())
+                            {
+                                if (!_engine.IsRunning)
+                                {
+                                    _engine.Start();
+                                }
+                            }
+                            else if (_engine.IsRunning)
+                            {
+                                _engine.Stop();
+                            }
+
+                            ScheduleSave();
+                        }
+                    }
+
+                    await SendResultAsync(request.Id, BuildUiState());
+                    return;
+                }
+
                 case "setInputMasterDevice":
                     if (request.Params.TryGetProperty("deviceId", out var inputMasterId))
                     {

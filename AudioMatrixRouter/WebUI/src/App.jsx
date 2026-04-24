@@ -985,7 +985,7 @@ export default function App({ runtime = "web" }) {
     const active = !!connection?.on && !connection?.muted;
     const baseGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
 
-    const routeCalls = [];
+    const routesPayload = [];
 
     if (mode === "channel") {
       const rowParsed = parseChannelId(rowId);
@@ -999,12 +999,12 @@ export default function App({ runtime = "web" }) {
       const inCh = (inputDevice.offset || 0) + rowParsed.channelIndex;
       const outCh = (outputDevice.offset || 0) + colParsed.channelIndex;
 
-      routeCalls.push(window.__nativeBridgeInvoke("setCrosspoint", {
+      routesPayload.push({
         inCh,
         outCh,
         active,
         gainDb: baseGainDb,
-      }));
+      });
     } else {
       const inputDeviceId = rowId?.startsWith("dev:") ? rowId.slice(4) : "";
       const outputDeviceId = colId?.startsWith("dev:") ? colId.slice(4) : "";
@@ -1019,17 +1019,22 @@ export default function App({ runtime = "web" }) {
       const routes = buildDeviceToChannelRouteMatrix(inChannels, outChannels);
 
       routes.forEach((route) => {
-        routeCalls.push(window.__nativeBridgeInvoke("setCrosspoint", {
+        routesPayload.push({
           inCh: (inputDevice.offset || 0) + route.inChannel,
           outCh: (outputDevice.offset || 0) + route.outChannel,
           active,
           gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
-        }));
+        });
       });
     }
 
-    if (routeCalls.length > 0) {
-      await Promise.all(routeCalls);
+    if (routesPayload.length > 0) {
+      try {
+        await window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload });
+      } catch (_) {
+        // Backward-compatible fallback for older host builds.
+        await Promise.all(routesPayload.map((route) => window.__nativeBridgeInvoke("setCrosspoint", route)));
+      }
     }
   };
 
@@ -2012,6 +2017,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const selectedSourceRawSplit = selectedSource ? getRowSplitLevels(selectedSource) : [0, 0];
+  const selectedDestinationRawSplit = selectedDestination ? getColSplitLevels(selectedDestination) : [0, 0];
   const routeIsAudible = !!selectedConnection?.on && !selectedConnection?.muted && !transientMuteAll;
   const routeGainLinear = routeIsAudible
     ? dbToLinear(Number.isFinite(selectedConnection?.gainDb) ? selectedConnection.gainDb : 0)
@@ -2040,6 +2046,34 @@ export default function App({ runtime = "web" }) {
         clamp(right * routeGainLinear, 0, 1),
       ];
     }
+  } else if (!isHoverDetail && selectedDestination) {
+    const destinationDeviceId = selectedDestination.outputDeviceId || outputDeviceFromColId(selectedDestination.id);
+    const hasAnyRouteToDevice = Object.entries(activeMatrix).some(([routeKey, conn]) => {
+      if (!conn?.on || conn?.muted) return false;
+      const [, colId] = routeKey.split("::");
+      return outputDeviceFromColId(colId) === destinationDeviceId;
+    });
+
+    const hasRouteToLeft = viewMode === "channel"
+      ? Object.entries(activeMatrix).some(([routeKey, conn]) => {
+          if (!conn?.on || conn?.muted) return false;
+          const [, colId] = routeKey.split("::");
+          return colId === `ch:${destinationDeviceId}:0`;
+        })
+      : hasAnyRouteToDevice;
+
+    const hasRouteToRight = viewMode === "channel"
+      ? Object.entries(activeMatrix).some(([routeKey, conn]) => {
+          if (!conn?.on || conn?.muted) return false;
+          const [, colId] = routeKey.split("::");
+          return colId === `ch:${destinationDeviceId}:1`;
+        })
+      : hasAnyRouteToDevice;
+
+    selectedDestinationSplit = [
+      hasRouteToLeft ? selectedDestinationRawSplit[0] ?? 0 : 0,
+      hasRouteToRight ? selectedDestinationRawSplit[1] ?? 0 : 0,
+    ];
   }
   const hasAnyActiveRoute = Object.values(activeMatrix).some((conn) => conn.on);
   const muteButtonIsMuted = isHoverDetail
