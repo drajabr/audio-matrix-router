@@ -5,9 +5,9 @@ namespace AudioMatrixRouter.Audio;
 
 public sealed class OutputSyncCoordinator
 {
-    private const double MaxPpmCorrection = 40.0;
-    private const double RatioSmoothing = 0.03;
-    private const int WarmupFrames = 48000 * 2;
+    private const int DriftThresholdFrames = 96;
+    private const int CorrectionCooldownFrames = 4096;
+    private const int WarmupFrames = 48000;
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
@@ -17,6 +17,8 @@ public sealed class OutputSyncCoordinator
     {
         public long FramesRendered;
         public double Ratio = 1.0;
+        public int PendingFrameSlip;
+        public long NextCorrectionAt;
     }
 
     public OutputSyncCoordinator(string masterConsumerId)
@@ -52,36 +54,45 @@ public sealed class OutputSyncCoordinator
             if (!_states.TryGetValue(consumerId, out var state)) return;
 
             state.FramesRendered += frames;
-            if (consumerId == _masterConsumerId)
-            {
-                state.Ratio = 1.0;
-                return;
-            }
+            state.Ratio = 1.0;
 
-            if (state.FramesRendered < WarmupFrames)
-            {
-                state.Ratio = 1.0;
-                return;
-            }
+            if (consumerId == _masterConsumerId) return;
+            if (state.PendingFrameSlip != 0) return;
 
-            if (!_states.TryGetValue(_masterConsumerId, out var masterState))
-            {
-                return;
-            }
+            if (!_states.TryGetValue(_masterConsumerId, out var masterState)) return;
+            if (state.FramesRendered < WarmupFrames || masterState.FramesRendered < WarmupFrames) return;
+            if (state.FramesRendered < state.NextCorrectionAt) return;
 
-            long frameError = masterState.FramesRendered - state.FramesRendered;
-            double maxRatioDelta = MaxPpmCorrection / 1_000_000.0;
-            double target = 1.0 + Math.Clamp(frameError * 2e-8, -maxRatioDelta, maxRatioDelta);
-            state.Ratio += (target - state.Ratio) * RatioSmoothing;
+            long errorFrames = masterState.FramesRendered - state.FramesRendered;
+            if (errorFrames >= DriftThresholdFrames)
+            {
+                // Follower is behind master: consume one extra source frame this callback.
+                state.PendingFrameSlip = 1;
+                state.NextCorrectionAt = state.FramesRendered + CorrectionCooldownFrames;
+            }
+            else if (errorFrames <= -DriftThresholdFrames)
+            {
+                // Follower is ahead of master: consume one fewer source frame this callback.
+                state.PendingFrameSlip = -1;
+                state.NextCorrectionAt = state.FramesRendered + CorrectionCooldownFrames;
+            }
         }
     }
 
     public double GetConsumerRatio(string consumerId)
     {
+        _ = consumerId;
+        return 1.0;
+    }
+
+    public int ConsumeFrameSlip(string consumerId)
+    {
         lock (_syncLock)
         {
-            if (!_states.TryGetValue(consumerId, out var state)) return 1.0;
-            return state.Ratio;
+            if (!_states.TryGetValue(consumerId, out var state)) return 0;
+            int slip = state.PendingFrameSlip;
+            state.PendingFrameSlip = 0;
+            return slip;
         }
     }
 }
@@ -92,7 +103,6 @@ public sealed class OutputSyncCoordinator
 /// </summary>
 public class MixingSampleProvider : ISampleProvider
 {
-    private const double ResampleEpsilon = 0.00005;
     private readonly RoutingMatrix _matrix;
     private readonly List<CaptureSource> _sources;
     private readonly int _outputChannelOffset;
@@ -104,10 +114,8 @@ public class MixingSampleProvider : ISampleProvider
     private readonly WaveFormat _waveFormat;
     private float[] _sourceTempBuffer = [];
     private float[] _mixBuffer = [];
-    private float[] _resampleBuffer = [];
     private float[] _delayBuffer = [];
     private int _delayWriteIndex;
-    private double _sourceFrameAccumulator;
     private long _underrunCount;
 
     public record struct CaptureSource(RingBuffer Buffer, int GlobalChannelOffset, int Channels);
@@ -160,22 +168,8 @@ public class MixingSampleProvider : ISampleProvider
     {
         int frames = count / _outputChannels;
         if (frames <= 0) return 0;
-
-        double ratio = _syncCoordinator.GetConsumerRatio(_consumerId);
-        bool requiresResample = Math.Abs(ratio - 1.0) >= ResampleEpsilon;
-
-        int sourceFrames;
-        if (requiresResample)
-        {
-            double desiredSourceFrames = frames * ratio + _sourceFrameAccumulator;
-            sourceFrames = Math.Max(1, (int)Math.Floor(desiredSourceFrames));
-            _sourceFrameAccumulator = desiredSourceFrames - sourceFrames;
-        }
-        else
-        {
-            sourceFrames = frames;
-            _sourceFrameAccumulator = 0;
-        }
+        int slip = _syncCoordinator.ConsumeFrameSlip(_consumerId);
+        int sourceFrames = Math.Max(1, frames + slip);
 
         int sourceSamples = sourceFrames * _outputChannels;
         if (_mixBuffer.Length < sourceSamples)
@@ -232,32 +226,7 @@ public class MixingSampleProvider : ISampleProvider
             src.Buffer.ReadForConsumer(_consumerId, _sourceTempBuffer, 0, framesRead);
         }
 
-        if (!requiresResample || sourceFrames == frames)
-        {
-            for (int i = 0; i < count; i++)
-            {
-                ref float s = ref _mixBuffer[i];
-                if (s > 1f) s = 1f;
-                else if (s < -1f) s = -1f;
-
-                buffer[offset + i] = s;
-            }
-        }
-        else
-        {
-            if (_resampleBuffer.Length < count)
-                _resampleBuffer = new float[count];
-
-            ResampleLinear(_mixBuffer, sourceFrames, _resampleBuffer, frames);
-            for (int i = 0; i < count; i++)
-            {
-                ref float s = ref _resampleBuffer[i];
-                if (s > 1f) s = 1f;
-                else if (s < -1f) s = -1f;
-
-                buffer[offset + i] = s;
-            }
-        }
+        FitMixedFramesToOutput(buffer, offset, frames, sourceFrames);
 
         ApplyOutputDelay(buffer, offset, count);
         _syncCoordinator.OnFramesRendered(_consumerId, frames);
@@ -265,50 +234,87 @@ public class MixingSampleProvider : ISampleProvider
         return count;
     }
 
-    private void ResampleLinear(float[] source, int sourceFrames, float[] destination, int destinationFrames)
+    private void FitMixedFramesToOutput(float[] output, int outputOffset, int outputFrames, int sourceFrames)
     {
-        if (destinationFrames <= 0) return;
-
-        if (sourceFrames <= 1)
+        if (sourceFrames == outputFrames)
         {
-            for (int f = 0; f < destinationFrames; f++)
+            for (int i = 0; i < outputFrames * _outputChannels; i++)
             {
+                output[outputOffset + i] = ClampSample(_mixBuffer[i]);
+            }
+            return;
+        }
+
+        if (sourceFrames == outputFrames + 1)
+        {
+            int dropIndex = sourceFrames / 2;
+            for (int outFrame = 0; outFrame < outputFrames; outFrame++)
+            {
+                int srcFrame = outFrame < dropIndex ? outFrame : outFrame + 1;
+                int outBase = outputOffset + outFrame * _outputChannels;
+                int srcBase = srcFrame * _outputChannels;
+
                 for (int ch = 0; ch < _outputChannels; ch++)
                 {
-                    destination[f * _outputChannels + ch] = sourceFrames == 1 ? source[ch] : 0f;
+                    float value = _mixBuffer[srcBase + ch];
+                    if (outFrame == dropIndex && dropIndex > 0 && dropIndex < sourceFrames - 1)
+                    {
+                        int prevBase = (dropIndex - 1) * _outputChannels;
+                        int nextBase = (dropIndex + 1) * _outputChannels;
+                        value = (_mixBuffer[prevBase + ch] + _mixBuffer[nextBase + ch]) * 0.5f;
+                    }
+
+                    output[outBase + ch] = ClampSample(value);
                 }
             }
             return;
         }
 
-        if (destinationFrames == 1)
+        if (sourceFrames + 1 == outputFrames)
         {
-            for (int ch = 0; ch < _outputChannels; ch++)
+            int insertIndex = sourceFrames / 2;
+            for (int outFrame = 0; outFrame < outputFrames; outFrame++)
             {
-                destination[ch] = source[ch];
+                int srcFrame = outFrame <= insertIndex ? outFrame : outFrame - 1;
+                srcFrame = Math.Clamp(srcFrame, 0, sourceFrames - 1);
+
+                int outBase = outputOffset + outFrame * _outputChannels;
+                int srcBase = srcFrame * _outputChannels;
+
+                for (int ch = 0; ch < _outputChannels; ch++)
+                {
+                    float value = _mixBuffer[srcBase + ch];
+                    if (outFrame == insertIndex && insertIndex > 0)
+                    {
+                        int prevBase = (insertIndex - 1) * _outputChannels;
+                        int curBase = Math.Min(insertIndex, sourceFrames - 1) * _outputChannels;
+                        value = (_mixBuffer[prevBase + ch] + _mixBuffer[curBase + ch]) * 0.5f;
+                    }
+
+                    output[outBase + ch] = ClampSample(value);
+                }
             }
             return;
         }
 
-        float scale = (sourceFrames - 1f) / (destinationFrames - 1f);
-        for (int outFrame = 0; outFrame < destinationFrames; outFrame++)
+        int framesToCopy = Math.Min(outputFrames, sourceFrames);
+        int samplesToCopy = framesToCopy * _outputChannels;
+        for (int i = 0; i < samplesToCopy; i++)
         {
-            float srcPos = outFrame * scale;
-            int srcIndex0 = (int)srcPos;
-            int srcIndex1 = Math.Min(srcIndex0 + 1, sourceFrames - 1);
-            float frac = srcPos - srcIndex0;
-
-            int outBase = outFrame * _outputChannels;
-            int srcBase0 = srcIndex0 * _outputChannels;
-            int srcBase1 = srcIndex1 * _outputChannels;
-
-            for (int ch = 0; ch < _outputChannels; ch++)
-            {
-                float a = source[srcBase0 + ch];
-                float b = source[srcBase1 + ch];
-                destination[outBase + ch] = a + (b - a) * frac;
-            }
+            output[outputOffset + i] = ClampSample(_mixBuffer[i]);
         }
+
+        for (int i = samplesToCopy; i < outputFrames * _outputChannels; i++)
+        {
+            output[outputOffset + i] = 0f;
+        }
+    }
+
+    private static float ClampSample(float sample)
+    {
+        if (sample > 1f) return 1f;
+        if (sample < -1f) return -1f;
+        return sample;
     }
 
     public void DetachConsumer()
