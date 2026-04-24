@@ -614,6 +614,8 @@ export default function App({ runtime = "web" }) {
 
   const [contextState, setContextState] = useState("suspended");
   const [latencyMs, setLatencyMs] = useState(null);
+  const [inputLatencyMs, setInputLatencyMs] = useState(null);
+  const [outputLatencyMs, setOutputLatencyMs] = useState(null);
   const [bufferMs, setBufferMs] = useState(null);
   const [jitterMs, setJitterMs] = useState(null);
   const [clockKhz, setClockKhz] = useState(null);
@@ -824,6 +826,8 @@ export default function App({ runtime = "web" }) {
         const lat = base + out;
 
         setLatencyMs(lat > 0 ? Math.round(lat) : null);
+        setInputLatencyMs(base > 0 ? Math.round(base * 10) / 10 : null);
+        setOutputLatencyMs(out > 0 ? Math.round(out * 10) / 10 : null);
         setBufferMs(base > 0 ? Math.round(base * 10) / 10 : null);
         setClockKhz(ctx.sampleRate ? Math.round((ctx.sampleRate / 1000) * 10) / 10 : null);
 
@@ -837,6 +841,8 @@ export default function App({ runtime = "web" }) {
         latencyLastRef.current = lat;
       } else {
         setLatencyMs(null);
+        setInputLatencyMs(null);
+        setOutputLatencyMs(null);
         setBufferMs(null);
         setJitterMs(null);
         setClockKhz(null);
@@ -909,6 +915,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           outputDeviceId: output.deviceId,
+          delayMs: Number.isFinite(output.delayMs) ? output.delayMs : 0,
           isMaster: output.deviceId === outputMasterId,
         };
       });
@@ -926,6 +933,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           outputDeviceId: output.deviceId,
+          delayMs: Number.isFinite(output.delayMs) ? output.delayMs : 0,
           isChannelStart: true,
           isMaster: output.deviceId === outputMasterId,
         },
@@ -937,6 +945,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           outputDeviceId: output.deviceId,
+          delayMs: Number.isFinite(output.delayMs) ? output.delayMs : 0,
           isChannelEnd: true,
           isMaster: output.deviceId === outputMasterId,
         },
@@ -1196,12 +1205,37 @@ export default function App({ runtime = "web" }) {
           label: d.label || `Input ${i + 1}`,
         }));
 
-      const discoveredOutputs = devices
+      let discoveredOutputs = devices
         .filter((d) => d.kind === "audiooutput" && d.deviceId !== "default" && d.deviceId !== "communications")
         .map((d, i) => ({
           deviceId: d.deviceId,
           label: d.label || `Output ${i + 1}`,
+          delayMs: 0,
         }));
+
+      if (hasNativeBridge) {
+        try {
+          const state = await window.__nativeBridgeInvoke("getState", {});
+          const nativeOutputs = [
+            ...(Array.isArray(state?.outputs) ? state.outputs : []),
+            ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
+          ];
+
+          const delayByDeviceId = new Map(
+            nativeOutputs.map((output) => [
+              output?.deviceId,
+              Number.isFinite(output?.delayMs) ? output.delayMs : 0,
+            ]),
+          );
+
+          discoveredOutputs = discoveredOutputs.map((output) => ({
+            ...output,
+            delayMs: delayByDeviceId.get(output.deviceId) ?? 0,
+          }));
+        } catch (_) {
+          // no-op
+        }
+      }
 
       const savedInputOrder = saved?.inputOrder || [];
       const savedOutputOrder = saved?.outputOrder || [];
@@ -1977,13 +2011,48 @@ export default function App({ runtime = "web" }) {
     ];
   };
 
-  const selectedSourceSplit = selectedSource ? getRowSplitLevels(selectedSource) : [0, 0];
-  const selectedDestinationSplit = selectedDestination ? getColSplitLevels(selectedDestination) : [0, 0];
+  const selectedSourceRawSplit = selectedSource ? getRowSplitLevels(selectedSource) : [0, 0];
+  const routeIsAudible = !!selectedConnection?.on && !selectedConnection?.muted && !transientMuteAll;
+  const routeGainLinear = routeIsAudible
+    ? dbToLinear(Number.isFinite(selectedConnection?.gainDb) ? selectedConnection.gainDb : 0)
+    : 0;
+
+  let selectedSourceSplit = [0, 0];
+  let selectedDestinationSplit = [0, 0];
+
+  if (routeIsAudible && detailCell) {
+    const rowParsed = parseChannelId(detailCell.rowId);
+    const colParsed = parseChannelId(detailCell.colId);
+
+    if (viewMode === "channel" && rowParsed && colParsed) {
+      const inIdx = clamp(rowParsed.channelIndex, 0, 1);
+      const outIdx = clamp(colParsed.channelIndex, 0, 1);
+      const inputLevel = selectedSourceRawSplit[inIdx] ?? 0;
+
+      selectedSourceSplit[inIdx] = inputLevel;
+      selectedDestinationSplit[outIdx] = clamp(inputLevel * routeGainLinear, 0, 1);
+    } else {
+      const left = selectedSourceRawSplit[0] ?? 0;
+      const right = selectedSourceRawSplit[1] ?? 0;
+      selectedSourceSplit = [left, right];
+      selectedDestinationSplit = [
+        clamp(left * routeGainLinear, 0, 1),
+        clamp(right * routeGainLinear, 0, 1),
+      ];
+    }
+  }
   const hasAnyActiveRoute = Object.values(activeMatrix).some((conn) => conn.on);
   const muteButtonIsMuted = isHoverDetail
     ? !!selectedConnection?.muted
     : transientMuteAll;
   const latencyLabel = latencyMs != null ? `${latencyMs}ms` : "n/a";
+  const sourceLatencyLabel = inputLatencyMs != null ? `${inputLatencyMs}ms` : "n/a";
+  const selectedDestinationDelayMs = Number.isFinite(selectedDestination?.delayMs) ? selectedDestination.delayMs : 0;
+  const destinationLatencyResolvedMs =
+    outputLatencyMs != null || selectedDestinationDelayMs > 0
+      ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
+      : null;
+  const destinationLatencyLabel = destinationLatencyResolvedMs != null ? `${destinationLatencyResolvedMs}ms` : "n/a";
   const jitterLabel = jitterMs != null ? `${jitterMs}ms` : "n/a";
   const bufferLabel = bufferMs != null ? `${bufferMs}ms` : "n/a";
   const clockLabel = clockKhz != null ? `${clockKhz}kHz` : "n/a";
@@ -2440,7 +2509,7 @@ export default function App({ runtime = "web" }) {
           <div className="card-metrics-box">
             <div className="metric-tile">
               <span className="metric-title">Latency</span>
-              <span className="metric-value">{latencyLabel}</span>
+              <span className="metric-value">{sourceLatencyLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Timing</span>
@@ -2477,7 +2546,7 @@ export default function App({ runtime = "web" }) {
           <div className="card-metrics-box">
             <div className="metric-tile">
               <span className="metric-title">Latency</span>
-              <span className="metric-value">{latencyLabel}</span>
+              <span className="metric-value">{destinationLatencyLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Timing</span>
