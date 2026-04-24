@@ -19,8 +19,10 @@ const BACKGROUND_KEY = "amrBackgroundPreference";
 const ACCENT_KEY = "amrAccentPreference";
 const FONT_KEY = "amrFontPreference";
 const FONT_SIZE_KEY = "amrFontSizePreference";
+const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
+const CAPTURE_BUFFER_OPTIONS = [10, 20, 40, 60, 100];
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -58,6 +60,14 @@ const FONT_SIZE_PRESETS = [
   { key: "3", label: "3", size: "16px" },
   { key: "4", label: "4", size: "17px" },
   { key: "5", label: "5", size: "18px" },
+];
+
+const UI_SCALE_PRESETS = [
+  { key: "xs", label: "XS", scale: 0.86 },
+  { key: "sm", label: "SM", scale: 0.93 },
+  { key: "md", label: "MD", scale: 1.0 },
+  { key: "lg", label: "LG", scale: 1.08 },
+  { key: "xl", label: "XL", scale: 1.16 },
 ];
 
 function ensureNativeBridge() {
@@ -625,6 +635,8 @@ export default function App({ runtime = "web" }) {
   const [accentIndex, setAccentIndex] = useState(() => getStoredIndex(ACCENT_KEY, ACCENT_PRESETS, Math.max(0, ACCENT_PRESETS.findIndex((p) => p.key === "white"))));
   const [fontIndex, setFontIndex] = useState(() => getStoredIndex(FONT_KEY, FONT_PRESETS, Math.max(0, FONT_PRESETS.findIndex((p) => p.key === "consolas"))));
   const [fontSizeIndex, setFontSizeIndex] = useState(() => getStoredIndex(FONT_SIZE_KEY, FONT_SIZE_PRESETS, 4));
+  const [uiScaleIndex, setUiScaleIndex] = useState(() => getStoredIndex(UI_SCALE_KEY, UI_SCALE_PRESETS, Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === "md"))));
+  const [captureBufferMs, setCaptureBufferMs] = useState(40);
   const [controlsCollapsed, setControlsCollapsed] = useState(() => {
     if (typeof window === "undefined") return true;
     return localStorage.getItem(QUICK_CONTROLS_COLLAPSED_KEY) !== "0";
@@ -725,6 +737,7 @@ export default function App({ runtime = "web" }) {
     const accent = ACCENT_PRESETS[accentIndex] || ACCENT_PRESETS[0];
     const font = FONT_PRESETS[fontIndex] || FONT_PRESETS[0];
     const fontSize = FONT_SIZE_PRESETS[fontSizeIndex] || FONT_SIZE_PRESETS[2];
+    const uiScale = UI_SCALE_PRESETS[uiScaleIndex] || UI_SCALE_PRESETS[2];
 
     root.style.setProperty("--bg", background.bg);
     root.style.setProperty("--surface", background.surface);
@@ -736,11 +749,13 @@ export default function App({ runtime = "web" }) {
     root.style.setProperty("--accent-hl", accent.accentHl);
     root.style.setProperty("--font-family", font.family);
     root.style.setProperty("--font-size", fontSize.size);
+    root.style.setProperty("--ui-scale", String(uiScale.scale));
 
     localStorage.setItem(BACKGROUND_KEY, background.key);
     localStorage.setItem(ACCENT_KEY, accent.key);
     localStorage.setItem(FONT_KEY, font.key);
     localStorage.setItem(FONT_SIZE_KEY, fontSize.key);
+    localStorage.setItem(UI_SCALE_KEY, uiScale.key);
 
     if (devicesDiscoveredRef.current) {
       persistState(buildPersistedState({
@@ -748,9 +763,10 @@ export default function App({ runtime = "web" }) {
         accentKey: accent.key,
         fontKey: font.key,
         fontSizeKey: fontSize.key,
+        uiScaleKey: uiScale.key,
       }));
     }
-  }, [backgroundIndex, accentIndex, fontIndex, fontSizeIndex]);
+  }, [backgroundIndex, accentIndex, fontIndex, fontSizeIndex, uiScaleIndex]);
 
   useEffect(() => {
     localStorage.setItem(QUICK_CONTROLS_COLLAPSED_KEY, controlsCollapsed ? "1" : "0");
@@ -1092,6 +1108,8 @@ export default function App({ runtime = "web" }) {
     accentKey: ACCENT_PRESETS[accentIndex]?.key,
     fontKey: FONT_PRESETS[fontIndex]?.key,
     fontSizeKey: FONT_SIZE_PRESETS[fontSizeIndex]?.key,
+    uiScaleKey: UI_SCALE_PRESETS[uiScaleIndex]?.key,
+    captureBufferMs,
     controlsCollapsed,
     showAllDevices,
     powerOn,
@@ -1195,9 +1213,14 @@ export default function App({ runtime = "web" }) {
         const fontSizeMatch = FONT_SIZE_PRESETS.findIndex((p) => p.key === saved.fontSizeKey);
         if (fontSizeMatch >= 0) setFontSizeIndex(fontSizeMatch);
       }
+      if (saved?.uiScaleKey) {
+        const uiScaleMatch = UI_SCALE_PRESETS.findIndex((p) => p.key === saved.uiScaleKey);
+        if (uiScaleMatch >= 0) setUiScaleIndex(uiScaleMatch);
+      }
       if (typeof saved?.controlsCollapsed === "boolean") setControlsCollapsed(saved.controlsCollapsed);
       if (typeof saved?.showAllDevices === "boolean") setShowAllDevices(saved.showAllDevices);
       if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
+      if (Number.isFinite(saved?.captureBufferMs)) setCaptureBufferMs(saved.captureBufferMs);
       if (!hasNativeBridge && typeof saved?.locked === "boolean") setLocked(saved.locked);
 
       await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -1221,6 +1244,9 @@ export default function App({ runtime = "web" }) {
       if (hasNativeBridge) {
         try {
           const state = await window.__nativeBridgeInvoke("getState", {});
+          if (Number.isFinite(state?.captureBufferMs)) {
+            setCaptureBufferMs(state.captureBufferMs);
+          }
           const nativeOutputs = [
             ...(Array.isArray(state?.outputs) ? state.outputs : []),
             ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
@@ -1332,6 +1358,8 @@ export default function App({ runtime = "web" }) {
         accentKey: saved?.accentKey || ACCENT_PRESETS[accentIndex]?.key,
         fontKey: saved?.fontKey || FONT_PRESETS[fontIndex]?.key,
         fontSizeKey: saved?.fontSizeKey || FONT_SIZE_PRESETS[fontSizeIndex]?.key,
+        uiScaleKey: saved?.uiScaleKey || UI_SCALE_PRESETS[uiScaleIndex]?.key,
+        captureBufferMs: Number.isFinite(saved?.captureBufferMs) ? saved.captureBufferMs : captureBufferMs,
         controlsCollapsed: typeof saved?.controlsCollapsed === "boolean" ? saved.controlsCollapsed : controlsCollapsed,
         showAllDevices: typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : showAllDevices,
         powerOn: typeof saved?.powerOn === "boolean" ? saved.powerOn : powerOn,
@@ -1865,6 +1893,8 @@ export default function App({ runtime = "web" }) {
     if (activeQuickPicker === "accent") return ACCENT_PRESETS;
     if (activeQuickPicker === "font") return FONT_PRESETS;
     if (activeQuickPicker === "fontSize") return FONT_SIZE_PRESETS;
+    if (activeQuickPicker === "uiScale") return UI_SCALE_PRESETS;
+    if (activeQuickPicker === "captureBuffer") return CAPTURE_BUFFER_OPTIONS.map((value) => ({ key: String(value), label: `${value}ms` }));
     if (activeQuickPicker === "startup") {
       return [
         { key: "enable", label: "ON" },
@@ -1879,6 +1909,8 @@ export default function App({ runtime = "web" }) {
     if (activeQuickPicker === "accent") return ACCENT_PRESETS[accentIndex]?.key;
     if (activeQuickPicker === "font") return FONT_PRESETS[fontIndex]?.key;
     if (activeQuickPicker === "fontSize") return FONT_SIZE_PRESETS[fontSizeIndex]?.key;
+    if (activeQuickPicker === "uiScale") return UI_SCALE_PRESETS[uiScaleIndex]?.key;
+    if (activeQuickPicker === "captureBuffer") return String(captureBufferMs);
     if (activeQuickPicker === "startup") return startupAtBoot ? "enable" : "disable";
     return "";
   })();
@@ -1888,6 +1920,16 @@ export default function App({ runtime = "web" }) {
     if (type === "accent") setAccentIndex(Math.max(0, ACCENT_PRESETS.findIndex((p) => p.key === key)));
     if (type === "font") setFontIndex(Math.max(0, FONT_PRESETS.findIndex((p) => p.key === key)));
     if (type === "fontSize") setFontSizeIndex(Math.max(0, FONT_SIZE_PRESETS.findIndex((p) => p.key === key)));
+    if (type === "uiScale") setUiScaleIndex(Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === key)));
+    if (type === "captureBuffer") {
+      const next = Number(key);
+      if (Number.isFinite(next)) {
+        setCaptureBufferMs(next);
+        if (hasNativeBridge) {
+          window.__nativeBridgeInvoke("setCaptureBufferMs", { bufferMs: next }).catch(() => {});
+        }
+      }
+    }
     if (type === "startup") handleSetStartupAtBoot(key === "enable");
   };
 
@@ -1992,6 +2034,17 @@ export default function App({ runtime = "web" }) {
       }`
     : "Select a square in the matrix";
 
+  const uiScale = UI_SCALE_PRESETS[uiScaleIndex] || UI_SCALE_PRESETS[2];
+  const scaledCellSize = Math.round(cellSize * uiScale.scale);
+  const scaledSourceWidth = Math.round(labelSizing.sourceWidth * uiScale.scale);
+  const scaledDestinationHeight = Math.round(labelSizing.destinationHeight * uiScale.scale);
+
+  const cycleCaptureBuffer = () => {
+    const currentIndex = Math.max(0, CAPTURE_BUFFER_OPTIONS.indexOf(captureBufferMs));
+    const next = CAPTURE_BUFFER_OPTIONS[(currentIndex + 1) % CAPTURE_BUFFER_OPTIONS.length];
+    applyQuickSelection("captureBuffer", String(next));
+  };
+
   const selectedSource = detailCell ? rows.find((r) => r.id === detailCell.rowId) : null;
   const selectedDestination = detailCell ? cols.find((c) => c.id === detailCell.colId) : null;
   const getRowSplitLevels = (row) => {
@@ -2018,7 +2071,8 @@ export default function App({ runtime = "web" }) {
 
   const selectedSourceRawSplit = selectedSource ? getRowSplitLevels(selectedSource) : [0, 0];
   const selectedDestinationRawSplit = selectedDestination ? getColSplitLevels(selectedDestination) : [0, 0];
-  const routeIsAudible = !!selectedConnection?.on && !selectedConnection?.muted && !transientMuteAll;
+  const isConnectionAudible = (conn) => !!conn?.on && !conn?.muted && !transientMuteAll;
+  const routeIsAudible = isConnectionAudible(selectedConnection);
   const routeGainLinear = routeIsAudible
     ? dbToLinear(Number.isFinite(selectedConnection?.gainDb) ? selectedConnection.gainDb : 0)
     : 0;
@@ -2026,7 +2080,7 @@ export default function App({ runtime = "web" }) {
   let selectedSourceSplit = [0, 0];
   let selectedDestinationSplit = [0, 0];
 
-  if (routeIsAudible && detailCell) {
+  if (isHoverDetail && routeIsAudible && detailCell) {
     const rowParsed = parseChannelId(detailCell.rowId);
     const colParsed = parseChannelId(detailCell.colId);
 
@@ -2046,29 +2100,53 @@ export default function App({ runtime = "web" }) {
         clamp(right * routeGainLinear, 0, 1),
       ];
     }
-  } else if (!isHoverDetail && selectedDestination) {
-    const destinationDeviceId = selectedDestination.outputDeviceId || outputDeviceFromColId(selectedDestination.id);
-    const hasAnyRouteToDevice = Object.entries(activeMatrix).some(([routeKey, conn]) => {
-      if (!conn?.on || conn?.muted) return false;
-      const [, colId] = routeKey.split("::");
-      return outputDeviceFromColId(colId) === destinationDeviceId;
+  } else if (!isHoverDetail && (selectedSource || selectedDestination)) {
+    const sourceDeviceId = selectedSource?.deviceId || parseChannelId(selectedSource?.id || "")?.deviceId || "";
+    const destinationDeviceId = selectedDestination?.outputDeviceId || outputDeviceFromColId(selectedDestination?.id || "");
+
+    let hasRouteFromLeft = false;
+    let hasRouteFromRight = false;
+    let hasRouteToLeft = false;
+    let hasRouteToRight = false;
+
+    Object.entries(activeMatrix).forEach(([routeKey, conn]) => {
+      if (!isConnectionAudible(conn)) return;
+
+      const [rowId, colId] = routeKey.split("::");
+      const rowParsed = parseChannelId(rowId);
+      const colParsed = parseChannelId(colId);
+
+      if (sourceDeviceId) {
+        const routeSourceDeviceId = rowId.startsWith("dev:") ? rowId.slice(4) : rowParsed?.deviceId || "";
+        if (routeSourceDeviceId === sourceDeviceId) {
+          if (viewMode === "channel") {
+            if (rowId === `ch:${sourceDeviceId}:0`) hasRouteFromLeft = true;
+            if (rowId === `ch:${sourceDeviceId}:1`) hasRouteFromRight = true;
+          } else {
+            hasRouteFromLeft = true;
+            hasRouteFromRight = true;
+          }
+        }
+      }
+
+      if (destinationDeviceId) {
+        const routeDestinationDeviceId = outputDeviceFromColId(colId);
+        if (routeDestinationDeviceId === destinationDeviceId) {
+          if (viewMode === "channel") {
+            if (colId === `ch:${destinationDeviceId}:0`) hasRouteToLeft = true;
+            if (colId === `ch:${destinationDeviceId}:1`) hasRouteToRight = true;
+          } else {
+            hasRouteToLeft = true;
+            hasRouteToRight = true;
+          }
+        }
+      }
     });
 
-    const hasRouteToLeft = viewMode === "channel"
-      ? Object.entries(activeMatrix).some(([routeKey, conn]) => {
-          if (!conn?.on || conn?.muted) return false;
-          const [, colId] = routeKey.split("::");
-          return colId === `ch:${destinationDeviceId}:0`;
-        })
-      : hasAnyRouteToDevice;
-
-    const hasRouteToRight = viewMode === "channel"
-      ? Object.entries(activeMatrix).some(([routeKey, conn]) => {
-          if (!conn?.on || conn?.muted) return false;
-          const [, colId] = routeKey.split("::");
-          return colId === `ch:${destinationDeviceId}:1`;
-        })
-      : hasAnyRouteToDevice;
+    selectedSourceSplit = [
+      hasRouteFromLeft ? selectedSourceRawSplit[0] ?? 0 : 0,
+      hasRouteFromRight ? selectedSourceRawSplit[1] ?? 0 : 0,
+    ];
 
     selectedDestinationSplit = [
       hasRouteToLeft ? selectedDestinationRawSplit[0] ?? 0 : 0,
@@ -2088,8 +2166,6 @@ export default function App({ runtime = "web" }) {
       : null;
   const destinationLatencyLabel = destinationLatencyResolvedMs != null ? `${destinationLatencyResolvedMs}ms` : "n/a";
   const jitterLabel = jitterMs != null ? `${jitterMs}ms` : "n/a";
-  const bufferLabel = bufferMs != null ? `${bufferMs}ms` : "n/a";
-  const clockLabel = clockKhz != null ? `${clockKhz}kHz` : "n/a";
 
   const handleTransientMuteAllToggle = () => {
     if (!hasAnyActiveRoute) return;
@@ -2139,6 +2215,9 @@ export default function App({ runtime = "web" }) {
             </div>
             <div className="quick-control-item">
               <button type="button" className="icon-btn icon-btn--square" title="Select font size" aria-label="Select font size" onClick={(event) => cyclePicker("fontSize", event)}>{FONT_SIZE_PRESETS[fontSizeIndex]?.label || "3"}</button>
+            </div>
+            <div className="quick-control-item">
+              <button type="button" className="icon-btn icon-btn--square" title="Select UI scale" aria-label="Select UI scale" onClick={(event) => cyclePicker("uiScale", event)}>{UI_SCALE_PRESETS[uiScaleIndex]?.label || "MD"}</button>
             </div>
             <div className="quick-control-item">
               <button
@@ -2198,9 +2277,9 @@ export default function App({ runtime = "web" }) {
           <div
             className={`matrix-grid${selectedCell ? " has-selection" : ""}`}
             style={{
-              gridTemplateColumns: `${labelSizing.sourceWidth}px repeat(${Math.max(cols.length, 1)}, ${cellSize}px)`,
-              gridTemplateRows: `${labelSizing.destinationHeight}px`,
-              gridAutoRows: `${cellSize}px`,
+              gridTemplateColumns: `${scaledSourceWidth}px repeat(${Math.max(cols.length, 1)}, ${scaledCellSize}px)`,
+              gridTemplateRows: `${scaledDestinationHeight}px`,
+              gridAutoRows: `${scaledCellSize}px`,
             }}
             onMouseLeave={() => {
               if (locked) return;
@@ -2389,7 +2468,7 @@ export default function App({ runtime = "web" }) {
                   const isMenuDropUp = !!tileMenuCell?.dropUp;
                   const isGainAdjustOpen = gainAdjustCell?.rowId === row.id && gainAdjustCell?.colId === col.id;
                   return (
-                    <div key={key} className="tile-cell-wrap" style={{ width: `${cellSize}px`, height: `${cellSize}px` }}>
+                      <div key={key} className="tile-cell-wrap" style={{ width: `${scaledCellSize}px`, height: `${scaledCellSize}px` }}>
                       <button
                         type="button"
                         className={[
@@ -2401,7 +2480,7 @@ export default function App({ runtime = "web" }) {
                           selectedCell && row.id === selectedCell.rowId && "active-row",
                           selectedCell && col.id === selectedCell.colId && "active-col",
                         ].filter(Boolean).join(" ")}
-                        style={{ width: `${cellSize}px`, height: `${cellSize}px` }}
+                        style={{ width: `${scaledCellSize}px`, height: `${scaledCellSize}px` }}
                         onMouseEnter={() => {
                           if (!locked) {
                             setSelectedCell({ rowId: row.id, colId: col.id });
@@ -2553,19 +2632,30 @@ export default function App({ runtime = "web" }) {
         </div>
 
         <div className="dock-col dock-center">
-            <button
-              type="button"
-              className={`mute-btn ${muteButtonIsMuted ? "muted" : ""}`}
-              disabled={!hasAnyActiveRoute}
-              onClick={handleTransientMuteAllToggle}
-              title={isHoverDetail
-                ? `Tile mute: ${selectedConnection?.muted ? "muted" : "unmuted"}. Click for transient mute all.`
-                : transientMuteAll
-                  ? "Transient mute all is ON. Click to restore previous mute state."
-                  : "Global mute status is OFF. Click for transient mute all."}
-            >
-              {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-            </button>
+          <div className="dock-center-stack">
+              <button
+                type="button"
+                className={`mute-btn ${muteButtonIsMuted ? "muted" : ""}`}
+                disabled={!hasAnyActiveRoute}
+                onClick={handleTransientMuteAllToggle}
+                title={isHoverDetail
+                  ? `Tile mute: ${selectedConnection?.muted ? "muted" : "unmuted"}. Click for transient mute all.`
+                  : transientMuteAll
+                    ? "Transient mute all is ON. Click to restore previous mute state."
+                    : "Global mute status is OFF. Click for transient mute all."}
+              >
+                {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+              </button>
+              <button
+                type="button"
+                className="mute-btn mute-btn-secondary"
+                onClick={cycleCaptureBuffer}
+                title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
+                aria-label="Cycle capture buffer size"
+              >
+                {`${captureBufferMs}ms`}
+              </button>
+          </div>
         </div>
 
         <div className="dock-col dock-card">

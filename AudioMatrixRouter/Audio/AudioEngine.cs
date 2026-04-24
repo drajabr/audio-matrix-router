@@ -20,12 +20,15 @@ public class ActiveDevice
 
 public class AudioEngine : IDisposable
 {
+    private const int DefaultCaptureRingBufferMs = 40;
+
     private readonly DeviceEnumerator _enumerator = new();
     private readonly List<ActiveDevice> _inputDevices = [];
     private readonly List<ActiveDevice> _outputDevices = [];
     private readonly RoutingMatrix _routingMatrix = new();
     private bool _running;
     private OutputSyncCoordinator? _syncCoordinator;
+    private int _captureBufferMs = DefaultCaptureRingBufferMs;
 
     private readonly record struct RoutedCrosspoint(
         string InputDeviceId,
@@ -46,6 +49,7 @@ public class AudioEngine : IDisposable
 
     public int TotalInputChannels { get; private set; }
     public int TotalOutputChannels { get; private set; }
+    public int CaptureBufferMs => _captureBufferMs;
 
     public void Init()
     {
@@ -57,9 +61,22 @@ public class AudioEngine : IDisposable
         var device = _inputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
         if (device == null) return false;
 
-        foreach (var d in _inputDevices) d.IsMasterDevice = false;
-        device.IsMasterDevice = true;
-        StateChanged?.Invoke();
+        bool changed = false;
+        foreach (var d in _inputDevices)
+        {
+            bool next = d.Info.Id == deviceId;
+            if (d.IsMasterDevice != next)
+            {
+                d.IsMasterDevice = next;
+                changed = true;
+            }
+        }
+
+        if (changed)
+        {
+            StateChanged?.Invoke();
+        }
+
         return true;
     }
 
@@ -68,9 +85,24 @@ public class AudioEngine : IDisposable
         var device = _outputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
         if (device == null) return false;
 
-        foreach (var d in _outputDevices) d.IsMasterDevice = false;
-        device.IsMasterDevice = true;
-        StateChanged?.Invoke();
+        bool changed = false;
+        foreach (var d in _outputDevices)
+        {
+            bool next = d.Info.Id == deviceId;
+            if (d.IsMasterDevice != next)
+            {
+                d.IsMasterDevice = next;
+                changed = true;
+            }
+        }
+
+        _syncCoordinator?.SetMasterConsumer(deviceId);
+
+        if (changed)
+        {
+            StateChanged?.Invoke();
+        }
+
         return true;
     }
 
@@ -160,28 +192,8 @@ public class AudioEngine : IDisposable
             return;
         }
 
-        if (active)
-        {
-            if (!_inputDevices.Any(d => d.IsMasterDevice))
-            {
-                var inputDevice = FindInputDeviceByChannel(inCh);
-                if (inputDevice != null)
-                {
-                    SetInputMasterDevice(inputDevice.Info.Id);
-                }
-            }
-
-            if (!_outputDevices.Any(d => d.IsMasterDevice))
-            {
-                var outputDevice = FindOutputDeviceByChannel(outCh);
-                if (outputDevice != null)
-                {
-                    SetOutputMasterDevice(outputDevice.Info.Id);
-                }
-            }
-        }
-
         _routingMatrix.Publish();
+        ReconcileMasterDevices();
     }
 
     public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb)> updates)
@@ -189,17 +201,7 @@ public class AudioEngine : IDisposable
         int changed = _routingMatrix.SetCrosspoints(updates);
         if (changed > 0)
         {
-            if (!_inputDevices.Any(d => d.IsMasterDevice))
-            {
-                var firstActiveInput = _inputDevices.FirstOrDefault();
-                if (firstActiveInput != null) SetInputMasterDevice(firstActiveInput.Info.Id);
-            }
-
-            if (!_outputDevices.Any(d => d.IsMasterDevice))
-            {
-                var firstActiveOutput = _outputDevices.FirstOrDefault();
-                if (firstActiveOutput != null) SetOutputMasterDevice(firstActiveOutput.Info.Id);
-            }
+            ReconcileMasterDevices();
         }
 
         return changed;
@@ -226,6 +228,7 @@ public class AudioEngine : IDisposable
     public void ClearCrosspoints()
     {
         _routingMatrix.ClearAll();
+        ReconcileMasterDevices();
     }
 
     public bool Start()
@@ -244,7 +247,8 @@ public class AudioEngine : IDisposable
                 var mmDevice = _enumerator.GetDevice(dev.Info.Id);
                 if (mmDevice == null) continue;
 
-                dev.RingBuffer = new RingBuffer(dev.Info.SampleRate * 2, dev.Info.Channels);
+                int ringFrames = Math.Max(dev.Info.SampleRate * _captureBufferMs / 1000, dev.Info.SampleRate / 100);
+                dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
                 dev.Capture = new WasapiCapture(mmDevice, true, 10); // 10ms buffer, event-driven
                 dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
@@ -316,6 +320,30 @@ public class AudioEngine : IDisposable
         return true;
     }
 
+    public bool SetCaptureBufferMs(int bufferMs)
+    {
+        int clamped = Math.Clamp(bufferMs, 10, 100);
+        if (_captureBufferMs == clamped)
+        {
+            return true;
+        }
+
+        _captureBufferMs = clamped;
+
+        bool wasRunning = _running;
+        if (wasRunning)
+        {
+            Stop();
+            if (_inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints())
+            {
+                Start();
+            }
+        }
+
+        StateChanged?.Invoke();
+        return true;
+    }
+
     public void Stop()
     {
         foreach (var dev in _inputDevices)
@@ -360,6 +388,7 @@ public class AudioEngine : IDisposable
 
         _routingMatrix.Resize(TotalInputChannels, TotalOutputChannels);
         _routingMatrix.Publish();
+        ReconcileMasterDevices();
     }
 
     public void RefreshDevices()
@@ -468,6 +497,82 @@ public class AudioEngine : IDisposable
         }
 
         _routingMatrix.Publish();
+        ReconcileMasterDevices();
+    }
+
+    private void ReconcileMasterDevices()
+    {
+        var activeInputIds = new HashSet<string>(StringComparer.Ordinal);
+        var activeOutputIds = new HashSet<string>(StringComparer.Ordinal);
+
+        var front = _routingMatrix.GetFrontBuffer();
+        int outChannels = _routingMatrix.OutputChannels;
+        if (front.Length > 0 && outChannels > 0)
+        {
+            for (int inCh = 0; inCh < _routingMatrix.InputChannels; inCh++)
+            {
+                for (int outCh = 0; outCh < outChannels; outCh++)
+                {
+                    int idx = inCh * outChannels + outCh;
+                    if (idx < 0 || idx >= front.Length || !front[idx].Active) continue;
+
+                    var inDevice = FindInputDeviceByChannel(inCh);
+                    var outDevice = FindOutputDeviceByChannel(outCh);
+                    if (inDevice != null) activeInputIds.Add(inDevice.Info.Id);
+                    if (outDevice != null) activeOutputIds.Add(outDevice.Info.Id);
+                }
+            }
+        }
+
+        bool changed = false;
+
+        string? desiredInputMaster = null;
+        if (activeInputIds.Count > 0)
+        {
+            var current = _inputDevices.FirstOrDefault(d => d.IsMasterDevice);
+            desiredInputMaster = current != null && activeInputIds.Contains(current.Info.Id)
+                ? current.Info.Id
+                : _inputDevices.FirstOrDefault(d => activeInputIds.Contains(d.Info.Id))?.Info.Id;
+        }
+
+        foreach (var d in _inputDevices)
+        {
+            bool next = desiredInputMaster != null && d.Info.Id == desiredInputMaster;
+            if (d.IsMasterDevice != next)
+            {
+                d.IsMasterDevice = next;
+                changed = true;
+            }
+        }
+
+        string? desiredOutputMaster = null;
+        if (activeOutputIds.Count > 0)
+        {
+            var current = _outputDevices.FirstOrDefault(d => d.IsMasterDevice);
+            desiredOutputMaster = current != null && activeOutputIds.Contains(current.Info.Id)
+                ? current.Info.Id
+                : _outputDevices.FirstOrDefault(d => activeOutputIds.Contains(d.Info.Id))?.Info.Id;
+        }
+
+        foreach (var d in _outputDevices)
+        {
+            bool next = desiredOutputMaster != null && d.Info.Id == desiredOutputMaster;
+            if (d.IsMasterDevice != next)
+            {
+                d.IsMasterDevice = next;
+                changed = true;
+            }
+        }
+
+        if (desiredOutputMaster != null)
+        {
+            _syncCoordinator?.SetMasterConsumer(desiredOutputMaster);
+        }
+
+        if (changed)
+        {
+            StateChanged?.Invoke();
+        }
     }
 
     public void Dispose()

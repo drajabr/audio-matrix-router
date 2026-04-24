@@ -19,6 +19,7 @@
   --font-size-md: calc(var(--font-size) * 0.92);
   --font-size-lg: calc(var(--font-size) * 1.08);
   --font-size-xl: calc(var(--font-size) * 1.22);
+  --ui-scale: 1;
   --text-strong: color-mix(in srgb, var(--text) 92%, white 8%);
   --text-on-accent: color-mix(in srgb, var(--bg) 82%, black 18%);
   --surface-raised: color-mix(in srgb, var(--surface) 82%, white 8%);
@@ -86,6 +87,10 @@ textarea {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  transform: scale(var(--ui-scale));
+  transform-origin: top left;
+  width: calc(100% / var(--ui-scale));
+  min-height: calc(100% / var(--ui-scale));
 }
 
 .rack-panel {
@@ -429,6 +434,10 @@ textarea {
 }
 
 .matrix-corner {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 26;
   border: 1px solid var(--line);
   background: color-mix(in srgb, var(--surface) 82%, black 18%);
   border-radius: var(--radius-tile);
@@ -512,7 +521,9 @@ textarea {
 }
 
 .row-head {
-  position: relative;
+  position: sticky;
+  left: 0;
+  z-index: 24;
   display: grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   align-items: stretch;
@@ -527,7 +538,9 @@ textarea {
 }
 
 .col-head {
-  position: relative;
+  position: sticky;
+  top: 0;
+  z-index: 25;
   display: grid;
   grid-template-rows: minmax(0, 1fr) 28px;
   align-items: stretch;
@@ -1082,6 +1095,13 @@ textarea {
   justify-content: center;
 }
 
+.dock-center-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+
 .dock-meter {
   width: 100%;
 }
@@ -1114,6 +1134,13 @@ textarea {
   border-color: color-mix(in srgb, var(--line) 74%, transparent);
   background: color-mix(in srgb, var(--surface) 70%, black 30%);
   color: var(--muted);
+}
+
+.mute-btn-secondary {
+  min-width: 64px;
+  font-size: var(--font-size-2xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 
 .cell.active-row,

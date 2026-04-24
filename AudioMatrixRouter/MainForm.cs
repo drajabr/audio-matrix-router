@@ -573,6 +573,15 @@ public sealed class MainForm : Form
                     await SendResultAsync(request.Id, BuildUiState());
                     return;
 
+                case "setCaptureBufferMs":
+                    if (request.Params.TryGetProperty("bufferMs", out var captureBufferMs))
+                    {
+                        _engine.SetCaptureBufferMs(captureBufferMs.GetInt32());
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState());
+                    return;
+
                 case "getStartupAtBoot":
                     await SendResultAsync(request.Id, IsStartupAtBootEnabled());
                     return;
@@ -630,6 +639,7 @@ public sealed class MainForm : Form
             Running = _engine.IsRunning,
             Locked = _locked,
             StartupAtBoot = IsStartupAtBootEnabled(),
+            CaptureBufferMs = _engine.CaptureBufferMs,
             AvailableInputs = _engine.GetAvailableDevices(DataFlow.Capture).Select(d => new DeviceState
             {
                 DeviceId = d.Id,
@@ -771,6 +781,7 @@ public sealed class MainForm : Form
         public bool Running { get; set; }
         public bool Locked { get; set; }
         public bool StartupAtBoot { get; set; }
+        public int CaptureBufferMs { get; set; }
         public List<DeviceState> AvailableInputs { get; set; } = [];
         public List<DeviceState> AvailableOutputs { get; set; } = [];
         public List<DeviceState> Inputs { get; set; } = [];

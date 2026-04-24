@@ -11,7 +11,7 @@ public sealed class OutputSyncCoordinator
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
-    private readonly string _masterConsumerId;
+    private string _masterConsumerId;
 
     private sealed class OutputState
     {
@@ -24,6 +24,19 @@ public sealed class OutputSyncCoordinator
     public OutputSyncCoordinator(string masterConsumerId)
     {
         _masterConsumerId = masterConsumerId;
+    }
+
+    public void SetMasterConsumer(string masterConsumerId)
+    {
+        lock (_syncLock)
+        {
+            _masterConsumerId = masterConsumerId;
+            foreach (var state in _states.Values)
+            {
+                state.PendingFrameSlip = 0;
+                state.NextCorrectionAt = 0;
+            }
+        }
     }
 
     public void RegisterConsumer(string consumerId)
