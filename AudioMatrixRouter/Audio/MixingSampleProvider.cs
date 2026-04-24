@@ -12,8 +12,12 @@ public class MixingSampleProvider : ISampleProvider
     private readonly List<CaptureSource> _sources;
     private readonly int _outputChannelOffset;
     private readonly int _outputChannels;
+    private readonly int _sampleRate;
+    private readonly object _delayLock = new();
     private readonly WaveFormat _waveFormat;
     private float[] _tempBuffer = [];
+    private float[] _delayBuffer = [];
+    private int _delayWriteIndex;
 
     public record struct CaptureSource(RingBuffer Buffer, int GlobalChannelOffset, int Channels);
 
@@ -22,16 +26,38 @@ public class MixingSampleProvider : ISampleProvider
         List<CaptureSource> sources,
         int outputChannelOffset,
         int outputChannels,
-        int sampleRate)
+        int sampleRate,
+        int outputDelayMs)
     {
         _matrix = matrix;
         _sources = sources;
         _outputChannelOffset = outputChannelOffset;
         _outputChannels = outputChannels;
+        _sampleRate = sampleRate;
         _waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, outputChannels);
+        SetOutputDelayMs(outputDelayMs);
     }
 
     public WaveFormat WaveFormat => _waveFormat;
+
+    public void SetOutputDelayMs(int delayMs)
+    {
+        var delayFrames = Math.Clamp((int)Math.Round(_sampleRate * (delayMs / 1000.0)), 0, _sampleRate * 5);
+        var delaySamples = delayFrames * _outputChannels;
+
+        lock (_delayLock)
+        {
+            if (delaySamples <= 0)
+            {
+                _delayBuffer = [];
+                _delayWriteIndex = 0;
+                return;
+            }
+
+            _delayBuffer = new float[delaySamples];
+            _delayWriteIndex = 0;
+        }
+    }
 
     public int Read(float[] buffer, int offset, int count)
     {
@@ -88,6 +114,32 @@ public class MixingSampleProvider : ISampleProvider
             else if (s < -1f) s = -1f;
         }
 
+        ApplyOutputDelay(buffer, offset, count);
+
         return count;
+    }
+
+    private void ApplyOutputDelay(float[] buffer, int offset, int count)
+    {
+        lock (_delayLock)
+        {
+            if (_delayBuffer.Length == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < count; i++)
+            {
+                var delayedSample = _delayBuffer[_delayWriteIndex];
+                _delayBuffer[_delayWriteIndex] = buffer[offset + i];
+                buffer[offset + i] = delayedSample;
+
+                _delayWriteIndex++;
+                if (_delayWriteIndex >= _delayBuffer.Length)
+                {
+                    _delayWriteIndex = 0;
+                }
+            }
+        }
     }
 }

@@ -24,12 +24,19 @@ public class CrosspointConfig
     public float GainDb { get; set; }
 }
 
+public class OutputLatencyConfig
+{
+    public string DeviceId { get; set; } = "";
+    public int DelayMs { get; set; }
+}
+
 public class AppConfig
 {
     public WindowConfig Window { get; set; } = new();
     public List<DeviceConfig> InputDevices { get; set; } = [];
     public List<DeviceConfig> OutputDevices { get; set; } = [];
     public List<CrosspointConfig> Crosspoints { get; set; } = [];
+    public List<OutputLatencyConfig> OutputLatencies { get; set; } = [];
     public bool Locked { get; set; }
     public string UiPreferencesJson { get; set; } = "";
 
@@ -80,7 +87,10 @@ public class AppConfig
         foreach (var d in engine.InputDevices)
             config.InputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
         foreach (var d in engine.OutputDevices)
+        {
             config.OutputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
+            config.OutputLatencies.Add(new OutputLatencyConfig { DeviceId = d.Info.Id, DelayMs = d.OutputDelayMs });
+        }
 
         var mat = engine.RoutingMatrix;
         for (int i = 0; i < mat.InputChannels; i++)
@@ -100,6 +110,10 @@ public class AppConfig
             engine.AddInputDevice(d.Id);
         foreach (var d in OutputDevices)
             engine.AddOutputDevice(d.Id);
+
+        foreach (var outputLatency in OutputLatencies)
+            engine.SetOutputDelayMs(outputLatency.DeviceId, outputLatency.DelayMs);
+
         foreach (var cp in Crosspoints)
             engine.SetCrosspoint(cp.InCh, cp.OutCh, true, cp.GainDb);
     }

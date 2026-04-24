@@ -526,6 +526,16 @@ public sealed class MainForm : Form
                     await SendResultAsync(request.Id, BuildUiState());
                     return;
 
+                case "setOutputDelayMs":
+                    if (request.Params.TryGetProperty("deviceId", out var outputDelayDeviceId) &&
+                        request.Params.TryGetProperty("delayMs", out var outputDelayMs))
+                    {
+                        _engine.SetOutputDelayMs(outputDelayDeviceId.GetString() ?? string.Empty, outputDelayMs.GetInt32());
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState());
+                    return;
+
                 case "getStartupAtBoot":
                     await SendResultAsync(request.Id, IsStartupAtBootEnabled());
                     return;
@@ -589,7 +599,8 @@ public sealed class MainForm : Form
                 Label = d.Name,
                 Channels = d.Channels,
                 Offset = 0,
-                IsMaster = false
+                IsMaster = false,
+                DelayMs = 0
             }).ToList(),
             AvailableOutputs = _engine.GetAvailableDevices(DataFlow.Render).Select(d => new DeviceState
             {
@@ -597,7 +608,8 @@ public sealed class MainForm : Form
                 Label = d.Name,
                 Channels = d.Channels,
                 Offset = 0,
-                IsMaster = false
+                IsMaster = false,
+                DelayMs = 0
             }).ToList(),
             Inputs = _engine.InputDevices.Select(d => new DeviceState
             {
@@ -605,7 +617,8 @@ public sealed class MainForm : Form
                 Label = d.Info.Name,
                 Channels = d.Info.Channels,
                 Offset = d.GlobalChannelOffset,
-                IsMaster = d.IsMasterDevice
+                IsMaster = d.IsMasterDevice,
+                DelayMs = 0
             }).ToList(),
             Outputs = _engine.OutputDevices.Select(d => new DeviceState
             {
@@ -613,7 +626,8 @@ public sealed class MainForm : Form
                 Label = d.Info.Name,
                 Channels = d.Info.Channels,
                 Offset = d.GlobalChannelOffset,
-                IsMaster = d.IsMasterDevice
+                IsMaster = d.IsMasterDevice,
+                DelayMs = d.OutputDelayMs
             }).ToList(),
             Routes = routes
         };
@@ -705,6 +719,7 @@ public sealed class MainForm : Form
         public int Channels { get; set; }
         public int Offset { get; set; }
         public bool IsMaster { get; set; }
+        public int DelayMs { get; set; }
     }
 
     private sealed class RouteState

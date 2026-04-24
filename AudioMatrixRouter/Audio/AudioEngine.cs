@@ -12,6 +12,7 @@ public class ActiveDevice
     public WasapiOut? Render { get; set; }
     public MixingSampleProvider? MixProvider { get; set; }
     public bool IsMasterDevice { get; set; }
+    public int OutputDelayMs { get; set; }
 }
 
 public class AudioEngine : IDisposable
@@ -227,7 +228,7 @@ public class AudioEngine : IDisposable
 
                 dev.MixProvider = new MixingSampleProvider(
                     _routingMatrix, sources,
-                    dev.GlobalChannelOffset, dev.Info.Channels, dev.Info.SampleRate);
+                    dev.GlobalChannelOffset, dev.Info.Channels, dev.Info.SampleRate, dev.OutputDelayMs);
 
                 dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, 10);
                 dev.Render.Init(dev.MixProvider);
@@ -243,6 +244,21 @@ public class AudioEngine : IDisposable
             Stop();
             return false;
         }
+    }
+
+    public bool SetOutputDelayMs(string deviceId, int delayMs)
+    {
+        var device = _outputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
+        if (device == null)
+        {
+            return false;
+        }
+
+        var clampedDelayMs = Math.Clamp(delayMs, 0, 5000);
+        device.OutputDelayMs = clampedDelayMs;
+        device.MixProvider?.SetOutputDelayMs(clampedDelayMs);
+        StateChanged?.Invoke();
+        return true;
     }
 
     public void Stop()
