@@ -164,6 +164,7 @@ function createLabelMap(devices, saved = {}, prefix) {
 }
 
 function outputDeviceFromColId(colId) {
+  if (!colId) return "";
   if (colId.startsWith("dev:")) return colId.slice(4);
   if (colId.startsWith("ch:")) return colId.split(":")[1];
   return "";
@@ -950,8 +951,8 @@ export default function App({ runtime = "web" }) {
   const getDevicePairFromRoute = (rowId, colId) => {
     const rowParsed = parseChannelId(rowId);
     const colParsed = parseChannelId(colId);
-    const inputDeviceId = rowId.startsWith("dev:") ? rowId.slice(4) : rowParsed?.deviceId || "";
-    const outputDeviceId = colId.startsWith("dev:") ? colId.slice(4) : colParsed?.deviceId || "";
+    const inputDeviceId = rowId?.startsWith("dev:") ? rowId.slice(4) : rowParsed?.deviceId || "";
+    const outputDeviceId = colId?.startsWith("dev:") ? colId.slice(4) : colParsed?.deviceId || "";
     return { inputDeviceId, outputDeviceId };
   };
 
@@ -996,8 +997,8 @@ export default function App({ runtime = "web" }) {
         gainDb: baseGainDb,
       }));
     } else {
-      const inputDeviceId = rowId.startsWith("dev:") ? rowId.slice(4) : "";
-      const outputDeviceId = colId.startsWith("dev:") ? colId.slice(4) : "";
+      const inputDeviceId = rowId?.startsWith("dev:") ? rowId.slice(4) : "";
+      const outputDeviceId = colId?.startsWith("dev:") ? colId.slice(4) : "";
       if (!inputDeviceId || !outputDeviceId) return;
 
       const inputDevice = nativeInputs.find((d) => d.deviceId === inputDeviceId);
