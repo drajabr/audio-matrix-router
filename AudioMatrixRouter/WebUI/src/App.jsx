@@ -2222,9 +2222,6 @@ export default function App({ runtime = "web" }) {
               <button type="button" className="icon-btn icon-btn--square" title="Select UI scale" aria-label="Select UI scale" onClick={(event) => cyclePicker("uiScale", event)}>{UI_SCALE_PRESETS[uiScaleIndex]?.label || "MD"}</button>
             </div>
             <div className="quick-control-item">
-              <button type="button" className="icon-btn icon-btn--square" title="Select capture buffer" aria-label="Select capture buffer" onClick={(event) => cyclePicker("captureBuffer", event)}>{`${captureBufferMs}ms`}</button>
-            </div>
-            <div className="quick-control-item">
               <button
                 type="button"
                 className={`icon-btn icon-btn--square ${startupAtBoot ? "is-on" : ""}`}
@@ -2255,6 +2252,21 @@ export default function App({ runtime = "web" }) {
                   <span className="qp-label">{option.key}</span>
                 </button>
               ))}
+            </div>
+            <div className="quick-drawer-inline-setting" role="group" aria-label="Audio capture buffer setting">
+              <span className="quick-drawer-inline-label">Buffer</span>
+              <button
+                type="button"
+                className="quick-drawer-inline-btn"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  cycleCaptureBuffer();
+                }}
+                title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
+                aria-label="Cycle capture buffer size"
+              >
+                {`${captureBufferMs}ms`}
+              </button>
             </div>
           </div>
           <button
@@ -2652,15 +2664,6 @@ export default function App({ runtime = "web" }) {
                     : "Global mute status is OFF. Click for transient mute all."}
               >
                 {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-              </button>
-              <button
-                type="button"
-                className="mute-btn mute-btn-secondary"
-                onClick={cycleCaptureBuffer}
-                title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
-                aria-label="Cycle capture buffer size"
-              >
-                {`${captureBufferMs}ms`}
               </button>
           </div>
         </div>
