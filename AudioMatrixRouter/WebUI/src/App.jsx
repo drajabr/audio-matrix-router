@@ -22,7 +22,7 @@ const FONT_SIZE_KEY = "amrFontSizePreference";
 const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
-const CAPTURE_BUFFER_OPTIONS = [10, 20, 40, 60, 100];
+const CAPTURE_BUFFER_OPTIONS = [5, 10, 20, 40, 60, 100];
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -639,6 +639,11 @@ export default function App({ runtime = "web" }) {
   const [fontSizeIndex, setFontSizeIndex] = useState(() => getStoredIndex(FONT_SIZE_KEY, FONT_SIZE_PRESETS, 4));
   const [uiScaleIndex, setUiScaleIndex] = useState(() => getStoredIndex(UI_SCALE_KEY, UI_SCALE_PRESETS, Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === "md"))));
   const [captureBufferMs, setCaptureBufferMs] = useState(40);
+  const [isApplyingCaptureBuffer, setIsApplyingCaptureBuffer] = useState(false);
+  const [nativeTotalLatencyMs, setNativeTotalLatencyMs] = useState(null);
+  const [nativeRouteLatencyByCh, setNativeRouteLatencyByCh] = useState({});
+  const [nativeInputChannelMeta, setNativeInputChannelMeta] = useState({});
+  const [nativeOutputChannelMeta, setNativeOutputChannelMeta] = useState({});
   const [controlsCollapsed, setControlsCollapsed] = useState(() => {
     if (typeof window === "undefined") return true;
     return localStorage.getItem(QUICK_CONTROLS_COLLAPSED_KEY) !== "0";
@@ -837,43 +842,122 @@ export default function App({ runtime = "web" }) {
   }, []);
 
   useEffect(() => {
-    const poll = () => {
-      const ctx = managerRef.current.context;
-      if (ctx && ctx.state === "running") {
-        const base = (ctx.baseLatency || 0) * 1000;
-        const out = (ctx.outputLatency || 0) * 1000;
-        const lat = base + out;
+    let cancelled = false;
+    let inFlight = false;
 
-        setLatencyMs(lat > 0 ? Math.round(lat) : null);
-        setInputLatencyMs(base > 0 ? Math.round(base * 10) / 10 : null);
-        setOutputLatencyMs(out > 0 ? Math.round(out * 10) / 10 : null);
-        setBufferMs(base > 0 ? Math.round(base * 10) / 10 : null);
-        setClockKhz(ctx.sampleRate ? Math.round((ctx.sampleRate / 1000) * 10) / 10 : null);
+    const poll = async () => {
+      if (inFlight) return;
+      inFlight = true;
 
-        if (latencyLastRef.current != null) {
-          const delta = Math.abs(lat - latencyLastRef.current);
-          latencyJitterRef.current = latencyJitterRef.current === 0
-            ? delta
-            : latencyJitterRef.current * 0.82 + delta * 0.18;
-          setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
+      try {
+        if (hasNativeBridge) {
+          const state = await window.__nativeBridgeInvoke("getState", {});
+          if (cancelled) return;
+
+          if (Number.isFinite(state?.captureBufferMs)) {
+            setCaptureBufferMs(state.captureBufferMs);
+          }
+
+          const total = Number.isFinite(state?.totalLatencyMs) ? Number(state.totalLatencyMs) : null;
+          setNativeTotalLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
+          setLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
+
+          const routeLatency = {};
+          (Array.isArray(state?.routes) ? state.routes : []).forEach((route) => {
+            if (!Number.isFinite(route?.inCh) || !Number.isFinite(route?.outCh)) return;
+            if (!Number.isFinite(route?.workingLatencyMs)) return;
+            routeLatency[`${route.inCh}::${route.outCh}`] = Number(route.workingLatencyMs);
+          });
+          setNativeRouteLatencyByCh(routeLatency);
+
+          const inMeta = {};
+          (Array.isArray(state?.inputs) ? state.inputs : []).forEach((d) => {
+            if (!d?.deviceId) return;
+            inMeta[d.deviceId] = {
+              offset: Number.isFinite(d?.offset) ? d.offset : 0,
+              channels: Number.isFinite(d?.channels) ? d.channels : 0,
+            };
+          });
+          setNativeInputChannelMeta(inMeta);
+
+          const outMeta = {};
+          (Array.isArray(state?.outputs) ? state.outputs : []).forEach((d) => {
+            if (!d?.deviceId) return;
+            outMeta[d.deviceId] = {
+              offset: Number.isFinite(d?.offset) ? d.offset : 0,
+              channels: Number.isFinite(d?.channels) ? d.channels : 0,
+            };
+          });
+          setNativeOutputChannelMeta(outMeta);
+
+          if (total != null) {
+            if (latencyLastRef.current != null) {
+              const delta = Math.abs(total - latencyLastRef.current);
+              latencyJitterRef.current = latencyJitterRef.current === 0
+                ? delta
+                : latencyJitterRef.current * 0.82 + delta * 0.18;
+              setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
+            }
+            latencyLastRef.current = total;
+          }
+
+          const ctx = managerRef.current.context;
+          setClockKhz(ctx?.sampleRate ? Math.round((ctx.sampleRate / 1000) * 10) / 10 : null);
+          setInputLatencyMs(null);
+          setOutputLatencyMs(null);
+          setBufferMs(null);
+          return;
         }
-        latencyLastRef.current = lat;
-      } else {
-        setLatencyMs(null);
-        setInputLatencyMs(null);
-        setOutputLatencyMs(null);
-        setBufferMs(null);
-        setJitterMs(null);
-        setClockKhz(null);
-        latencyLastRef.current = null;
-        latencyJitterRef.current = 0;
+
+        const ctx = managerRef.current.context;
+        if (ctx && ctx.state === "running") {
+          const base = (ctx.baseLatency || 0) * 1000;
+          const out = (ctx.outputLatency || 0) * 1000;
+          const lat = base + out;
+
+          setLatencyMs(lat > 0 ? Math.round(lat) : null);
+          setInputLatencyMs(base > 0 ? Math.round(base * 10) / 10 : null);
+          setOutputLatencyMs(out > 0 ? Math.round(out * 10) / 10 : null);
+          setBufferMs(base > 0 ? Math.round(base * 10) / 10 : null);
+          setClockKhz(ctx.sampleRate ? Math.round((ctx.sampleRate / 1000) * 10) / 10 : null);
+
+          if (latencyLastRef.current != null) {
+            const delta = Math.abs(lat - latencyLastRef.current);
+            latencyJitterRef.current = latencyJitterRef.current === 0
+              ? delta
+              : latencyJitterRef.current * 0.82 + delta * 0.18;
+            setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
+          }
+          latencyLastRef.current = lat;
+        } else {
+          setLatencyMs(null);
+          setInputLatencyMs(null);
+          setOutputLatencyMs(null);
+          setBufferMs(null);
+          setJitterMs(null);
+          setClockKhz(null);
+          setNativeTotalLatencyMs(null);
+          setNativeRouteLatencyByCh({});
+          latencyLastRef.current = null;
+          latencyJitterRef.current = 0;
+        }
+      } catch (_) {
+        if (!cancelled) {
+          setLatencyMs(null);
+          setNativeTotalLatencyMs(null);
+        }
+      } finally {
+        inFlight = false;
       }
     };
 
-    poll();
-    const id = setInterval(poll, 250);
-    return () => clearInterval(id);
-  }, []);
+    void poll();
+    const id = setInterval(() => { void poll(); }, 250);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [hasNativeBridge]);
 
   const rows = useMemo(() => {
     if (viewMode === "device") {
@@ -1925,11 +2009,28 @@ export default function App({ runtime = "web" }) {
     if (type === "fontSize") setFontSizeIndex(Math.max(0, FONT_SIZE_PRESETS.findIndex((p) => p.key === key)));
     if (type === "uiScale") setUiScaleIndex(Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === key)));
     if (type === "captureBuffer") {
+      if (locked || isApplyingCaptureBuffer) return;
       const next = Number(key);
       if (Number.isFinite(next)) {
-        setCaptureBufferMs(next);
+        const prev = captureBufferMs;
+        const selected = CAPTURE_BUFFER_OPTIONS.includes(next) ? next : CAPTURE_BUFFER_OPTIONS[0];
+        setCaptureBufferMs(selected);
+        persistState(buildPersistedState({ captureBufferMs: selected }));
+
         if (hasNativeBridge) {
-          window.__nativeBridgeInvoke("setCaptureBufferMs", { bufferMs: next }).catch(() => {});
+          setIsApplyingCaptureBuffer(true);
+          window.__nativeBridgeInvoke("setCaptureBufferMs", { bufferMs: selected })
+            .then((state) => {
+              const applied = Number.isFinite(state?.captureBufferMs) ? state.captureBufferMs : selected;
+              setCaptureBufferMs(applied);
+              persistState(buildPersistedState({ captureBufferMs: applied }));
+            })
+            .catch(() => {
+              setCaptureBufferMs(prev);
+            })
+            .finally(() => {
+              setIsApplyingCaptureBuffer(false);
+            });
         }
       }
     }
@@ -2043,6 +2144,7 @@ export default function App({ runtime = "web" }) {
   const scaledDestinationHeight = Math.round(labelSizing.destinationHeight * uiScale.scale);
 
   const cycleCaptureBuffer = () => {
+    if (locked || isApplyingCaptureBuffer) return;
     const currentIndex = Math.max(0, CAPTURE_BUFFER_OPTIONS.indexOf(captureBufferMs));
     const next = CAPTURE_BUFFER_OPTIONS[(currentIndex + 1) % CAPTURE_BUFFER_OPTIONS.length];
     applyQuickSelection("captureBuffer", String(next));
@@ -2160,13 +2262,68 @@ export default function App({ runtime = "web" }) {
   const muteButtonIsMuted = isHoverDetail
     ? !!selectedConnection?.muted
     : transientMuteAll;
-  const latencyLabel = latencyMs != null ? `${latencyMs}ms` : "n/a";
-  const sourceLatencyLabel = inputLatencyMs != null ? `${inputLatencyMs}ms` : "n/a";
+
+  const detailRouteLatencyMs = (() => {
+    if (!hasNativeBridge || !detailCell) return null;
+
+    const lookup = (inCh, outCh) => {
+      const raw = nativeRouteLatencyByCh[`${inCh}::${outCh}`];
+      return Number.isFinite(raw) ? raw : null;
+    };
+
+    if (viewMode === "channel") {
+      const rowParsed = parseChannelId(detailCell.rowId);
+      const colParsed = parseChannelId(detailCell.colId);
+      if (!rowParsed || !colParsed) return null;
+
+      const inMeta = nativeInputChannelMeta[rowParsed.deviceId];
+      const outMeta = nativeOutputChannelMeta[colParsed.deviceId];
+      if (!inMeta || !outMeta) return null;
+
+      const inCh = inMeta.offset + rowParsed.channelIndex;
+      const outCh = outMeta.offset + colParsed.channelIndex;
+      return lookup(inCh, outCh);
+    }
+
+    const sourceDeviceId = detailCell.rowId.startsWith("dev:") ? detailCell.rowId.slice(4) : "";
+    const destinationDeviceId = outputDeviceFromColId(detailCell.colId);
+    const inMeta = nativeInputChannelMeta[sourceDeviceId];
+    const outMeta = nativeOutputChannelMeta[destinationDeviceId];
+    if (!inMeta || !outMeta) return null;
+
+    let best = null;
+    for (let inLocal = 0; inLocal < inMeta.channels; inLocal += 1) {
+      const inCh = inMeta.offset + inLocal;
+      for (let outLocal = 0; outLocal < outMeta.channels; outLocal += 1) {
+        const outCh = outMeta.offset + outLocal;
+        const value = lookup(inCh, outCh);
+        if (value == null) continue;
+        best = best == null ? value : Math.max(best, value);
+      }
+    }
+
+    return best;
+  })();
+
+  const nativeTopbarTotalLatencyMs = hasNativeBridge
+    ? nativeTotalLatencyMs
+    : null;
+  const runningLatencyDisplayMs = hasNativeBridge
+    ? nativeTopbarTotalLatencyMs
+    : latencyMs;
+  const sourceLatencyDisplayMs = hasNativeBridge
+    ? detailRouteLatencyMs
+    : inputLatencyMs;
+  const latencyLabel = runningLatencyDisplayMs != null ? `${runningLatencyDisplayMs}ms` : "n/a";
+  const sourceLatencyLabel = sourceLatencyDisplayMs != null ? `${sourceLatencyDisplayMs}ms` : "n/a";
   const selectedDestinationDelayMs = Number.isFinite(selectedDestination?.delayMs) ? selectedDestination.delayMs : 0;
   const destinationLatencyResolvedMs =
-    outputLatencyMs != null || selectedDestinationDelayMs > 0
-      ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
-      : null;
+    hasNativeBridge
+      ? detailRouteLatencyMs
+      : (outputLatencyMs != null || selectedDestinationDelayMs > 0
+        ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
+        : null)
+  ;
   const destinationLatencyLabel = destinationLatencyResolvedMs != null ? `${destinationLatencyResolvedMs}ms` : "n/a";
   const jitterLabel = jitterMs != null ? `${jitterMs}ms` : "n/a";
 
@@ -2201,7 +2358,7 @@ export default function App({ runtime = "web" }) {
               <h1>Audio Matrix Patch</h1>
               <span className="brand-version-pill">{APP_VERSION}</span>
             </div>
-            <p>{contextState === "running" ? `Running${latencyMs != null ? ` · ${latencyMs}ms` : ""}` : "Standby"}</p>
+            <p>{contextState === "running" ? `Running${latencyLabel !== "n/a" ? ` · ${latencyLabel}` : ""}` : "Standby"}</p>
           </div>
         </div>
 
@@ -2330,8 +2487,12 @@ export default function App({ runtime = "web" }) {
                   onClick={cycleCaptureBuffer}
                   title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
                   aria-label="Cycle capture buffer size"
+                  disabled={locked || isApplyingCaptureBuffer}
                 >
-                  <span aria-hidden="true">{`${captureBufferMs}`}</span>
+                  <span className="buffer-readout" aria-hidden="true">
+                    <span>{`${captureBufferMs}`}</span>
+                    <span className="buffer-unit">ms</span>
+                  </span>
                 </button>
                 <button
                   type="button"

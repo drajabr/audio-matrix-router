@@ -619,17 +619,29 @@ public sealed class MainForm : Form
     {
         var routes = new List<RouteState>();
         var matrix = _engine.RoutingMatrix;
+        double? maxWorkingLatencyMs = null;
         for (int inCh = 0; inCh < matrix.InputChannels; inCh++)
         {
             for (int outCh = 0; outCh < matrix.OutputChannels; outCh++)
             {
                 var cp = matrix.GetCrosspoint(inCh, outCh);
                 if (!cp.Active) continue;
+
+                double? workingLatencyMs = null;
+                if (_engine.TryGetRouteWorkingLatencyMs(inCh, outCh, out var measuredLatencyMs))
+                {
+                    workingLatencyMs = Math.Round(measuredLatencyMs, 1);
+                    maxWorkingLatencyMs = maxWorkingLatencyMs.HasValue
+                        ? Math.Max(maxWorkingLatencyMs.Value, workingLatencyMs.Value)
+                        : workingLatencyMs.Value;
+                }
+
                 routes.Add(new RouteState
                 {
                     InCh = inCh,
                     OutCh = outCh,
-                    GainDb = matrix.GetGainDb(inCh, outCh)
+                    GainDb = matrix.GetGainDb(inCh, outCh),
+                    WorkingLatencyMs = workingLatencyMs
                 });
             }
         }
@@ -640,6 +652,7 @@ public sealed class MainForm : Form
             Locked = _locked,
             StartupAtBoot = IsStartupAtBootEnabled(),
             CaptureBufferMs = _engine.CaptureBufferMs,
+            TotalLatencyMs = maxWorkingLatencyMs,
             AvailableInputs = _engine.GetAvailableDevices(DataFlow.Capture).Select(d => new DeviceState
             {
                 DeviceId = d.Id,
@@ -774,6 +787,7 @@ public sealed class MainForm : Form
         public int InCh { get; set; }
         public int OutCh { get; set; }
         public float GainDb { get; set; }
+        public double? WorkingLatencyMs { get; set; }
     }
 
     private sealed class UiState
@@ -782,6 +796,7 @@ public sealed class MainForm : Form
         public bool Locked { get; set; }
         public bool StartupAtBoot { get; set; }
         public int CaptureBufferMs { get; set; }
+        public double? TotalLatencyMs { get; set; }
         public List<DeviceState> AvailableInputs { get; set; } = [];
         public List<DeviceState> AvailableOutputs { get; set; } = [];
         public List<DeviceState> Inputs { get; set; } = [];

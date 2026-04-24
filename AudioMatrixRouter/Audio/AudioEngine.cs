@@ -21,6 +21,7 @@ public class ActiveDevice
 public class AudioEngine : IDisposable
 {
     private const int DefaultCaptureRingBufferMs = 40;
+    private const int RenderPeriodMs = 10;
 
     private readonly DeviceEnumerator _enumerator = new();
     private readonly List<ActiveDevice> _inputDevices = [];
@@ -50,6 +51,28 @@ public class AudioEngine : IDisposable
     public int TotalInputChannels { get; private set; }
     public int TotalOutputChannels { get; private set; }
     public int CaptureBufferMs => _captureBufferMs;
+
+    public bool TryGetRouteWorkingLatencyMs(int inCh, int outCh, out double latencyMs)
+    {
+        latencyMs = 0;
+        if (inCh < 0 || outCh < 0) return false;
+
+        var matrix = _routingMatrix;
+        if (inCh >= matrix.InputChannels || outCh >= matrix.OutputChannels) return false;
+
+        var input = _inputDevices.FirstOrDefault(d => inCh >= d.GlobalChannelOffset && inCh < d.GlobalChannelOffset + d.Info.Channels);
+        var output = _outputDevices.FirstOrDefault(d => outCh >= d.GlobalChannelOffset && outCh < d.GlobalChannelOffset + d.Info.Channels);
+        if (input == null || output == null || input.RingBuffer == null) return false;
+
+        var consumerId = string.IsNullOrWhiteSpace(output.ConsumerId) ? output.Info.Id : output.ConsumerId;
+        int queuedFrames = input.RingBuffer.GetAvailableFrames(consumerId);
+        double captureQueueMs = input.Info.SampleRate > 0
+            ? (queuedFrames * 1000.0) / input.Info.SampleRate
+            : 0;
+
+        latencyMs = captureQueueMs + RenderPeriodMs + output.OutputDelayMs;
+        return true;
+    }
 
     public void Init()
     {
@@ -247,10 +270,10 @@ public class AudioEngine : IDisposable
                 var mmDevice = _enumerator.GetDevice(dev.Info.Id);
                 if (mmDevice == null) continue;
 
-                int ringFrames = Math.Max(dev.Info.SampleRate * _captureBufferMs / 1000, dev.Info.SampleRate / 100);
+                int ringFrames = Math.Max(dev.Info.SampleRate * _captureBufferMs / 1000, dev.Info.SampleRate / 200);
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
-                dev.Capture = new WasapiCapture(mmDevice, true, 10); // 10ms buffer, event-driven
+                dev.Capture = new WasapiCapture(mmDevice, true, _captureBufferMs);
                 dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
                 dev.Capture.DataAvailable += (s, e) =>
                 {
@@ -322,7 +345,7 @@ public class AudioEngine : IDisposable
 
     public bool SetCaptureBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 10, 100);
+        int clamped = Math.Clamp(bufferMs, 5, 100);
         if (_captureBufferMs == clamped)
         {
             return true;
