@@ -95,7 +95,11 @@ Write-Host "Web output     : $webOut"
 Write-Host "Desktop output : $desktopOut"
 $exePath = Join-Path $desktopOut 'AudioMatrixRouter.exe'
 if (Test-Path $exePath) {
-  (Get-Item $exePath).LastWriteTime = Get-Date
+  try {
+    (Get-Item $exePath).LastWriteTime = Get-Date
+  } catch {
+    Write-Host 'Warning: Could not update desktop exe timestamp; continuing.'
+  }
 }
 Get-Item $exePath | Select-Object FullName, LastWriteTime, Length | Format-List
 

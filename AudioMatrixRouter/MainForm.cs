@@ -22,7 +22,7 @@ public sealed class MainForm : Form
 
     private readonly AudioEngine _engine = new();
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
-    private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 500 };
+    private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 100 };
     private readonly System.Windows.Forms.Timer _deviceRefreshTimer = new() { Interval = 250 };
     private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 100 };
     private readonly NotifyIcon _trayIcon = new();
@@ -35,6 +35,7 @@ public sealed class MainForm : Form
     private bool _startMinimizedFromConfig;
     private bool _startupAtBoot;
     private string _uiPreferencesJson = "";
+    private bool _suppressConfigSave;
     private const string StartupScriptName = "AudioMatrixRouter-startup.cmd";
 
     // Cached enumeration of system devices. WASAPI device enumeration + AudioClient.MixFormat
@@ -85,7 +86,15 @@ public sealed class MainForm : Form
             _deviceRefreshTimer.Stop();
             _availableDevicesDirty = true;
             _pendingFullStatePush = true;
-            SyncDevicesWithSystem();
+            _suppressConfigSave = true;
+            try
+            {
+                SyncDevicesWithSystem();
+            }
+            finally
+            {
+                _suppressConfigSave = false;
+            }
             await PushStateToUiAsync();
         };
 
@@ -108,6 +117,10 @@ public sealed class MainForm : Form
         {
             if (IsDisposed) return;
             _pendingFullStatePush = true;
+            if (!_suppressConfigSave)
+            {
+                ScheduleSave();
+            }
             if (InvokeRequired)
             {
                 BeginInvoke(() => { _ = PushStateToUiAsync(); });
@@ -320,6 +333,9 @@ public sealed class MainForm : Form
 
     private void LoadConfigAndDevices()
     {
+        _suppressConfigSave = true;
+        try
+        {
         var loadedConfig = AppConfig.Load();
         if (loadedConfig != null)
         {
@@ -342,13 +358,7 @@ public sealed class MainForm : Form
 
             SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
 
-            // First launch fallback: if saved config has no valid devices on this machine, bootstrap with current active devices.
-            if (_engine.InputDevices.Count == 0 || _engine.OutputDevices.Count == 0)
-            {
-                SyncDevicesWithSystem(addAllAvailableIfEmpty: true);
-            }
-
-            // If saved routes exist, start the engine immediately so audio flows from launch.
+            // Honor persisted routes/config on launch.
             if (!_engine.IsRunning
                 && _engine.InputDevices.Count > 0
                 && _engine.OutputDevices.Count > 0
@@ -360,7 +370,12 @@ public sealed class MainForm : Form
             return;
         }
 
-        SyncDevicesWithSystem(addAllAvailableIfEmpty: true);
+        SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+        }
+        finally
+        {
+            _suppressConfigSave = false;
+        }
     }
 
     private void SyncDevicesWithSystem(bool addAllAvailableIfEmpty = false)
@@ -408,7 +423,7 @@ public sealed class MainForm : Form
     private void ScheduleSave()
     {
         _saveTimer.Stop();
-        _saveTimer.Start();
+        SaveConfig();
     }
 
     private void ApplyDarkTitleBar()

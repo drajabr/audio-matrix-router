@@ -830,6 +830,9 @@ export default function App({ runtime = "web" }) {
   const nativeInputPeakTargetsRef = useRef({});
   const nativeOutputPeakTargetsRef = useRef({});
   const localEditHoldUntilRef = useRef(0);
+  const nativeSyncVersionRef = useRef(0);
+  const persistQueueRef = useRef(Promise.resolve());
+  const lastPersistedJsonRef = useRef("");
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -899,35 +902,15 @@ export default function App({ runtime = "web" }) {
     localStorage.setItem(FONT_SIZE_KEY, fontSize.key);
     localStorage.setItem(UI_SCALE_KEY, uiScale.key);
 
-    if (devicesDiscoveredRef.current) {
-      persistState(buildPersistedState({
-        backgroundKey: background.key,
-        accentKey: accent.key,
-        fontKey: font.key,
-        fontSizeKey: fontSize.key,
-        uiScaleKey: uiScale.key,
-      }));
-    }
   }, [backgroundIndex, accentIndex, fontIndex, fontSizeIndex, uiScaleIndex]);
 
   useEffect(() => {
     localStorage.setItem(QUICK_CONTROLS_COLLAPSED_KEY, controlsCollapsed ? "1" : "0");
-    if (devicesDiscoveredRef.current) {
-      persistState(buildPersistedState({ controlsCollapsed }));
-    }
   }, [controlsCollapsed]);
 
   useEffect(() => {
     localStorage.setItem(POWER_ON_KEY, powerOn ? "1" : "0");
-    if (devicesDiscoveredRef.current) {
-      persistState(buildPersistedState({ powerOn }));
-    }
   }, [powerOn]);
-
-  useEffect(() => {
-    if (!devicesDiscoveredRef.current) return;
-    persistState(buildPersistedState({ showAllDevices, locked }));
-  }, [showAllDevices, locked]);
 
   useEffect(() => {
     if (!hasNativeBridge) return;
@@ -1075,7 +1058,13 @@ export default function App({ runtime = "web" }) {
 
         const now = performance.now();
         if (now >= localEditHoldUntilRef.current) {
-          const nextNativeMatrix = buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols);
+          const nextNativeMatrix = buildMatrixByViewFromNativeState(
+            state,
+            deviceRows,
+            deviceCols,
+            channelRows,
+            channelCols,
+          );
           setMatrixByView((prev) => {
             if (matrixByViewEqual(prev, nextNativeMatrix)) return prev;
             matrixRef.current = nextNativeMatrix;
@@ -1359,21 +1348,11 @@ export default function App({ runtime = "web" }) {
 
   const syncConnectionToNative = async (mode, rowId, colId, connection) => {
     if (!hasNativeBridge) return;
-
-    // Pull device metadata from BOTH active engine inputs/outputs and the available pool,
-    // so newly-selected devices that aren't in the engine yet still resolve. The native
-    // side will add them on demand when it sees the inDeviceId/outDeviceId fields.
-    const state = await window.__nativeBridgeInvoke("getState", {});
-    const allInputs = [
-      ...(Array.isArray(state?.inputs) ? state.inputs : []),
-      ...(Array.isArray(state?.availableInputs) ? state.availableInputs : []),
-    ];
-    const allOutputs = [
-      ...(Array.isArray(state?.outputs) ? state.outputs : []),
-      ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
-    ];
-    const findInput = (id) => allInputs.find((d) => d?.deviceId === id);
-    const findOutput = (id) => allOutputs.find((d) => d?.deviceId === id);
+    const syncVersion = ++nativeSyncVersionRef.current;
+    const findInput = (id) => inputs.find((d) => d?.deviceId === id);
+    const findOutput = (id) => outputs.find((d) => d?.deviceId === id);
+    const getInputOffset = (id) => Number.isFinite(nativeInputChannelMeta[id]?.offset) ? nativeInputChannelMeta[id].offset : null;
+    const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMeta[id]?.offset) ? nativeOutputChannelMeta[id].offset : null;
 
     const active = !!connection?.on && !connection?.muted;
     const baseGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
@@ -1394,8 +1373,8 @@ export default function App({ runtime = "web" }) {
         inChannel: rowParsed.channelIndex,
         outDeviceId: colParsed.deviceId,
         outChannel: colParsed.channelIndex,
-        inCh: (Number.isFinite(inputDevice?.offset) ? inputDevice.offset : 0) + rowParsed.channelIndex,
-        outCh: (Number.isFinite(outputDevice?.offset) ? outputDevice.offset : 0) + colParsed.channelIndex,
+        ...(getInputOffset(rowParsed.deviceId) != null ? { inCh: getInputOffset(rowParsed.deviceId) + rowParsed.channelIndex } : {}),
+        ...(getOutputOffset(colParsed.deviceId) != null ? { outCh: getOutputOffset(colParsed.deviceId) + colParsed.channelIndex } : {}),
         active,
         gainDb: baseGainDb,
       });
@@ -1408,37 +1387,60 @@ export default function App({ runtime = "web" }) {
       const outputDevice = findOutput(outputDeviceId);
       if (!inputDevice || !outputDevice) return;
 
-      const inChannels = Array.from({ length: inputDevice.channels || 0 }, (_, i) => i);
-      const outChannels = Array.from({ length: outputDevice.channels || 0 }, (_, i) => i);
-      const routes = buildDeviceToChannelRouteMatrix(inChannels, outChannels);
+      const inChannels = Array.from(
+        { length: Math.max(1, Number.isFinite(inputDevice?.channels) ? inputDevice.channels : 0) },
+        (_, i) => i,
+      );
+      const outChannels = Array.from(
+        { length: Math.max(1, Number.isFinite(outputDevice?.channels) ? outputDevice.channels : 0) },
+        (_, i) => i,
+      );
 
-      routes.forEach((route) => {
-        routesPayload.push({
-          inDeviceId: inputDeviceId,
-          inChannel: route.inChannel,
-          outDeviceId: outputDeviceId,
-          outChannel: route.outChannel,
-          inCh: (Number.isFinite(inputDevice?.offset) ? inputDevice.offset : 0) + route.inChannel,
-          outCh: (Number.isFinite(outputDevice?.offset) ? outputDevice.offset : 0) + route.outChannel,
-          active,
-          gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+      if (!active) {
+        // Device tile OFF means kill every channel route for that device pair immediately.
+        inChannels.forEach((inChannel) => {
+          outChannels.forEach((outChannel) => {
+            routesPayload.push({
+              inDeviceId: inputDeviceId,
+              inChannel,
+              outDeviceId: outputDeviceId,
+              outChannel,
+              ...(getInputOffset(inputDeviceId) != null ? { inCh: getInputOffset(inputDeviceId) + inChannel } : {}),
+              ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + outChannel } : {}),
+              active: false,
+              gainDb: 0,
+            });
+          });
         });
-      });
+      } else {
+        const routes = buildDeviceToChannelRouteMatrix(inChannels, outChannels);
+        routes.forEach((route) => {
+          routesPayload.push({
+            inDeviceId: inputDeviceId,
+            inChannel: route.inChannel,
+            outDeviceId: outputDeviceId,
+            outChannel: route.outChannel,
+            ...(getInputOffset(inputDeviceId) != null ? { inCh: getInputOffset(inputDeviceId) + route.inChannel } : {}),
+            ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + route.outChannel } : {}),
+            active: true,
+            gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+          });
+        });
+      }
     }
 
     if (routesPayload.length > 0) {
       try {
-        await window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload });
-        localEditHoldUntilRef.current = 0;
-        try {
-          const refreshed = await window.__nativeBridgeInvoke("getState", {});
-          window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
-        } catch (_) {
-          // no-op
+        const refreshed = await window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload });
+        if (syncVersion === nativeSyncVersionRef.current) {
+          localEditHoldUntilRef.current = 0;
+          if (refreshed) {
+            window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
+          }
         }
       } catch (_) {
         // Backward-compatible fallback for hosts that only expose setCrosspoint.
-        await Promise.all(routesPayload.map((route) => {
+        const fallbackResults = await Promise.all(routesPayload.map((route) => {
           const legacy = {
             inCh: Number.isFinite(route.inCh) ? route.inCh : (Number.isFinite(route.inChannel) ? route.inChannel : 0),
             outCh: Number.isFinite(route.outCh) ? route.outCh : (Number.isFinite(route.outChannel) ? route.outChannel : 0),
@@ -1447,12 +1449,12 @@ export default function App({ runtime = "web" }) {
           };
           return window.__nativeBridgeInvoke("setCrosspoint", legacy);
         }));
-        localEditHoldUntilRef.current = 0;
-        try {
-          const refreshed = await window.__nativeBridgeInvoke("getState", {});
-          window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
-        } catch (_) {
-          // no-op
+        if (syncVersion === nativeSyncVersionRef.current) {
+          localEditHoldUntilRef.current = 0;
+          const refreshed = fallbackResults[fallbackResults.length - 1];
+          if (refreshed) {
+            window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
+          }
         }
       }
     }
@@ -1517,29 +1519,55 @@ export default function App({ runtime = "web" }) {
     controlsCollapsed,
     showAllDevices,
     powerOn,
-    locked,
     inputLabels,
     outputLabels,
-    inputMasterId,
-    outputMasterId,
     viewMode,
     labelSizing,
-    matrixByView,
     inputOrder: inputs.map((d) => d.deviceId),
     outputOrder: outputs.map((d) => d.deviceId),
     ...overrides,
   });
 
   const persistState = (next) => {
+    let json = "";
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      const payload = hasNativeBridge
+        ? {
+            backgroundKey: next?.backgroundKey,
+            accentKey: next?.accentKey,
+            fontKey: next?.fontKey,
+            fontSizeKey: next?.fontSizeKey,
+            uiScaleKey: next?.uiScaleKey,
+            captureBufferMs: next?.captureBufferMs,
+            controlsCollapsed: next?.controlsCollapsed,
+            showAllDevices: next?.showAllDevices,
+            powerOn: next?.powerOn,
+            inputLabels: next?.inputLabels,
+            outputLabels: next?.outputLabels,
+            viewMode: next?.viewMode,
+            labelSizing: next?.labelSizing,
+            inputOrder: next?.inputOrder,
+            outputOrder: next?.outputOrder,
+          }
+        : next;
+      json = JSON.stringify(payload);
+    } catch (_) {
+      return;
+    }
+
+    try {
+      localStorage.setItem(STORAGE_KEY, json);
     } catch (_) {
       // no-op
     }
 
-    if (hasNativeBridge) {
-      window.__nativeBridgeInvoke("setUiPreferences", { json: JSON.stringify(next) }).catch(() => {});
-    }
+    if (!hasNativeBridge || lastPersistedJsonRef.current === json) return;
+
+    lastPersistedJsonRef.current = json;
+    persistQueueRef.current = persistQueueRef.current
+      .catch(() => {})
+      .then(() => window.__nativeBridgeInvoke("setUiPreferences", { json }))
+      .catch(() => {});
   };
 
   const loadPersistedState = async () => {
@@ -1547,6 +1575,7 @@ export default function App({ runtime = "web" }) {
       try {
         const raw = await window.__nativeBridgeInvoke("getUiPreferences", {});
         if (typeof raw === "string" && raw.trim()) {
+          lastPersistedJsonRef.current = raw;
           return JSON.parse(raw);
         }
       } catch (_) {
@@ -1556,6 +1585,9 @@ export default function App({ runtime = "web" }) {
 
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
+      if (typeof raw === "string" && raw.trim()) {
+        lastPersistedJsonRef.current = raw;
+      }
       return raw ? JSON.parse(raw) : null;
     } catch (_) {
       return null;
@@ -1789,14 +1821,22 @@ export default function App({ runtime = "web" }) {
         ? currentMatrixByView.channel
         : saved?.matrixByView?.channel || {};
 
-      const nativeMatrixByView = hasNativeBridge
-        ? buildMatrixByViewFromNativeState(nativeState, deviceRows, deviceCols, channelRows, channelCols)
-        : null;
-
-      const nextMatrixByView = nativeMatrixByView || {
+      const savedBackedMatrixByView = {
         device: createMatrix(deviceRows, deviceCols, sourceDeviceMatrix),
         channel: createMatrix(channelRows, channelCols, sourceChannelMatrix),
       };
+
+      const nativeMatrixByView = hasNativeBridge
+        ? buildMatrixByViewFromNativeState(
+            nativeState,
+            deviceRows,
+            deviceCols,
+            channelRows,
+            channelCols,
+          )
+        : null;
+
+      const nextMatrixByView = nativeMatrixByView || savedBackedMatrixByView;
 
       const nextViewMode = saved?.viewMode === "channel" ? "channel" : "device";
       const hasSavedLabelSizing = !!saved?.labelSizing;
@@ -1821,12 +1861,24 @@ export default function App({ runtime = "web" }) {
       matrixRef.current = nextMatrixByView;
       modeRef.current = nextViewMode;
 
-      const nextInputMaster = orderedInputs.some((d) => d.deviceId === saved?.inputMasterId) ? saved?.inputMasterId || "" : "";
-      const nextOutputMaster = orderedOutputs.some((d) => d.deviceId === saved?.outputMasterId) ? saved?.outputMasterId || "" : "";
+      const nativeInputMaster = hasNativeBridge
+        ? ((Array.isArray(nativeState?.inputs) ? nativeState.inputs : []).find((d) => d?.isMaster)?.deviceId || "")
+        : "";
+      const nativeOutputMaster = hasNativeBridge
+        ? ((Array.isArray(nativeState?.outputs) ? nativeState.outputs : []).find((d) => d?.isMaster)?.deviceId || "")
+        : "";
+      const nextInputMaster = hasNativeBridge
+        ? nativeInputMaster
+        : (orderedInputs.some((d) => d.deviceId === saved?.inputMasterId) ? saved?.inputMasterId || "" : "");
+      const nextOutputMaster = hasNativeBridge
+        ? nativeOutputMaster
+        : (orderedOutputs.some((d) => d.deviceId === saved?.outputMasterId) ? saved?.outputMasterId || "" : "");
       setInputMasterId(nextInputMaster);
       setOutputMasterId(nextOutputMaster);
-      if (nextInputMaster) pushInputMasterToNative(nextInputMaster);
-      if (nextOutputMaster) pushOutputMasterToNative(nextOutputMaster);
+      if (!hasNativeBridge) {
+        if (nextInputMaster) pushInputMasterToNative(nextInputMaster);
+        if (nextOutputMaster) pushOutputMasterToNative(nextOutputMaster);
+      }
 
       const snapshot = buildPersistedState({
         backgroundKey: saved?.backgroundKey || BACKGROUND_PRESETS[backgroundIndex]?.key,
@@ -1838,14 +1890,13 @@ export default function App({ runtime = "web" }) {
         controlsCollapsed: typeof saved?.controlsCollapsed === "boolean" ? saved.controlsCollapsed : controlsCollapsed,
         showAllDevices: typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : showAllDevices,
         powerOn: typeof saved?.powerOn === "boolean" ? saved.powerOn : powerOn,
-        locked: hasNativeBridge ? locked : !!saved?.locked,
+        locked: hasNativeBridge ? !!nativeState?.locked : !!saved?.locked,
         inputLabels: nextInputLabels,
         outputLabels: nextOutputLabels,
         inputMasterId: nextInputMaster,
         outputMasterId: nextOutputMaster,
         viewMode: nextViewMode,
         labelSizing: nextLabelSizing,
-        matrixByView: nextMatrixByView,
         inputOrder: orderedInputs.map((d) => d.deviceId),
         outputOrder: orderedOutputs.map((d) => d.deviceId),
       });
@@ -1908,6 +1959,18 @@ export default function App({ runtime = "web" }) {
 
   const handleResetMatrix = async (event) => {
     event?.stopPropagation?.();
+
+    if (hasNativeBridge) {
+      try {
+        localEditHoldUntilRef.current = 0;
+        const state = await window.__nativeBridgeInvoke("clearRoutes", {});
+        if (state) {
+          window.dispatchEvent(new CustomEvent("native-state", { detail: state }));
+        }
+      } catch (_) {
+        // no-op
+      }
+    }
 
     const deviceRows = inputs.map((input) => ({ id: `dev:${input.deviceId}` }));
     const deviceCols = outputs.map((output) => ({ id: `dev:${output.deviceId}` }));
@@ -1975,14 +2038,34 @@ export default function App({ runtime = "web" }) {
 
   useEffect(() => {
     if (!devicesDiscoveredRef.current) return;
-    
+
     persistState({
       ...buildPersistedState(),
       matrixByView,
       inputOrder: inputs.map((d) => d.deviceId),
       outputOrder: outputs.map((d) => d.deviceId),
     });
-  }, [inputs, outputs, viewMode, inputLabels, outputLabels, inputMasterId, outputMasterId, labelSizing, matrixByView]);
+  }, [
+    backgroundIndex,
+    accentIndex,
+    fontIndex,
+    fontSizeIndex,
+    uiScaleIndex,
+    captureBufferMs,
+    controlsCollapsed,
+    showAllDevices,
+    powerOn,
+    locked,
+    inputs,
+    outputs,
+    inputLabels,
+    outputLabels,
+    inputMasterId,
+    outputMasterId,
+    viewMode,
+    labelSizing,
+    matrixByView,
+  ]);
 
   useEffect(() => {
     const unlockOnGesture = async () => {
@@ -2090,8 +2173,8 @@ export default function App({ runtime = "web" }) {
 
     if (hasNativeBridge) {
       // Hold native matrix overwrite briefly so click feedback isn't immediately reverted
-      // while the setCrosspoints round-trip is still in flight.
-      localEditHoldUntilRef.current = performance.now() + 1200;
+      // while the native mutation round-trip is still in flight.
+      localEditHoldUntilRef.current = performance.now() + 250;
     }
 
     const key = getCellKey(rowId, colId);
@@ -2523,15 +2606,7 @@ export default function App({ runtime = "web" }) {
       resizeRef.current.mode = null;
       document.body.style.cursor = "";
 
-      persistState({
-        viewMode,
-        inputLabels,
-        outputLabels,
-        inputMasterId,
-        outputMasterId,
-        labelSizing,
-        matrixByView,
-      });
+      persistState(buildPersistedState({ labelSizing, matrixByView }));
     };
 
     window.addEventListener("mousemove", onMove);

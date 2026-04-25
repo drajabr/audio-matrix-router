@@ -173,6 +173,7 @@ public class AudioEngine : IDisposable
         var ad = new ActiveDevice { Info = found };
         _inputDevices.Add(ad);
         RecalcChannelOffsets();
+        StateChanged?.Invoke();
         return true;
     }
 
@@ -187,6 +188,7 @@ public class AudioEngine : IDisposable
         var ad = new ActiveDevice { Info = found };
         _outputDevices.Add(ad);
         RecalcChannelOffsets();
+        StateChanged?.Invoke();
         return true;
     }
 
@@ -216,6 +218,7 @@ public class AudioEngine : IDisposable
         RecalcChannelOffsets();
         RestoreRoutedCrosspoints(routeSnapshot);
         if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
+        StateChanged?.Invoke();
     }
 
     public void RemoveOutputDevice(int index)
@@ -228,6 +231,7 @@ public class AudioEngine : IDisposable
         RecalcChannelOffsets();
         RestoreRoutedCrosspoints(routeSnapshot);
         if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
+        StateChanged?.Invoke();
     }
 
     public void SetCrosspoint(int inCh, int outCh, bool active, float gainDb)
@@ -239,7 +243,7 @@ public class AudioEngine : IDisposable
         }
 
         _routingMatrix.Publish();
-        ReconcileMasterDevices();
+        StateChanged?.Invoke();
     }
 
     public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb)> updates)
@@ -247,7 +251,7 @@ public class AudioEngine : IDisposable
         int changed = _routingMatrix.SetCrosspoints(updates);
         if (changed > 0)
         {
-            ReconcileMasterDevices();
+            StateChanged?.Invoke();
         }
 
         return changed;
@@ -269,12 +273,13 @@ public class AudioEngine : IDisposable
     {
         _routingMatrix.ToggleCrosspoint(inCh, outCh);
         _routingMatrix.Publish();
+        StateChanged?.Invoke();
     }
 
     public void ClearCrosspoints()
     {
         _routingMatrix.ClearAll();
-        ReconcileMasterDevices();
+        StateChanged?.Invoke();
     }
 
     public bool Start()
@@ -461,7 +466,6 @@ public class AudioEngine : IDisposable
 
         _routingMatrix.Resize(TotalInputChannels, TotalOutputChannels);
         _routingMatrix.Publish();
-        ReconcileMasterDevices();
     }
 
     public void RefreshDevices()
@@ -510,6 +514,8 @@ public class AudioEngine : IDisposable
         {
             Start();
         }
+
+        StateChanged?.Invoke();
     }
 
     private List<RoutedCrosspoint> CaptureRoutedCrosspoints()
@@ -573,82 +579,6 @@ public class AudioEngine : IDisposable
         }
 
         _routingMatrix.Publish();
-        ReconcileMasterDevices();
-    }
-
-    private void ReconcileMasterDevices()
-    {
-        var activeInputIds = new HashSet<string>(StringComparer.Ordinal);
-        var activeOutputIds = new HashSet<string>(StringComparer.Ordinal);
-
-        var front = _routingMatrix.GetFrontBuffer();
-        int outChannels = _routingMatrix.OutputChannels;
-        if (front.Length > 0 && outChannels > 0)
-        {
-            for (int inCh = 0; inCh < _routingMatrix.InputChannels; inCh++)
-            {
-                for (int outCh = 0; outCh < outChannels; outCh++)
-                {
-                    int idx = inCh * outChannels + outCh;
-                    if (idx < 0 || idx >= front.Length || !front[idx].Active) continue;
-
-                    var inDevice = FindInputDeviceByChannel(inCh);
-                    var outDevice = FindOutputDeviceByChannel(outCh);
-                    if (inDevice != null) activeInputIds.Add(inDevice.Info.Id);
-                    if (outDevice != null) activeOutputIds.Add(outDevice.Info.Id);
-                }
-            }
-        }
-
-        bool changed = false;
-
-        string? desiredInputMaster = null;
-        if (activeInputIds.Count > 0)
-        {
-            var current = _inputDevices.FirstOrDefault(d => d.IsMasterDevice);
-            desiredInputMaster = current != null && activeInputIds.Contains(current.Info.Id)
-                ? current.Info.Id
-                : _inputDevices.FirstOrDefault(d => activeInputIds.Contains(d.Info.Id))?.Info.Id;
-        }
-
-        foreach (var d in _inputDevices)
-        {
-            bool next = desiredInputMaster != null && d.Info.Id == desiredInputMaster;
-            if (d.IsMasterDevice != next)
-            {
-                d.IsMasterDevice = next;
-                changed = true;
-            }
-        }
-
-        string? desiredOutputMaster = null;
-        if (activeOutputIds.Count > 0)
-        {
-            var current = _outputDevices.FirstOrDefault(d => d.IsMasterDevice);
-            desiredOutputMaster = current != null && activeOutputIds.Contains(current.Info.Id)
-                ? current.Info.Id
-                : _outputDevices.FirstOrDefault(d => activeOutputIds.Contains(d.Info.Id))?.Info.Id;
-        }
-
-        foreach (var d in _outputDevices)
-        {
-            bool next = desiredOutputMaster != null && d.Info.Id == desiredOutputMaster;
-            if (d.IsMasterDevice != next)
-            {
-                d.IsMasterDevice = next;
-                changed = true;
-            }
-        }
-
-        if (desiredOutputMaster != null)
-        {
-            _syncCoordinator?.SetMasterConsumer(desiredOutputMaster);
-        }
-
-        if (changed)
-        {
-            StateChanged?.Invoke();
-        }
     }
 
     public void Dispose()

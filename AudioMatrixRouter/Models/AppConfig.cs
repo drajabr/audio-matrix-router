@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Diagnostics;
 
 namespace AudioMatrixRouter.Models;
 
@@ -70,10 +71,31 @@ public class AppConfig
     {
         try
         {
+            var path = GetConfigPath();
+            var dir = Path.GetDirectoryName(path);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
             var json = JsonSerializer.Serialize(this, _jsonOptions);
-            File.WriteAllText(GetConfigPath(), json);
+            var tempPath = path + ".tmp";
+            File.WriteAllText(tempPath, json);
+
+            if (File.Exists(path))
+            {
+                File.Copy(tempPath, path, overwrite: true);
+                File.Delete(tempPath);
+            }
+            else
+            {
+                File.Move(tempPath, path);
+            }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[AppConfig] Save failed: {ex}");
+        }
     }
 
     public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson)
@@ -108,12 +130,9 @@ public class AppConfig
 
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
-        // Migration: a previous version of SyncDevicesWithSystem auto-added every system
-        // capture + loopback endpoint as an active input and persisted that bloated list.
-        // On startup we'd then open a WasapiCapture/WasapiLoopbackCapture per device,
-        // which pegs CPU and hangs the UI. So: only add devices that are referenced by
-        // at least one saved crosspoint, then remap channel indices to the pruned layout.
-        // First pass: temporarily add all devices to learn each one's channel count.
+        // Honor the user's configured active device lists exactly as saved, in saved order.
+        // If a saved device is unavailable on this machine right now, skip it at runtime,
+        // but do not infer replacements or expand the config with other system devices.
         foreach (var d in InputDevices)
             engine.AddInputDevice(d.Id);
         foreach (var d in OutputDevices)
@@ -127,27 +146,14 @@ public class AppConfig
             .Select(d => (Id: d.Info.Id, Channels: d.Info.Channels, OldOffset: d.GlobalChannelOffset))
             .ToList();
 
-        // Determine which devices any crosspoint references.
-        var usedInputIds = new HashSet<string>();
-        var usedOutputIds = new HashSet<string>();
-        foreach (var cp in Crosspoints)
-        {
-            var inDev = inputSnapshot.FirstOrDefault(d => cp.InCh >= d.OldOffset && cp.InCh < d.OldOffset + d.Channels);
-            if (inDev.Id != null) usedInputIds.Add(inDev.Id);
-            var outDev = outputSnapshot.FirstOrDefault(d => cp.OutCh >= d.OldOffset && cp.OutCh < d.OldOffset + d.Channels);
-            if (outDev.Id != null) usedOutputIds.Add(outDev.Id);
-        }
-
-        // Wipe and rebuild with only referenced devices, in original saved order.
-        // RemoveInputDevice/RemoveOutputDevice resize the matrix; remove from the end
-        // to avoid shifting indices repeatedly.
+        // Wipe and rebuild with all available configured devices in original saved order.
         for (int i = engine.InputDevices.Count - 1; i >= 0; i--)
             engine.RemoveInputDevice(i);
         for (int i = engine.OutputDevices.Count - 1; i >= 0; i--)
             engine.RemoveOutputDevice(i);
 
-        var keptInputs = inputSnapshot.Where(d => usedInputIds.Contains(d.Id)).ToList();
-        var keptOutputs = outputSnapshot.Where(d => usedOutputIds.Contains(d.Id)).ToList();
+        var keptInputs = inputSnapshot.ToList();
+        var keptOutputs = outputSnapshot.ToList();
 
         foreach (var d in keptInputs)
             engine.AddInputDevice(d.Id);
