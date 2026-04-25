@@ -23,6 +23,7 @@ const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
 const CAPTURE_BUFFER_OPTIONS = [5, 10, 20, 40, 60, 100];
+const METER_AUTO_SCALE_WINDOW_MS = 60000;
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -428,6 +429,39 @@ function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channel
   return next;
 }
 
+function mergeNativeMatrixWithLocalFlags(prevMatrix, nextNativeMatrix) {
+  const mergeView = (prevView, nextView) => {
+    const merged = {};
+    Object.keys(nextView || {}).forEach((key) => {
+      const nativeConn = nextView[key] || makeDefaultConnection();
+      const prevConn = prevView?.[key] || makeDefaultConnection();
+
+      const keepMutedLocal = !!prevConn?.muted;
+      const mergedConn = {
+        ...nativeConn,
+        phaseInverted: !!prevConn?.phaseInverted,
+        muted: keepMutedLocal,
+      };
+
+      if (keepMutedLocal) {
+        // Native host has no dedicated mute/phase fields; keep local mute intent stable.
+        mergedConn.on = true;
+        if (Number.isFinite(prevConn?.gainDb)) {
+          mergedConn.gainDb = prevConn.gainDb;
+        }
+      }
+
+      merged[key] = mergedConn;
+    });
+    return merged;
+  };
+
+  return {
+    device: mergeView(prevMatrix?.device, nextNativeMatrix?.device),
+    channel: mergeView(prevMatrix?.channel, nextNativeMatrix?.channel),
+  };
+}
+
 function matrixConnectionEqual(a, b) {
   const aConn = a || makeDefaultConnection();
   const bConn = b || makeDefaultConnection();
@@ -783,6 +817,7 @@ export default function App({ runtime = "web" }) {
   const [gainAdjustCell, setGainAdjustCell] = useState(null);
   const [transientMuteAll, setTransientMuteAll] = useState(false);
   const [showResizeGuides, setShowResizeGuides] = useState(false);
+  const [showBufferMenu, setShowBufferMenu] = useState(false);
 
   const [viewMode, setViewMode] = useState("device");
   const [inputs, setInputs] = useState([]);
@@ -827,12 +862,14 @@ export default function App({ runtime = "web" }) {
   const dragScrollRef = useRef({ tracking: false, dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0, pointerId: 0, blockNextClick: false });
   const latencyLastRef = useRef(null);
   const latencyJitterRef = useRef(0);
-  const nativeInputPeakTargetsRef = useRef({});
-  const nativeOutputPeakTargetsRef = useRef({});
   const localEditHoldUntilRef = useRef(0);
   const nativeSyncVersionRef = useRef(0);
   const persistQueueRef = useRef(Promise.resolve());
   const lastPersistedJsonRef = useRef("");
+  const inputAutoScaleRef = useRef(new Map());
+  const outputAutoScaleRef = useRef(new Map());
+  const meterFrameRef = useRef({ lastTs: 0 });
+  const wheelDragRef = useRef(null);
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -989,7 +1026,6 @@ export default function App({ runtime = "web" }) {
         const peakLevels = Array.isArray(d?.peakLevels)
           ? d.peakLevels.map((v) => clamp(Number(v) || 0, 0, 1))
           : [];
-        nativeInputPeakTargetsRef.current[d.deviceId] = peakLevels;
         inMeta[d.deviceId] = {
           offset: Number.isFinite(d?.offset) ? d.offset : 0,
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
@@ -1000,19 +1036,7 @@ export default function App({ runtime = "web" }) {
           peakLevels,
         };
       });
-      nativeInputPeakTargetsRef.current = Object.fromEntries(
-        Object.entries(nativeInputPeakTargetsRef.current).filter(([deviceId]) => !!inMeta[deviceId]),
-      );
-      setNativeInputChannelMeta((prev) => {
-        const next = {};
-        Object.keys(inMeta).forEach((deviceId) => {
-          next[deviceId] = {
-            ...inMeta[deviceId],
-            peakLevels: prev[deviceId]?.peakLevels ?? inMeta[deviceId].peakLevels,
-          };
-        });
-        return next;
-      });
+      setNativeInputChannelMeta(inMeta);
 
       const outMeta = {};
       (Array.isArray(state?.outputs) ? state.outputs : []).forEach((d) => {
@@ -1020,7 +1044,6 @@ export default function App({ runtime = "web" }) {
         const peakLevels = Array.isArray(d?.peakLevels)
           ? d.peakLevels.map((v) => clamp(Number(v) || 0, 0, 1))
           : [];
-        nativeOutputPeakTargetsRef.current[d.deviceId] = peakLevels;
         outMeta[d.deviceId] = {
           offset: Number.isFinite(d?.offset) ? d.offset : 0,
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
@@ -1030,19 +1053,7 @@ export default function App({ runtime = "web" }) {
           peakLevels,
         };
       });
-      nativeOutputPeakTargetsRef.current = Object.fromEntries(
-        Object.entries(nativeOutputPeakTargetsRef.current).filter(([deviceId]) => !!outMeta[deviceId]),
-      );
-      setNativeOutputChannelMeta((prev) => {
-        const next = {};
-        Object.keys(outMeta).forEach((deviceId) => {
-          next[deviceId] = {
-            ...outMeta[deviceId],
-            peakLevels: prev[deviceId]?.peakLevels ?? outMeta[deviceId].peakLevels,
-          };
-        });
-        return next;
-      });
+      setNativeOutputChannelMeta(outMeta);
 
       if (hasNativeBridge && inputs.length > 0 && outputs.length > 0) {
         const deviceRows = inputs.map((i) => ({ id: `dev:${i.deviceId}` }));
@@ -1066,9 +1077,10 @@ export default function App({ runtime = "web" }) {
             channelCols,
           );
           setMatrixByView((prev) => {
-            if (matrixByViewEqual(prev, nextNativeMatrix)) return prev;
-            matrixRef.current = nextNativeMatrix;
-            return nextNativeMatrix;
+            const merged = mergeNativeMatrixWithLocalFlags(prev, nextNativeMatrix);
+            if (matrixByViewEqual(prev, merged)) return prev;
+            matrixRef.current = merged;
+            return merged;
           });
         }
 
@@ -1177,55 +1189,6 @@ export default function App({ runtime = "web" }) {
       }
     };
   }, [hasNativeBridge, inputs, outputs, inputMasterId, outputMasterId]);
-
-  useEffect(() => {
-    if (!hasNativeBridge) return;
-
-    let rafId = 0;
-
-    const smoothPeaks = (prevMeta, targetsRef) => {
-      const keys = Object.keys(prevMeta);
-      let changed = false;
-      const nextMeta = {};
-
-      keys.forEach((deviceId) => {
-        const entry = prevMeta[deviceId] || {};
-        const currentPeaks = Array.isArray(entry.peakLevels) ? entry.peakLevels : [];
-        const targetPeaks = Array.isArray(targetsRef.current[deviceId]) ? targetsRef.current[deviceId] : [];
-        const peakCount = Math.max(currentPeaks.length, targetPeaks.length);
-        const smoothedPeaks = new Array(peakCount);
-
-        for (let i = 0; i < peakCount; i += 1) {
-          const current = clamp(Number(currentPeaks[i]) || 0, 0, 1);
-          const target = clamp(Number(targetPeaks[i]) || 0, 0, 1);
-          const blend = target > current ? 0.38 : 0.16;
-          let next = current + (target - current) * blend;
-          if (Math.abs(target - next) < 0.002) next = target;
-          if (next < 0.0005) next = 0;
-          smoothedPeaks[i] = next;
-          if (!changed && Math.abs(next - current) > 0.0005) changed = true;
-        }
-
-        nextMeta[deviceId] = {
-          ...entry,
-          peakLevels: smoothedPeaks,
-        };
-      });
-
-      return changed ? nextMeta : prevMeta;
-    };
-
-    const tick = () => {
-      setNativeInputChannelMeta((prev) => smoothPeaks(prev, nativeInputPeakTargetsRef));
-      setNativeOutputChannelMeta((prev) => smoothPeaks(prev, nativeOutputPeakTargetsRef));
-      rafId = requestAnimationFrame(tick);
-    };
-
-    rafId = requestAnimationFrame(tick);
-    return () => {
-      cancelAnimationFrame(rafId);
-    };
-  }, [hasNativeBridge]);
 
   const rows = useMemo(() => {
     if (viewMode === "device") {
@@ -2086,7 +2049,16 @@ export default function App({ runtime = "web" }) {
   }, []);
 
   useEffect(() => {
+    if (hasNativeBridge) return undefined;
+
     const tick = () => {
+      const now = performance.now();
+      if (now - meterFrameRef.current.lastTs < 1000 / 30) {
+        rafRef.current = requestAnimationFrame(tick);
+        return;
+      }
+      meterFrameRef.current.lastTs = now;
+
       const nextInput = {};
       rows.forEach((row) => {
         nextInput[row.id] = managerRef.current.getInputLevel(row.id);
@@ -2127,7 +2099,7 @@ export default function App({ runtime = "web" }) {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [rows, cols, routedInputs, routedOutputs]);
+  }, [hasNativeBridge, rows, cols, routedInputs, routedOutputs]);
 
   useEffect(() => {
     if (inputs.length === 0 || outputs.length === 0) return;
@@ -2638,15 +2610,40 @@ export default function App({ runtime = "web" }) {
     ? Math.max(1, cols.reduce((acc, col) => acc + Math.max(1, col.channelCount || 1), 0))
     : Math.max(cols.length, 1);
 
-  const cycleCaptureBuffer = () => {
+  const setCaptureBufferFromMenu = (next) => {
     if (locked || isApplyingCaptureBuffer) return;
-    const currentIndex = Math.max(0, CAPTURE_BUFFER_OPTIONS.indexOf(captureBufferMs));
-    const next = CAPTURE_BUFFER_OPTIONS[(currentIndex + 1) % CAPTURE_BUFFER_OPTIONS.length];
     applyQuickSelection("captureBuffer", String(next));
+    setShowBufferMenu(false);
   };
 
   const selectedSource = detailCell ? rows.find((r) => r.id === detailCell.rowId) : null;
   const selectedDestination = detailCell ? cols.find((c) => c.id === detailCell.colId) : null;
+  const autoScaleLevels = (levels, scaleMapRef, scaleKey) => {
+    const source = Array.isArray(levels) ? levels : [];
+    const safe = source.map((v) => clamp(Number(v) || 0, 0, 1));
+    const peak = safe.reduce((acc, v) => (v > acc ? v : acc), 0);
+
+    const now = performance.now();
+    const state = scaleMapRef.current.get(scaleKey) || { history: [] };
+    state.history.push({ t: now, v: peak });
+    const cutoff = now - METER_AUTO_SCALE_WINDOW_MS;
+    while (state.history.length > 0 && state.history[0].t < cutoff) {
+      state.history.shift();
+    }
+    // Bound memory in case browser tab sleeps and wakes unpredictably.
+    if (state.history.length > 2400) {
+      state.history.splice(0, state.history.length - 2400);
+    }
+
+    let windowMax = 0.08;
+    for (let i = 0; i < state.history.length; i += 1) {
+      if (state.history[i].v > windowMax) windowMax = state.history[i].v;
+    }
+    scaleMapRef.current.set(scaleKey, state);
+    const denom = Math.max(0.0001, windowMax);
+    return safe.map((v) => clamp(v / denom, 0, 1));
+  };
+
   const getRowSplitLevels = (row) => {
     if (!row) return [0, 0];
     const devId = row.deviceId || (row.id.startsWith("dev:") ? row.id.slice(4) : row.id.split(":")[1]);
@@ -2654,8 +2651,9 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const first = peaks[0] ?? 0;
-        const second = ch > 1 ? (peaks[1] ?? 0) : first;
+        const scaled = autoScaleLevels(peaks, inputAutoScaleRef, `in-split:${devId}`);
+        const first = scaled[0] ?? 0;
+        const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
       }
       return [0, 0];
@@ -2664,9 +2662,10 @@ export default function App({ runtime = "web" }) {
     const rightId = `ch:${devId}:${Math.min(1, ch - 1)}`;
     const left = inputLevels[leftId] ?? managerRef.current.getInputLevel(leftId) ?? 0;
     const right = inputLevels[rightId] ?? managerRef.current.getInputLevel(rightId) ?? 0;
+    const scaled = autoScaleLevels([left, ch > 1 ? right : left], inputAutoScaleRef, `in-split:${devId}`);
     return [
-      left,
-      ch > 1 ? right : left,
+      scaled[0] ?? 0,
+      scaled[1] ?? 0,
     ];
   };
 
@@ -2677,8 +2676,9 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const first = peaks[0] ?? 0;
-        const second = ch > 1 ? (peaks[1] ?? 0) : first;
+        const scaled = autoScaleLevels(peaks, outputAutoScaleRef, `out-split:${devId}`);
+        const first = scaled[0] ?? 0;
+        const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
       }
       return [0, 0];
@@ -2687,9 +2687,10 @@ export default function App({ runtime = "web" }) {
     const rightId = `ch:${devId}:${Math.min(1, ch - 1)}`;
     const left = outputLevels[leftId] ?? managerRef.current.getOutputLevel(leftId) ?? 0;
     const right = outputLevels[rightId] ?? managerRef.current.getOutputLevel(rightId) ?? 0;
+    const scaled = autoScaleLevels([left, ch > 1 ? right : left], outputAutoScaleRef, `out-split:${devId}`);
     return [
-      left,
-      ch > 1 ? right : left,
+      scaled[0] ?? 0,
+      scaled[1] ?? 0,
     ];
   };
 
@@ -2702,14 +2703,16 @@ export default function App({ runtime = "web" }) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        for (let i = 0; i < ch; i += 1) out[i] = peaks[i] ?? 0;
+        const scaled = autoScaleLevels(peaks, inputAutoScaleRef, `in:${devId}`);
+        for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
     }
-    return Array.from({ length: ch }, (_, i) => {
+    const raw = Array.from({ length: ch }, (_, i) => {
       const id = `ch:${devId}:${i}`;
       return inputLevels[id] ?? managerRef.current.getInputLevel(id) ?? 0;
     });
+    return autoScaleLevels(raw, inputAutoScaleRef, `in:${devId}`);
   };
 
   const getColChannelLevels = (col) => {
@@ -2720,14 +2723,16 @@ export default function App({ runtime = "web" }) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        for (let i = 0; i < ch; i += 1) out[i] = peaks[i] ?? 0;
+        const scaled = autoScaleLevels(peaks, outputAutoScaleRef, `out:${devId}`);
+        for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
     }
-    return Array.from({ length: ch }, (_, i) => {
+    const raw = Array.from({ length: ch }, (_, i) => {
       const id = `ch:${devId}:${i}`;
       return outputLevels[id] ?? managerRef.current.getOutputLevel(id) ?? 0;
     });
+    return autoScaleLevels(raw, outputAutoScaleRef, `out:${devId}`);
   };
 
   const getChannelAxisLabel = (channelCount, channelIndex) => {
@@ -2877,7 +2882,14 @@ export default function App({ runtime = "web" }) {
     ? (detailRouteLatencyMs ?? inputLatencyMs)
     : inputLatencyMs;
   const latencyLabel = runningLatencyDisplayMs != null ? `${runningLatencyDisplayMs}ms` : "n/a";
-  const sourceLatencyLabel = sourceLatencyDisplayMs != null ? `${sourceLatencyDisplayMs}ms` : "n/a";
+  const selectedSourceDeviceId = selectedSource?.deviceId || parseChannelId(selectedSource?.id || "")?.deviceId || "";
+  const selectedDestinationDeviceId = selectedDestination?.outputDeviceId || outputDeviceFromColId(selectedDestination?.id || "");
+  const sourceDeviceDriverLatencyMs = Number.isFinite(nativeInputChannelMeta[selectedSourceDeviceId]?.driverLatencyMs)
+    ? nativeInputChannelMeta[selectedSourceDeviceId].driverLatencyMs
+    : null;
+  const destinationDeviceDriverLatencyMs = Number.isFinite(nativeOutputChannelMeta[selectedDestinationDeviceId]?.driverLatencyMs)
+    ? nativeOutputChannelMeta[selectedDestinationDeviceId].driverLatencyMs
+    : null;
   const selectedDestinationDelayMs = Number.isFinite(selectedDestination?.delayMs) ? selectedDestination.delayMs : 0;
   const destinationLatencyResolvedMs =
     hasNativeBridge
@@ -2888,8 +2900,35 @@ export default function App({ runtime = "web" }) {
         ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
         : null)
   ;
-  const destinationLatencyLabel = destinationLatencyResolvedMs != null ? `${destinationLatencyResolvedMs}ms` : "n/a";
+  const sourceLatencyEffectiveMs = sourceLatencyDisplayMs ?? sourceDeviceDriverLatencyMs;
+  const destinationLatencyEffectiveMs = destinationLatencyResolvedMs ?? (
+    destinationDeviceDriverLatencyMs != null || selectedDestinationDelayMs > 0
+      ? Math.round(((destinationDeviceDriverLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
+      : null
+  );
+  const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
+  const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
   const jitterLabel = jitterMs != null ? `${jitterMs}ms` : "n/a";
+
+  const selectedSourceChannelLabels = Array.from(
+    { length: Math.max(1, Number.isFinite(selectedSource?.channelCount) ? selectedSource.channelCount : 1) },
+    (_, i) => getChannelAxisLabel(Math.max(1, Number.isFinite(selectedSource?.channelCount) ? selectedSource.channelCount : 1), i),
+  );
+  const selectedDestinationChannelLabels = Array.from(
+    { length: Math.max(1, Number.isFinite(selectedDestination?.channelCount) ? selectedDestination.channelCount : 1) },
+    (_, i) => getChannelAxisLabel(Math.max(1, Number.isFinite(selectedDestination?.channelCount) ? selectedDestination.channelCount : 1), i),
+  );
+
+  const selectedGainDb = Number.isFinite(selectedConnection?.gainDb) ? selectedConnection.gainDb : 0;
+  const canEditSelectedRoute = !!detailCell && !locked;
+  const updateSelectedRoute = (patch) => {
+    if (!detailCell || locked) return;
+    updateConnection(detailCell.rowId, detailCell.colId, {
+      ...(selectedConnection || makeDefaultConnection()),
+      on: true,
+      ...patch,
+    });
+  };
 
   const handleTransientMuteAllToggle = () => {
     if (!hasAnyActiveRoute) return;
@@ -2897,8 +2936,10 @@ export default function App({ runtime = "web" }) {
   };
 
   const handleRootClick = (event) => {
+    if (event.target.closest(".buffer-menu")) return;
     if (event.target.closest(".matrix-grid")) return;
     if (event.target.closest(".mute-btn")) return;
+    setShowBufferMenu(false);
     setSelectedCell(null);
   };
 
@@ -3074,12 +3115,25 @@ export default function App({ runtime = "web" }) {
               const rect = event.currentTarget.getBoundingClientRect();
               const x = event.clientX - rect.left;
               const y = event.clientY - rect.top;
-              const threshold = 18;
+              const threshold = 8;
               const nearSourceAxis = Math.abs(x - scaledSourceWidth) <= threshold;
               const nearDestAxis = Math.abs(y - scaledDestinationHeight) <= threshold;
               const nextVisible = nearSourceAxis || nearDestAxis;
               if (nextVisible !== showResizeGuides) {
                 setShowResizeGuides(nextVisible);
+              }
+
+              if (!locked) {
+                const tileWrap = event.target.closest(".tile-cell-wrap[data-rowid][data-colid]");
+                if (tileWrap) {
+                  const rowId = tileWrap.getAttribute("data-rowid");
+                  const colId = tileWrap.getAttribute("data-colid");
+                  if (rowId && colId && (selectedCell?.rowId !== rowId || selectedCell?.colId !== colId)) {
+                    setSelectedCell({ rowId, colId });
+                  }
+                } else if (!tileMenuCell && !gainAdjustCell && selectedCell) {
+                  setSelectedCell(null);
+                }
               }
             }}
           >
@@ -3111,19 +3165,68 @@ export default function App({ runtime = "web" }) {
                 >
                   <span aria-hidden="true">{locked ? "🔒" : "🔓"}</span>
                 </button>
-                <button
-                  type="button"
-                  className={`corner-control-btn corner-control-buffer corner-control-btn--buffer ${isApplyingCaptureBuffer ? "active" : ""}`}
-                  onClick={cycleCaptureBuffer}
-                  title={`${isApplyingCaptureBuffer ? "Applying" : "Capture buffer"} ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
-                  aria-label="Cycle capture buffer size"
-                  disabled={locked || isApplyingCaptureBuffer}
+                <div className="buffer-control-wrap corner-control-buffer">
+                  <button
+                    type="button"
+                    className={`corner-control-btn corner-control-btn--buffer ${isApplyingCaptureBuffer ? "active" : ""}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      if (locked || isApplyingCaptureBuffer) return;
+                      setShowBufferMenu((prev) => !prev);
+                    }}
+                    title={`${isApplyingCaptureBuffer ? "Applying" : "Capture buffer"} ${captureBufferMs}ms. Click to open list.`}
+                    aria-label="Open capture buffer size list"
+                    disabled={locked || isApplyingCaptureBuffer}
+                  >
+                    <span className="buffer-readout" aria-hidden="true">
+                      <span>{`${captureBufferMs}`}</span>
+                      <span className="buffer-unit">ms</span>
+                    </span>
+                  </button>
+                  {showBufferMenu ? (
+                    <div className="buffer-menu" role="listbox" aria-label="Capture buffer sizes" onClick={(event) => event.stopPropagation()}>
+                      {CAPTURE_BUFFER_OPTIONS.map((ms) => (
+                        <button
+                          key={ms}
+                          type="button"
+                          className={`buffer-menu-option${captureBufferMs === ms ? " is-active" : ""}`}
+                          onClick={() => setCaptureBufferFromMenu(ms)}
+                          role="option"
+                          aria-selected={captureBufferMs === ms}
+                        >
+                          {ms}ms
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+                <div
+                  className="corner-control-mid corner-gain-wheel"
+                  onPointerDown={(e) => {
+                    if (!canEditSelectedRoute) return;
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                    wheelDragRef.current = { startY: e.clientY, startDb: selectedGainDb };
+                  }}
+                  onPointerMove={(e) => {
+                    if (!wheelDragRef.current) return;
+                    const delta = (wheelDragRef.current.startY - e.clientY) / 8;
+                    updateSelectedRoute({ gainDb: clamp(Math.round((wheelDragRef.current.startDb + delta) * 2) / 2, DB_MIN, DB_MAX) });
+                  }}
+                  onPointerUp={() => { wheelDragRef.current = null; }}
+                  onPointerCancel={() => { wheelDragRef.current = null; }}
+                  style={{ cursor: canEditSelectedRoute ? "ns-resize" : "default", opacity: canEditSelectedRoute ? 1 : 0.45 }}
+                  title={canEditSelectedRoute ? "Drag up/down to adjust route gain" : "Select a route to adjust gain"}
+                  role="spinbutton"
+                  aria-valuenow={selectedGainDb}
+                  aria-valuemin={DB_MIN}
+                  aria-valuemax={DB_MAX}
+                  aria-label="Route gain"
                 >
-                  <span className="buffer-readout" aria-hidden="true">
-                    <span>{`${captureBufferMs}`}</span>
-                    <span className="buffer-unit">ms</span>
+                  <span className="corner-gain-wheel-value">
+                    {selectedGainDb > 0 ? `+${selectedGainDb.toFixed(1)}` : selectedGainDb.toFixed(1)}
+                    <span className="corner-gain-wheel-unit">dB</span>
                   </span>
-                </button>
+                </div>
                 <button
                   type="button"
                   className={`corner-control-btn corner-control-br ${viewMode === "channel" ? "active" : ""}`}
@@ -3148,7 +3251,7 @@ export default function App({ runtime = "web" }) {
                 </button>
                 <button
                   type="button"
-                  className={`corner-control-btn corner-control-mid ${isReloadingDevices ? "active" : ""}`}
+                  className={`corner-control-btn corner-control-reload ${isReloadingDevices ? "active" : ""}`}
                   onClick={handleReloadDevices}
                   disabled={isReloadingDevices || locked}
                   title="Restart and reload devices"
@@ -3309,6 +3412,8 @@ export default function App({ runtime = "web" }) {
                       <div
                         key={key}
                         className="tile-cell-wrap"
+                        data-rowid={row.id}
+                        data-colid={col.id}
                         style={{
                           width: `${tileWidth}px`,
                           height: `${tileHeight}px`,
@@ -3358,7 +3463,6 @@ export default function App({ runtime = "web" }) {
                           openTileMenuForCell(event, row.id, col.id);
                         }}
                         title={`${row.label} -> ${col.label}`}
-                        disabled={locked}
                       >
                         {Math.abs(state.gainDb || 0) >= 0.5 ? (
                           <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${Math.round(state.gainDb)}dB`}</span>
@@ -3369,13 +3473,7 @@ export default function App({ runtime = "web" }) {
                           <button
                             type="button"
                             className={`tile-menu-btn ${state.phaseInverted ? "active" : ""}`}
-                            onClick={() =>
-                              updateConnection(row.id, col.id, {
-                                ...state,
-                                on: true,
-                                phaseInverted: !state.phaseInverted,
-                              })
-                            }
+                            onClick={() => updateConnection(row.id, col.id, (prev) => ({ ...prev, on: true, phaseInverted: !prev.phaseInverted }))}
                             title="Flip phase"
                             aria-label="Flip phase"
                             disabled={locked}
@@ -3405,42 +3503,12 @@ export default function App({ runtime = "web" }) {
                             >
                               {`${Math.round(state.gainDb || 0)} dB`}
                             </button>
-                            {isGainAdjustOpen ? (
-                              <>
-                                <button
-                                  type="button"
-                                  className="tile-gain-step tile-gain-up"
-                                  onClick={() => adjustGainForCell(row.id, col.id, 1)}
-                                  title="Increase gain"
-                                  aria-label="Increase gain"
-                                  disabled={locked}
-                                >
-                                  ▲
-                                </button>
-                                <button
-                                  type="button"
-                                  className="tile-gain-step tile-gain-down"
-                                  onClick={() => adjustGainForCell(row.id, col.id, -1)}
-                                  title="Decrease gain"
-                                  aria-label="Decrease gain"
-                                  disabled={locked}
-                                >
-                                  ▼
-                                </button>
-                              </>
-                            ) : null}
                           </div>
 
                           <button
                             type="button"
                             className={`tile-menu-btn ${state.muted ? "active warn" : ""}`}
-                            onClick={() =>
-                              updateConnection(row.id, col.id, {
-                                ...state,
-                                on: true,
-                                muted: !state.muted,
-                              })
-                            }
+                            onClick={() => updateConnection(row.id, col.id, (prev) => ({ ...prev, on: true, muted: !prev.muted }))}
                             title="Toggle mute"
                             aria-label="Toggle mute"
                             disabled={locked}
@@ -3463,14 +3531,22 @@ export default function App({ runtime = "web" }) {
       <div className="inline-editor docked rack-panel">
         <div className="dock-col dock-card">
           <div className="card-main-copy card-main-copy-split">
-            <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true">
-              <span className="meter-bar meter-bar-l" style={{ width: `${Math.round(selectedSourceSplit[0] * 100)}%` }} />
-              <span className="meter-bar meter-bar-r" style={{ width: `${Math.round(selectedSourceSplit[1] * 100)}%` }} />
+            <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedSourceChannelLabels.length}, 1fr)` }}>
+              {selectedSourceChannelLabels.map((_, i) => (
+                <span key={i} className={`meter-bar meter-bar-${i === 0 ? "l" : "r"}`} style={{ width: `${Math.round((selectedSourceSplit[i] ?? 0) * 100)}%` }} />
+              ))}
             </div>
             {selectedSource?.isMaster ? <span className="detail-master-badge">MASTER</span> : null}
-            <div className="detail-name-stack">
-              <span className="detail-name-main">{selectedSource?.label || "Source"}</span>
-              {selectedSource?.hardwareLabel ? <span className="detail-name-sub">{selectedSource.hardwareLabel}</span> : null}
+            <div className="detail-device-row">
+              <div className="detail-name-stack">
+                <span className="detail-name-main">{selectedSource?.label || "Source"}</span>
+                {selectedSource?.hardwareLabel ? <span className="detail-name-sub">{selectedSource.hardwareLabel}</span> : null}
+              </div>
+              <span className="row-channels-box detail-channels-vert" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedSourceChannelLabels.length}, 1fr)` }}>
+                {selectedSourceChannelLabels.map((label, i) => (
+                  <span key={`src-${i}`} className="axis-split-label axis-split-cell">{label}</span>
+                ))}
+              </span>
             </div>
           </div>
           <div className="card-metrics-box">
@@ -3487,32 +3563,40 @@ export default function App({ runtime = "web" }) {
 
         <div className="dock-col dock-center">
           <div className="dock-center-stack">
-              <button
-                type="button"
-                className={`mute-btn ${muteButtonIsMuted ? "muted" : ""}`}
-                disabled={!hasAnyActiveRoute}
-                onClick={handleTransientMuteAllToggle}
-                title={isHoverDetail
-                  ? `Tile mute: ${selectedConnection?.muted ? "muted" : "unmuted"}. Click for transient mute all.`
-                  : transientMuteAll
-                    ? "Transient mute all is ON. Click to restore previous mute state."
-                    : "Global mute status is OFF. Click for transient mute all."}
-              >
-                {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-              </button>
+            <button
+              type="button"
+              className={`mute-btn ${muteButtonIsMuted ? "muted" : ""}`}
+              disabled={!hasAnyActiveRoute}
+              onClick={handleTransientMuteAllToggle}
+              title={isHoverDetail
+                ? `Tile mute: ${selectedConnection?.muted ? "muted" : "unmuted"}. Click for transient mute all.`
+                : transientMuteAll
+                  ? "Transient mute all is ON. Click to restore previous mute state."
+                  : "Global mute status is OFF. Click for transient mute all."}
+            >
+              {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+            </button>
           </div>
         </div>
 
         <div className="dock-col dock-card">
           <div className="card-main-copy card-main-copy-split">
-            <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true">
-              <span className="meter-bar meter-bar-l" style={{ width: `${Math.round(selectedDestinationSplit[0] * 100)}%` }} />
-              <span className="meter-bar meter-bar-r" style={{ width: `${Math.round(selectedDestinationSplit[1] * 100)}%` }} />
+            <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
+              {selectedDestinationChannelLabels.map((_, i) => (
+                <span key={i} className={`meter-bar meter-bar-${i === 0 ? "l" : "r"}`} style={{ width: `${Math.round((selectedDestinationSplit[i] ?? 0) * 100)}%` }} />
+              ))}
             </div>
             {selectedDestination?.isMaster ? <span className="detail-master-badge">MASTER</span> : null}
-            <div className="detail-name-stack">
-              <span className="detail-name-main">{selectedDestination?.label || "Destination"}</span>
-              {selectedDestination?.hardwareLabel ? <span className="detail-name-sub">{selectedDestination.hardwareLabel}</span> : null}
+            <div className="detail-device-row">
+              <div className="detail-name-stack">
+                <span className="detail-name-main">{selectedDestination?.label || "Destination"}</span>
+                {selectedDestination?.hardwareLabel ? <span className="detail-name-sub">{selectedDestination.hardwareLabel}</span> : null}
+              </div>
+              <span className="row-channels-box detail-channels-vert" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
+                {selectedDestinationChannelLabels.map((label, i) => (
+                  <span key={`dst-${i}`} className="axis-split-label axis-split-cell">{label}</span>
+                ))}
+              </span>
             </div>
           </div>
           <div className="card-metrics-box">
