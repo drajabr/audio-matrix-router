@@ -2181,14 +2181,19 @@ export default function App({ runtime = "web" }) {
     let shouldReloadForMasterSwitch = false;
     let nextInputMasterId = inputMasterId;
     let nextOutputMasterId = outputMasterId;
-    let updatedConnection = null;
+
+    // IMPORTANT: compute the next connection synchronously here using matrixRef (always current),
+    // BEFORE calling setMatrixByView. React state updaters run lazily during render, so any
+    // value assigned inside a setMatrixByView callback is NOT available on the next line —
+    // which would make the syncConnectionToNative call below silently never fire.
+    const preCurrentMatrix = matrixRef.current?.[viewMode] || {};
+    const preCurrentConnection = preCurrentMatrix[key] || makeDefaultConnection();
+    const preRawNext = typeof updater === "function" ? updater(preCurrentConnection) : updater;
+    const updatedConnection = sanitizeConnection(preRawNext);
 
     setMatrixByView((prev) => {
       const currentModeMatrix = prev[viewMode] || {};
-      const currentConnection = currentModeMatrix[key] || makeDefaultConnection();
-      const rawNextConnection = typeof updater === "function" ? updater(currentConnection) : updater;
-      const nextConnection = sanitizeConnection(rawNextConnection);
-      updatedConnection = nextConnection;
+      const nextConnection = updatedConnection;
 
       if (nextConnection.on) {
         const pair = getDevicePairFromRoute(rowId, colId);
@@ -2299,7 +2304,7 @@ export default function App({ runtime = "web" }) {
       return next;
     });
 
-    if (hasNativeBridge && updatedConnection) {
+    if (hasNativeBridge) {
       syncConnectionToNative(viewMode, rowId, colId, updatedConnection).catch(() => {});
     }
 
