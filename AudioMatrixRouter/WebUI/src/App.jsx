@@ -428,6 +428,32 @@ function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channel
   return next;
 }
 
+function matrixConnectionEqual(a, b) {
+  const aConn = a || makeDefaultConnection();
+  const bConn = b || makeDefaultConnection();
+  return (
+    !!aConn.on === !!bConn.on &&
+    !!aConn.muted === !!bConn.muted &&
+    !!aConn.phaseInverted === !!bConn.phaseInverted &&
+    Math.abs((Number(aConn.gainDb) || 0) - (Number(bConn.gainDb) || 0)) < 0.001
+  );
+}
+
+function matrixViewEqual(a, b) {
+  const aKeys = Object.keys(a || {});
+  const bKeys = Object.keys(b || {});
+  if (aKeys.length !== bKeys.length) return false;
+  for (const key of aKeys) {
+    if (!(key in (b || {}))) return false;
+    if (!matrixConnectionEqual(a[key], b[key])) return false;
+  }
+  return true;
+}
+
+function matrixByViewEqual(a, b) {
+  return matrixViewEqual(a?.device, b?.device) && matrixViewEqual(a?.channel, b?.channel);
+}
+
 class AudioMatrixManager {
   constructor() {
     this.context = null;
@@ -1034,6 +1060,31 @@ export default function App({ runtime = "web" }) {
         return next;
       });
 
+      if (hasNativeBridge && inputs.length > 0 && outputs.length > 0) {
+        const deviceRows = inputs.map((i) => ({ id: `dev:${i.deviceId}` }));
+        const deviceCols = outputs.map((o) => ({ id: `dev:${o.deviceId}` }));
+        const channelRows = inputs.flatMap((i) => {
+          const ch = Math.max(1, Number.isFinite(i?.channels) ? Math.floor(i.channels) : 2);
+          return Array.from({ length: ch }, (_, idx) => ({ id: `ch:${i.deviceId}:${idx}` }));
+        });
+        const channelCols = outputs.flatMap((o) => {
+          const ch = Math.max(1, Number.isFinite(o?.channels) ? Math.floor(o.channels) : 2);
+          return Array.from({ length: ch }, (_, idx) => ({ id: `ch:${o.deviceId}:${idx}` }));
+        });
+
+        const nextNativeMatrix = buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols);
+        setMatrixByView((prev) => {
+          if (matrixByViewEqual(prev, nextNativeMatrix)) return prev;
+          matrixRef.current = nextNativeMatrix;
+          return nextNativeMatrix;
+        });
+
+        const masterInput = (Array.isArray(state?.inputs) ? state.inputs : []).find((d) => d?.isMaster)?.deviceId || "";
+        const masterOutput = (Array.isArray(state?.outputs) ? state.outputs : []).find((d) => d?.isMaster)?.deviceId || "";
+        if (masterInput !== inputMasterId) setInputMasterId(masterInput);
+        if (masterOutput !== outputMasterId) setOutputMasterId(masterOutput);
+      }
+
       if (total != null) {
         if (latencyLastRef.current != null) {
           const delta = Math.abs(total - latencyLastRef.current);
@@ -1132,7 +1183,7 @@ export default function App({ runtime = "web" }) {
         window.removeEventListener("native-state", onNativeState);
       }
     };
-  }, [hasNativeBridge]);
+  }, [hasNativeBridge, inputs, outputs, inputMasterId, outputMasterId]);
 
   useEffect(() => {
     if (!hasNativeBridge) return;
@@ -2813,7 +2864,7 @@ export default function App({ runtime = "web" }) {
             // Drag-scroll can start from nearly anywhere in the board, including tiles.
             if (event.button !== 0) return;
             const target = event.target;
-            if (target.closest && target.closest(".matrix-corner, .corner-controls, .resize-handle, .tile-context-menu, .tile-menu-btn, .tile-gain-step, .tile-gain-btn, input, a")) {
+            if (target.closest && target.closest(".matrix-corner, .corner-controls, .resize-handle, .tile-context-menu, .tile-menu-btn, .tile-gain-step, .tile-gain-btn, .tile-cell-wrap, .cell, .row-head, .col-head, input, a, button")) {
               return;
             }
             const wrap = matrixWrapRef.current;
@@ -2985,12 +3036,10 @@ export default function App({ runtime = "web" }) {
             {cols.map((col) => {
               if (viewMode === "channel" && !col.isChannelStart) return null;
 
-              const channelCount = viewMode === "device"
-                ? Math.max(2, col.channelCount || 1)
-                : Math.max(1, col.channelCount || 1);
+              const channelCount = Math.max(1, col.channelCount || 1);
               const isActive = activeRoutes.has(col.id) || (col.pairedIds || []).some((pid) => activeRoutes.has(pid));
               const span = viewMode === "channel" ? channelCount : 1;
-              const colChannelLevels = viewMode === "channel" ? getColChannelLevels(col) : getColSplitLevels(col);
+              const colChannelLevels = getColChannelLevels(col);
 
               const isColSelected = selectedCell?.colId === col.id || (col.pairedIds || []).some((pid) => selectedCell?.colId === pid);
               return (
@@ -3047,13 +3096,11 @@ export default function App({ runtime = "web" }) {
             })}
 
             {rows.map((row, rowIndex) => {
-              const channelCount = viewMode === "device"
-                ? Math.max(2, row.channelCount || 1)
-                : Math.max(1, row.channelCount || 1);
+              const channelCount = Math.max(1, row.channelCount || 1);
               const isRowActive = activeRoutes.has(row.id) || (row.pairedIds || []).some((pid) => activeRoutes.has(pid));
               const isRowAxisActive = selectedCell?.rowId === row.id || (row.pairedIds || []).some((pid) => selectedCell?.rowId === pid);
               const skipHead = viewMode === "channel" && !row.isChannelStart;
-              const rowChannelLevels = viewMode === "channel" ? getRowChannelLevels(row) : getRowSplitLevels(row);
+              const rowChannelLevels = getRowChannelLevels(row);
               return (
               <React.Fragment key={row.id}>
                 {!skipHead && (

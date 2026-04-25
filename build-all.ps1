@@ -115,12 +115,19 @@ Write-Host 'Starting local preview server on http://localhost:4173'
 Write-Host 'Preview server will run in the background.'
 Write-Host ''
 
-$npmCommand = (Get-Command npm -ErrorAction SilentlyContinue)
-if (-not $npmCommand) {
-  Write-Host 'ERROR: npm not found on PATH; cannot start preview server.'
-  exit 1
+$npmCmdPath = (Get-Command npm.cmd -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+if (-not $npmCmdPath) {
+  Write-Host 'Warning: npm.cmd not found on PATH; skipping preview server startup.'
+  exit 0
 }
 
-$previewArgs = @('run', 'preview', '--', '--host', '127.0.0.1', '--port', '4173')
-$previewProcess = Start-Process -FilePath $npmCommand.Source -ArgumentList $previewArgs -WorkingDirectory $webUiPath -PassThru
-Write-Host "Preview process started (PID: $($previewProcess.Id))."
+$previewCommand = '"' + $npmCmdPath + '" run preview -- --host 127.0.0.1 --port 4173'
+try {
+  $previewProcess = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $previewCommand) -WorkingDirectory $webUiPath -WindowStyle Hidden -PassThru
+  Write-Host "Preview process started (PID: $($previewProcess.Id))."
+}
+catch {
+  Write-Host "Warning: Failed to start preview server in background: $($_.Exception.Message)"
+}
+
+exit 0
