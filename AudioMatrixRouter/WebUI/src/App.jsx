@@ -1,5 +1,4 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Volume2, VolumeX } from "lucide-react";
 
 const APP_VERSION = __APP_VERSION__;
 const STORAGE_KEY = "audio-router-matrix-v3";
@@ -22,8 +21,10 @@ const FONT_SIZE_KEY = "amrFontSizePreference";
 const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
-const CAPTURE_BUFFER_OPTIONS = [5, 10, 20, 40, 60, 100];
-const METER_AUTO_SCALE_WINDOW_MS = 60000;
+const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 29 }, (_, i) => 10 + i * 5);
+const CAPTURE_BUFFER_MIN = 10;
+const CAPTURE_BUFFER_MAX = 150;
+const CAPTURE_BUFFER_DEFAULT = 40;
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -365,7 +366,7 @@ function collectConfiguredDeviceIds(matrixByView) {
   return { configuredInputIds, configuredOutputIds };
 }
 
-function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols) {
+function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols, masterGainOffsetDb = 0) {
   const next = {
     device: createMatrix(deviceRows, deviceCols, {}),
     channel: createMatrix(channelRows, channelCols, {}),
@@ -397,7 +398,7 @@ function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channel
     const outRef = resolveDeviceChannel(nativeOutputs, route?.outCh);
     if (!inRef || !outRef || !inRef.deviceId || !outRef.deviceId) return;
 
-    const gainDb = Number.isFinite(route?.gainDb) ? route.gainDb : 0;
+    const gainDb = clamp((Number.isFinite(route?.gainDb) ? route.gainDb : 0) - masterGainOffsetDb, DB_MIN, DB_MAX);
 
     const channelKey = getCellKey(`ch:${inRef.deviceId}:${inRef.localChannel}`, `ch:${outRef.deviceId}:${outRef.localChannel}`);
     if (channelKey in next.channel) {
@@ -437,10 +438,12 @@ function mergeNativeMatrixWithLocalFlags(prevMatrix, nextNativeMatrix) {
       const prevConn = prevView?.[key] || makeDefaultConnection();
 
       const keepMutedLocal = !!prevConn?.muted;
+      const keepGainLocal = !!prevConn?.on && Number.isFinite(prevConn?.gainDb);
       const mergedConn = {
         ...nativeConn,
         phaseInverted: !!prevConn?.phaseInverted,
         muted: keepMutedLocal,
+        gainDb: keepGainLocal ? prevConn.gainDb : nativeConn.gainDb,
       };
 
       if (keepMutedLocal) {
@@ -795,7 +798,8 @@ export default function App({ runtime = "web" }) {
   const [fontIndex, setFontIndex] = useState(() => getStoredIndex(FONT_KEY, FONT_PRESETS, Math.max(0, FONT_PRESETS.findIndex((p) => p.key === "consolas"))));
   const [fontSizeIndex, setFontSizeIndex] = useState(() => getStoredIndex(FONT_SIZE_KEY, FONT_SIZE_PRESETS, 4));
   const [uiScaleIndex, setUiScaleIndex] = useState(() => getStoredIndex(UI_SCALE_KEY, UI_SCALE_PRESETS, Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === "md"))));
-  const [captureBufferMs, setCaptureBufferMs] = useState(40);
+  const [captureBufferMs, setCaptureBufferMs] = useState(CAPTURE_BUFFER_DEFAULT);
+  const [masterGainDb, setMasterGainDb] = useState(0);
   const [isApplyingCaptureBuffer, setIsApplyingCaptureBuffer] = useState(false);
   const [nativeTotalLatencyMs, setNativeTotalLatencyMs] = useState(null);
   const [nativeRouteLatencyByCh, setNativeRouteLatencyByCh] = useState({});
@@ -813,11 +817,8 @@ export default function App({ runtime = "web" }) {
     if (typeof window === "undefined") return true;
     return localStorage.getItem(POWER_ON_KEY) !== "0";
   });
-  const [tileMenuCell, setTileMenuCell] = useState(null);
-  const [gainAdjustCell, setGainAdjustCell] = useState(null);
   const [transientMuteAll, setTransientMuteAll] = useState(false);
   const [showResizeGuides, setShowResizeGuides] = useState(false);
-  const [showBufferMenu, setShowBufferMenu] = useState(false);
 
   const [viewMode, setViewMode] = useState("device");
   const [inputs, setInputs] = useState([]);
@@ -866,10 +867,22 @@ export default function App({ runtime = "web" }) {
   const nativeSyncVersionRef = useRef(0);
   const persistQueueRef = useRef(Promise.resolve());
   const lastPersistedJsonRef = useRef("");
-  const inputAutoScaleRef = useRef(new Map());
-  const outputAutoScaleRef = useRef(new Map());
   const meterFrameRef = useRef({ lastTs: 0 });
+  const inputAutoZoomRef = useRef(new Map());
+  const outputAutoZoomRef = useRef(new Map());
+  const jitterUiRef = useRef({ lastTs: 0, lastValue: null });
   const wheelDragRef = useRef(null);
+  const wheelDragSuppressClickRef = useRef(false);
+  const bufferDragRef = useRef(null);
+  const bufferDragSuppressClickRef = useRef(false);
+  const captureBufferApplyTimerRef = useRef(null);
+  const pendingCaptureBufferRef = useRef(null);
+  const masterGainSyncTimerRef = useRef(null);
+  const masterGainDbRef = useRef(masterGainDb);
+
+  useEffect(() => {
+    masterGainDbRef.current = masterGainDb;
+  }, [masterGainDb]);
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -878,6 +891,22 @@ export default function App({ runtime = "web" }) {
   useEffect(() => {
     modeRef.current = viewMode;
   }, [viewMode]);
+
+  const updateJitterDisplay = (nextJitter) => {
+    if (!Number.isFinite(nextJitter)) {
+      jitterUiRef.current = { lastTs: 0, lastValue: null };
+      setJitterMs(null);
+      return;
+    }
+
+    const rounded = Math.round(nextJitter * 10) / 10;
+    const now = performance.now();
+    const { lastTs, lastValue } = jitterUiRef.current;
+    if (lastValue == null || Math.abs(rounded - lastValue) >= 0.4 || (now - lastTs) >= 320) {
+      jitterUiRef.current = { lastTs: now, lastValue: rounded };
+      setJitterMs(rounded);
+    }
+  };
 
   const { configuredInputIds, configuredOutputIds } = useMemo(
     () => collectConfiguredDeviceIds(matrixByView),
@@ -962,8 +991,6 @@ export default function App({ runtime = "web" }) {
   useEffect(() => {
     if (!locked) return;
     setSelectedCell(null);
-    setTileMenuCell(null);
-    setGainAdjustCell(null);
   }, [locked]);
 
   useEffect(() => {
@@ -972,18 +999,12 @@ export default function App({ runtime = "web" }) {
         setActiveQuickPicker("");
         setControlsCollapsed(true);
       }
-      if (!event.target.closest(".tile-context-menu")) {
-        setTileMenuCell(null);
-        setGainAdjustCell(null);
-      }
     };
 
     const onKeyDown = (event) => {
       if (event.key === "Escape") {
         setActiveQuickPicker("");
         setControlsCollapsed(true);
-        setTileMenuCell(null);
-        setGainAdjustCell(null);
       }
     };
 
@@ -1005,7 +1026,13 @@ export default function App({ runtime = "web" }) {
       lastPushTs = performance.now();
 
       if (Number.isFinite(state?.captureBufferMs)) {
-        setCaptureBufferMs(state.captureBufferMs);
+        const pendingCaptureBuffer = pendingCaptureBufferRef.current;
+        if (!Number.isFinite(pendingCaptureBuffer)) {
+          setCaptureBufferMs(state.captureBufferMs);
+        } else if (Math.abs(state.captureBufferMs - pendingCaptureBuffer) < 0.5) {
+          pendingCaptureBufferRef.current = null;
+          setCaptureBufferMs(state.captureBufferMs);
+        }
       }
 
       const total = Number.isFinite(state?.totalLatencyMs) ? Number(state.totalLatencyMs) : null;
@@ -1075,6 +1102,7 @@ export default function App({ runtime = "web" }) {
             deviceCols,
             channelRows,
             channelCols,
+            masterGainDbRef.current,
           );
           setMatrixByView((prev) => {
             const merged = mergeNativeMatrixWithLocalFlags(prev, nextNativeMatrix);
@@ -1096,10 +1124,10 @@ export default function App({ runtime = "web" }) {
           latencyJitterRef.current = latencyJitterRef.current === 0
             ? delta
             : latencyJitterRef.current * 0.82 + delta * 0.18;
-          setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
+          updateJitterDisplay(latencyJitterRef.current);
         } else {
           latencyJitterRef.current = 0;
-          setJitterMs(0);
+          updateJitterDisplay(0);
         }
         latencyLastRef.current = total;
       }
@@ -1147,7 +1175,7 @@ export default function App({ runtime = "web" }) {
             latencyJitterRef.current = latencyJitterRef.current === 0
               ? delta
               : latencyJitterRef.current * 0.82 + delta * 0.18;
-            setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
+            updateJitterDisplay(latencyJitterRef.current);
           }
           latencyLastRef.current = lat;
         } else {
@@ -1155,7 +1183,7 @@ export default function App({ runtime = "web" }) {
           setInputLatencyMs(null);
           setOutputLatencyMs(null);
           setBufferMs(null);
-          setJitterMs(null);
+          updateJitterDisplay(null);
           setClockKhz(null);
           setNativeTotalLatencyMs(null);
           setNativeRouteLatencyByCh({});
@@ -1317,8 +1345,9 @@ export default function App({ runtime = "web" }) {
     const getInputOffset = (id) => Number.isFinite(nativeInputChannelMeta[id]?.offset) ? nativeInputChannelMeta[id].offset : null;
     const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMeta[id]?.offset) ? nativeOutputChannelMeta[id].offset : null;
 
-    const active = !!connection?.on && !connection?.muted;
-    const baseGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
+    const active = !!connection?.on;
+    const routeGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
+    const baseGainDb = clamp(routeGainDb + masterGainDb, DB_MIN, DB_MAX);
 
     const routesPayload = [];
 
@@ -1438,7 +1467,7 @@ export default function App({ runtime = "web" }) {
   const activeRoutes = useMemo(() => {
     const set = new Set();
     Object.entries(activeMatrix).forEach(([key, conn]) => {
-      if (conn.on && !conn.muted) {
+      if (conn.on) {
         const [rowId, colId] = key.split("::");
         set.add(rowId);
         set.add(colId);
@@ -1479,6 +1508,7 @@ export default function App({ runtime = "web" }) {
     fontSizeKey: FONT_SIZE_PRESETS[fontSizeIndex]?.key,
     uiScaleKey: UI_SCALE_PRESETS[uiScaleIndex]?.key,
     captureBufferMs,
+    masterGainDb,
     controlsCollapsed,
     showAllDevices,
     powerOn,
@@ -1502,6 +1532,7 @@ export default function App({ runtime = "web" }) {
             fontSizeKey: next?.fontSizeKey,
             uiScaleKey: next?.uiScaleKey,
             captureBufferMs: next?.captureBufferMs,
+            masterGainDb: next?.masterGainDb,
             controlsCollapsed: next?.controlsCollapsed,
             showAllDevices: next?.showAllDevices,
             powerOn: next?.powerOn,
@@ -1558,9 +1589,11 @@ export default function App({ runtime = "web" }) {
   };
 
   const resolveLinearGain = (connection) => {
-    if (!connection.on || connection.muted || transientMuteAll) return 0;
+    if (!connection.on || transientMuteAll) return 0;
     const direction = connection.phaseInverted ? -1 : 1;
-    return dbToLinear(connection.gainDb) * direction;
+    const routeDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
+    const effectiveDb = clamp(routeDb + masterGainDb, DB_MIN, DB_MAX);
+    return dbToLinear(effectiveDb) * direction;
   };
 
   const applyMatrixToEngine = (mode, matrix) => {
@@ -1623,6 +1656,7 @@ export default function App({ runtime = "web" }) {
       if (typeof saved?.showAllDevices === "boolean") setShowAllDevices(saved.showAllDevices);
       if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
       if (Number.isFinite(saved?.captureBufferMs)) setCaptureBufferMs(saved.captureBufferMs);
+      if (Number.isFinite(saved?.masterGainDb)) setMasterGainDb(clamp(saved.masterGainDb, DB_MIN, DB_MAX));
       if (!hasNativeBridge && typeof saved?.locked === "boolean") setLocked(saved.locked);
 
       let discoveredInputs = [];
@@ -1796,6 +1830,7 @@ export default function App({ runtime = "web" }) {
             deviceCols,
             channelRows,
             channelCols,
+            masterGainDb,
           )
         : null;
 
@@ -1850,6 +1885,7 @@ export default function App({ runtime = "web" }) {
         fontSizeKey: saved?.fontSizeKey || FONT_SIZE_PRESETS[fontSizeIndex]?.key,
         uiScaleKey: saved?.uiScaleKey || UI_SCALE_PRESETS[uiScaleIndex]?.key,
         captureBufferMs: Number.isFinite(saved?.captureBufferMs) ? saved.captureBufferMs : captureBufferMs,
+        masterGainDb: Number.isFinite(saved?.masterGainDb) ? clamp(saved.masterGainDb, DB_MIN, DB_MAX) : masterGainDb,
         controlsCollapsed: typeof saved?.controlsCollapsed === "boolean" ? saved.controlsCollapsed : controlsCollapsed,
         showAllDevices: typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : showAllDevices,
         powerOn: typeof saved?.powerOn === "boolean" ? saved.powerOn : powerOn,
@@ -1903,8 +1939,6 @@ export default function App({ runtime = "web" }) {
   const handleReloadDevices = async (event) => {
     event?.stopPropagation?.();
     setSelectedCell(null);
-    setTileMenuCell(null);
-    setGainAdjustCell(null);
 
     try {
       await managerRef.current.teardown();
@@ -2015,6 +2049,7 @@ export default function App({ runtime = "web" }) {
     fontSizeIndex,
     uiScaleIndex,
     captureBufferMs,
+    masterGainDb,
     controlsCollapsed,
     showAllDevices,
     powerOn,
@@ -2052,39 +2087,44 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) return undefined;
 
     const tick = () => {
-      const now = performance.now();
-      if (now - meterFrameRef.current.lastTs < 1000 / 30) {
-        rafRef.current = requestAnimationFrame(tick);
-        return;
-      }
-      meterFrameRef.current.lastTs = now;
+      const currentMode = modeRef.current;
+      const currentMatrix = matrixRef.current[currentMode] || {};
+      const activeSet = new Set();
+      Object.entries(currentMatrix).forEach(([key, conn]) => {
+        if (!conn.on || conn.muted || transientMuteAll) return;
+        const [rowId, colId] = key.split("::");
+        activeSet.add(rowId);
+        activeSet.add(colId);
+      });
 
       const nextInput = {};
       rows.forEach((row) => {
-        nextInput[row.id] = managerRef.current.getInputLevel(row.id);
+        nextInput[row.id] = activeSet.has(row.id) ? managerRef.current.getInputLevel(row.id) : 0;
       });
 
-      if (modeRef.current === "device") {
+      if (currentMode === "device") {
         inputs.forEach((input) => {
           const channelCount = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
+          const deviceActive = activeSet.has(`dev:${input.deviceId}`);
           for (let ch = 0; ch < channelCount; ch += 1) {
             const id = `ch:${input.deviceId}:${ch}`;
-            nextInput[id] = managerRef.current.getInputLevel(id);
+            nextInput[id] = deviceActive ? managerRef.current.getInputLevel(id) : 0;
           }
         });
       }
 
       const nextOutput = {};
       cols.forEach((col) => {
-        nextOutput[col.id] = managerRef.current.getOutputLevel(col.id);
+        nextOutput[col.id] = activeSet.has(col.id) ? managerRef.current.getOutputLevel(col.id) : 0;
       });
 
-      if (modeRef.current === "device") {
+      if (currentMode === "device") {
         outputs.forEach((output) => {
           const channelCount = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
+          const deviceActive = activeSet.has(`dev:${output.deviceId}`);
           for (let ch = 0; ch < channelCount; ch += 1) {
             const id = `ch:${output.deviceId}:${ch}`;
-            nextOutput[id] = managerRef.current.getOutputLevel(id);
+            nextOutput[id] = deviceActive ? managerRef.current.getOutputLevel(id) : 0;
           }
         });
       }
@@ -2099,7 +2139,7 @@ export default function App({ runtime = "web" }) {
     return () => {
       if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
-  }, [hasNativeBridge, rows, cols, routedInputs, routedOutputs]);
+  }, [hasNativeBridge, rows, cols, routedInputs, routedOutputs, transientMuteAll]);
 
   useEffect(() => {
     if (inputs.length === 0 || outputs.length === 0) return;
@@ -2125,6 +2165,12 @@ export default function App({ runtime = "web" }) {
 
   useEffect(() => {
     return () => {
+      if (captureBufferApplyTimerRef.current) {
+        clearTimeout(captureBufferApplyTimerRef.current);
+      }
+      if (masterGainSyncTimerRef.current) {
+        clearTimeout(masterGainSyncTimerRef.current);
+      }
       managerRef.current.teardown();
     };
   }, []);
@@ -2481,28 +2527,35 @@ export default function App({ runtime = "web" }) {
     if (type === "fontSize") setFontSizeIndex(Math.max(0, FONT_SIZE_PRESETS.findIndex((p) => p.key === key)));
     if (type === "uiScale") setUiScaleIndex(Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === key)));
     if (type === "captureBuffer") {
-      if (locked || isApplyingCaptureBuffer) return;
+      if (locked) return;
       const next = Number(key);
       if (Number.isFinite(next)) {
-        const prev = captureBufferMs;
-        const selected = CAPTURE_BUFFER_OPTIONS.includes(next) ? next : CAPTURE_BUFFER_OPTIONS[0];
+        const selected = clamp(Math.round(next / 5) * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
         setCaptureBufferMs(selected);
         persistState(buildPersistedState({ captureBufferMs: selected }));
 
         if (hasNativeBridge) {
-          setIsApplyingCaptureBuffer(true);
-          window.__nativeBridgeInvoke("setCaptureBufferMs", { bufferMs: selected })
-            .then((state) => {
-              const applied = Number.isFinite(state?.captureBufferMs) ? state.captureBufferMs : selected;
-              setCaptureBufferMs(applied);
-              persistState(buildPersistedState({ captureBufferMs: applied }));
-            })
-            .catch(() => {
-              setCaptureBufferMs(prev);
-            })
-            .finally(() => {
-              setIsApplyingCaptureBuffer(false);
-            });
+          pendingCaptureBufferRef.current = selected;
+          if (captureBufferApplyTimerRef.current) {
+            clearTimeout(captureBufferApplyTimerRef.current);
+          }
+          captureBufferApplyTimerRef.current = setTimeout(() => {
+            const requested = pendingCaptureBufferRef.current;
+            if (!Number.isFinite(requested)) return;
+            setIsApplyingCaptureBuffer(true);
+            window.__nativeBridgeInvoke("setCaptureBufferMs", { bufferMs: requested })
+              .then((state) => {
+                const applied = Number.isFinite(state?.captureBufferMs) ? state.captureBufferMs : requested;
+                if (pendingCaptureBufferRef.current !== requested) return;
+                pendingCaptureBufferRef.current = null;
+                setCaptureBufferMs(applied);
+                persistState(buildPersistedState({ captureBufferMs: applied }));
+              })
+              .catch(() => {})
+              .finally(() => {
+                setIsApplyingCaptureBuffer(false);
+              });
+          }, 500);
         }
       }
     }
@@ -2513,20 +2566,160 @@ export default function App({ runtime = "web" }) {
     if (locked) return;
     const key = getCellKey(rowId, colId);
     const state = activeMatrix[key] || makeDefaultConnection();
+    const baseGainDb = Number.isFinite(state.gainDb) ? state.gainDb : 0;
     updateConnection(rowId, colId, {
       ...state,
       on: true,
-      gainDb: clamp((Number.isFinite(state.gainDb) ? state.gainDb : 0) + stepDb, DB_MIN, DB_MAX),
+      gainDb: clamp(Math.round((baseGainDb + stepDb) * 2) / 2, DB_MIN, DB_MAX),
     });
   };
 
-  const openTileMenuForCell = (event, rowId, colId) => {
-    if (locked) return;
-    const menuHeightEstimate = 130;
-    const nearBottom = event.clientY > window.innerHeight - menuHeightEstimate;
-    setTileMenuCell({ rowId, colId, dropUp: nearBottom });
-    setGainAdjustCell(null);
+  const applyGlobalGainDelta = (deltaDb) => {
+    if (locked || !Number.isFinite(deltaDb) || Math.abs(deltaDb) < 0.001) return;
+    setMasterGainDb((prev) => {
+      const next = clamp(Math.round((prev + deltaDb) * 2) / 2, DB_MIN, DB_MAX);
+      return Math.abs(next - prev) < 0.001 ? prev : next;
+    });
   };
+
+  const applyBufferDelta = (deltaMs) => {
+    if (locked || !Number.isFinite(deltaMs)) return;
+    const snapped = clamp(Math.round((captureBufferMs + deltaMs) / 5) * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
+    if (snapped === captureBufferMs) return;
+    applyQuickSelection("captureBuffer", String(snapped));
+  };
+
+  const buildNativeRoutesPayload = (matrix, options = {}) => {
+    const {
+      includeMasterGain = true,
+      muteAll = false,
+    } = options;
+    const findInput = (id) => inputs.find((d) => d?.deviceId === id);
+    const findOutput = (id) => outputs.find((d) => d?.deviceId === id);
+    const getInputOffset = (id) => Number.isFinite(nativeInputChannelMeta[id]?.offset) ? nativeInputChannelMeta[id].offset : null;
+    const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMeta[id]?.offset) ? nativeOutputChannelMeta[id].offset : null;
+    const routesPayload = [];
+
+    Object.entries(matrix).forEach(([key, conn]) => {
+      if (!conn?.on) return;
+      const [rowId, colId] = key.split("::");
+      const routeGainDb = Number.isFinite(conn?.gainDb) ? conn.gainDb : 0;
+      const baseGainDb = includeMasterGain
+        ? clamp(routeGainDb + masterGainDbRef.current, DB_MIN, DB_MAX)
+        : routeGainDb;
+
+      if (viewMode === "channel") {
+        const rowParsed = parseChannelId(rowId);
+        const colParsed = parseChannelId(colId);
+        if (!rowParsed || !colParsed) return;
+        routesPayload.push({
+          inDeviceId: rowParsed.deviceId,
+          inChannel: rowParsed.channelIndex,
+          outDeviceId: colParsed.deviceId,
+          outChannel: colParsed.channelIndex,
+          ...(getInputOffset(rowParsed.deviceId) != null ? { inCh: getInputOffset(rowParsed.deviceId) + rowParsed.channelIndex } : {}),
+          ...(getOutputOffset(colParsed.deviceId) != null ? { outCh: getOutputOffset(colParsed.deviceId) + colParsed.channelIndex } : {}),
+          active: !muteAll,
+          gainDb: baseGainDb,
+        });
+        return;
+      }
+
+      const inputDeviceId = rowId?.startsWith("dev:") ? rowId.slice(4) : "";
+      const outputDeviceId = colId?.startsWith("dev:") ? colId.slice(4) : "";
+      if (!inputDeviceId || !outputDeviceId) return;
+
+      const inputDevice = findInput(inputDeviceId);
+      const outputDevice = findOutput(outputDeviceId);
+      if (!inputDevice || !outputDevice) return;
+
+      const inChannels = Array.from(
+        { length: Math.max(1, Number.isFinite(inputDevice?.channels) ? inputDevice.channels : 0) },
+        (_, i) => i,
+      );
+      const outChannels = Array.from(
+        { length: Math.max(1, Number.isFinite(outputDevice?.channels) ? outputDevice.channels : 0) },
+        (_, i) => i,
+      );
+
+      const routes = buildDeviceToChannelRouteMatrix(inChannels, outChannels);
+      routes.forEach((route) => {
+        routesPayload.push({
+          inDeviceId: inputDeviceId,
+          inChannel: route.inChannel,
+          outDeviceId: outputDeviceId,
+          outChannel: route.outChannel,
+          ...(getInputOffset(inputDeviceId) != null ? { inCh: getInputOffset(inputDeviceId) + route.inChannel } : {}),
+          ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + route.outChannel } : {}),
+          active: !muteAll,
+          gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+        });
+      });
+    });
+
+    return routesPayload;
+  };
+
+  useEffect(() => {
+    if (!devicesDiscoveredRef.current) return;
+
+    if (!hasNativeBridge) {
+      if (powerOn) {
+        applyMatrixToEngine(viewMode, matrixRef.current[viewMode] || {});
+      }
+      return;
+    }
+
+    if (masterGainSyncTimerRef.current) {
+      clearTimeout(masterGainSyncTimerRef.current);
+    }
+
+    // Keep tile gain values visually stable while native applies master-offset gains.
+    localEditHoldUntilRef.current = performance.now() + 700;
+
+    const matrix = matrixRef.current[viewMode] || {};
+    const routesPayload = buildNativeRoutesPayload(matrix, {
+      includeMasterGain: true,
+      muteAll: transientMuteAll,
+    });
+
+    if (routesPayload.length === 0) {
+      localEditHoldUntilRef.current = 0;
+      return;
+    }
+
+    window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload })
+        .then((refreshed) => {
+          localEditHoldUntilRef.current = 0;
+          if (refreshed) {
+            window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
+          }
+        })
+        .catch(async () => {
+          // Avoid flooding native bridge with hundreds of legacy calls on global mute toggles.
+          if (transientMuteAll || routesPayload.length > 128) {
+            localEditHoldUntilRef.current = 0;
+            return;
+          }
+
+          let refreshed = null;
+          for (const route of routesPayload) {
+            const legacy = {
+              inCh: Number.isFinite(route.inCh) ? route.inCh : (Number.isFinite(route.inChannel) ? route.inChannel : 0),
+              outCh: Number.isFinite(route.outCh) ? route.outCh : (Number.isFinite(route.outChannel) ? route.outChannel : 0),
+              active: !!route.active,
+              gainDb: Number.isFinite(route.gainDb) ? route.gainDb : 0,
+            };
+            // Sequential fallback keeps UI responsive versus firing all calls at once.
+            // eslint-disable-next-line no-await-in-loop
+            refreshed = await window.__nativeBridgeInvoke("setCrosspoint", legacy);
+          }
+          localEditHoldUntilRef.current = 0;
+          if (refreshed) {
+            window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
+          }
+        });
+  }, [masterGainDb, transientMuteAll, hasNativeBridge, powerOn, viewMode, inputs, outputs, nativeInputChannelMeta, nativeOutputChannelMeta]);
 
   const beginResizeSourceWidth = (event) => {
     event.preventDefault();
@@ -2611,37 +2804,46 @@ export default function App({ runtime = "web" }) {
     : Math.max(cols.length, 1);
 
   const setCaptureBufferFromMenu = (next) => {
-    if (locked || isApplyingCaptureBuffer) return;
+    if (locked) return;
     applyQuickSelection("captureBuffer", String(next));
-    setShowBufferMenu(false);
   };
 
   const selectedSource = detailCell ? rows.find((r) => r.id === detailCell.rowId) : null;
   const selectedDestination = detailCell ? cols.find((c) => c.id === detailCell.colId) : null;
   const autoScaleLevels = (levels, scaleMapRef, scaleKey) => {
     const source = Array.isArray(levels) ? levels : [];
-    const safe = source.map((v) => clamp(Number(v) || 0, 0, 1));
-    const peak = safe.reduce((acc, v) => (v > acc ? v : acc), 0);
+    const values = source.map((v) => clamp(Number(v) || 0, 0, 1));
+    if (values.length === 0) return values;
 
-    const now = performance.now();
-    const state = scaleMapRef.current.get(scaleKey) || { history: [] };
-    state.history.push({ t: now, v: peak });
-    const cutoff = now - METER_AUTO_SCALE_WINDOW_MS;
-    while (state.history.length > 0 && state.history[0].t < cutoff) {
-      state.history.shift();
-    }
-    // Bound memory in case browser tab sleeps and wakes unpredictably.
-    if (state.history.length > 2400) {
-      state.history.splice(0, state.history.length - 2400);
+    const tracker = scaleMapRef.current.get(scaleKey) || { floor: 0.006, peak: 0.22 };
+    const observedPeak = values.reduce((acc, val) => Math.max(acc, val), 0);
+    const observedFloor = values.reduce((acc, val) => Math.min(acc, val), 1);
+
+    if (observedPeak > tracker.peak) {
+      tracker.peak += (observedPeak - tracker.peak) * 0.24;
+    } else {
+      tracker.peak = Math.max(observedPeak, tracker.peak * 0.985);
     }
 
-    let windowMax = 0.08;
-    for (let i = 0; i < state.history.length; i += 1) {
-      if (state.history[i].v > windowMax) windowMax = state.history[i].v;
+    if (observedFloor < tracker.floor) {
+      tracker.floor += (observedFloor - tracker.floor) * 0.12;
+    } else {
+      tracker.floor = Math.min(observedFloor, tracker.floor * 1.01 + 0.0003);
     }
-    scaleMapRef.current.set(scaleKey, state);
-    const denom = Math.max(0.0001, windowMax);
-    return safe.map((v) => clamp(v / denom, 0, 1));
+
+    const dynamicRange = clamp(tracker.peak - tracker.floor, 0.08, 0.95);
+    const nextTracker = {
+      floor: tracker.floor,
+      peak: tracker.floor + dynamicRange,
+    };
+    scaleMapRef.current.set(scaleKey, nextTracker);
+
+    if (scaleMapRef.current.size > 256) {
+      const firstKey = scaleMapRef.current.keys().next().value;
+      if (firstKey != null) scaleMapRef.current.delete(firstKey);
+    }
+
+    return values.map((value) => clamp((value - nextTracker.floor) / dynamicRange, 0, 1));
   };
 
   const getRowSplitLevels = (row) => {
@@ -2651,7 +2853,7 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const scaled = autoScaleLevels(peaks, inputAutoScaleRef, `in-split:${devId}`);
+        const scaled = autoScaleLevels(peaks, inputAutoZoomRef, `in-split:${devId}`);
         const first = scaled[0] ?? 0;
         const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
@@ -2662,7 +2864,7 @@ export default function App({ runtime = "web" }) {
     const rightId = `ch:${devId}:${Math.min(1, ch - 1)}`;
     const left = inputLevels[leftId] ?? managerRef.current.getInputLevel(leftId) ?? 0;
     const right = inputLevels[rightId] ?? managerRef.current.getInputLevel(rightId) ?? 0;
-    const scaled = autoScaleLevels([left, ch > 1 ? right : left], inputAutoScaleRef, `in-split:${devId}`);
+    const scaled = autoScaleLevels([left, ch > 1 ? right : left], inputAutoZoomRef, `in-split:${devId}`);
     return [
       scaled[0] ?? 0,
       scaled[1] ?? 0,
@@ -2676,7 +2878,7 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const scaled = autoScaleLevels(peaks, outputAutoScaleRef, `out-split:${devId}`);
+        const scaled = autoScaleLevels(peaks, outputAutoZoomRef, `out-split:${devId}`);
         const first = scaled[0] ?? 0;
         const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
@@ -2687,7 +2889,7 @@ export default function App({ runtime = "web" }) {
     const rightId = `ch:${devId}:${Math.min(1, ch - 1)}`;
     const left = outputLevels[leftId] ?? managerRef.current.getOutputLevel(leftId) ?? 0;
     const right = outputLevels[rightId] ?? managerRef.current.getOutputLevel(rightId) ?? 0;
-    const scaled = autoScaleLevels([left, ch > 1 ? right : left], outputAutoScaleRef, `out-split:${devId}`);
+    const scaled = autoScaleLevels([left, ch > 1 ? right : left], outputAutoZoomRef, `out-split:${devId}`);
     return [
       scaled[0] ?? 0,
       scaled[1] ?? 0,
@@ -2703,7 +2905,7 @@ export default function App({ runtime = "web" }) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        const scaled = autoScaleLevels(peaks, inputAutoScaleRef, `in:${devId}`);
+        const scaled = autoScaleLevels(peaks, inputAutoZoomRef, `in:${devId}`);
         for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
@@ -2712,7 +2914,7 @@ export default function App({ runtime = "web" }) {
       const id = `ch:${devId}:${i}`;
       return inputLevels[id] ?? managerRef.current.getInputLevel(id) ?? 0;
     });
-    return autoScaleLevels(raw, inputAutoScaleRef, `in:${devId}`);
+    return autoScaleLevels(raw, inputAutoZoomRef, `in:${devId}`);
   };
 
   const getColChannelLevels = (col) => {
@@ -2723,7 +2925,7 @@ export default function App({ runtime = "web" }) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        const scaled = autoScaleLevels(peaks, outputAutoScaleRef, `out:${devId}`);
+        const scaled = autoScaleLevels(peaks, outputAutoZoomRef, `out:${devId}`);
         for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
@@ -2732,7 +2934,7 @@ export default function App({ runtime = "web" }) {
       const id = `ch:${devId}:${i}`;
       return outputLevels[id] ?? managerRef.current.getOutputLevel(id) ?? 0;
     });
-    return autoScaleLevels(raw, outputAutoScaleRef, `out:${devId}`);
+    return autoScaleLevels(raw, outputAutoZoomRef, `out:${devId}`);
   };
 
   const getChannelAxisLabel = (channelCount, channelIndex) => {
@@ -2826,9 +3028,7 @@ export default function App({ runtime = "web" }) {
     ];
   }
   const hasAnyActiveRoute = Object.values(activeMatrix).some((conn) => conn.on);
-  const muteButtonIsMuted = isHoverDetail
-    ? !!selectedConnection?.muted
-    : transientMuteAll;
+  const routeIndicatorActive = !!selectedConnection?.on;
 
   const detailRouteLatencyMs = (() => {
     if (!hasNativeBridge || !detailCell) return null;
@@ -2918,17 +3118,14 @@ export default function App({ runtime = "web" }) {
     { length: Math.max(1, Number.isFinite(selectedDestination?.channelCount) ? selectedDestination.channelCount : 1) },
     (_, i) => getChannelAxisLabel(Math.max(1, Number.isFinite(selectedDestination?.channelCount) ? selectedDestination.channelCount : 1), i),
   );
+  const routeIndicatorMultiChannel = viewMode !== "channel"
+    && Math.max(selectedSourceChannelLabels.length, selectedDestinationChannelLabels.length) > 1;
+  const routeIndicatorIcon = routeIndicatorActive
+    ? (routeIndicatorMultiChannel ? "⮆" : "🡢")
+    : "⏸";
 
-  const selectedGainDb = Number.isFinite(selectedConnection?.gainDb) ? selectedConnection.gainDb : 0;
-  const canEditSelectedRoute = !!detailCell && !locked;
-  const updateSelectedRoute = (patch) => {
-    if (!detailCell || locked) return;
-    updateConnection(detailCell.rowId, detailCell.colId, {
-      ...(selectedConnection || makeDefaultConnection()),
-      on: true,
-      ...patch,
-    });
-  };
+  const globalGainDb = masterGainDb;
+  const canEditGlobalGain = !locked;
 
   const handleTransientMuteAllToggle = () => {
     if (!hasAnyActiveRoute) return;
@@ -2936,10 +3133,8 @@ export default function App({ runtime = "web" }) {
   };
 
   const handleRootClick = (event) => {
-    if (event.target.closest(".buffer-menu")) return;
     if (event.target.closest(".matrix-grid")) return;
-    if (event.target.closest(".mute-btn")) return;
-    setShowBufferMenu(false);
+    if (event.target.closest(".route-indicator-btn")) return;
     setSelectedCell(null);
   };
 
@@ -3045,7 +3240,7 @@ export default function App({ runtime = "web" }) {
             // Drag-scroll can start from nearly anywhere in the board, including tiles.
             if (event.button !== 0) return;
             const target = event.target;
-            if (target.closest && target.closest(".matrix-corner, .corner-controls, .resize-handle, .tile-context-menu, .tile-menu-btn, .tile-gain-step, .tile-gain-btn, .tile-cell-wrap, .cell, .row-head, .col-head, input, a, button")) {
+            if (target.closest && target.closest(".matrix-corner, .corner-controls, .resize-handle, .row-head, .col-head, input, a")) {
               return;
             }
             const wrap = matrixWrapRef.current;
@@ -3099,9 +3294,7 @@ export default function App({ runtime = "web" }) {
             // Discard hover selection as soon as the pointer leaves the matrix surface.
             setShowResizeGuides(false);
             if (locked) return;
-            if (!tileMenuCell && !gainAdjustCell) {
-              setSelectedCell(null);
-            }
+            setSelectedCell(null);
           }}
         >
           <div
@@ -3131,8 +3324,6 @@ export default function App({ runtime = "web" }) {
                   if (rowId && colId && (selectedCell?.rowId !== rowId || selectedCell?.colId !== colId)) {
                     setSelectedCell({ rowId, colId });
                   }
-                } else if (!tileMenuCell && !gainAdjustCell && selectedCell) {
-                  setSelectedCell(null);
                 }
               }
             }}
@@ -3141,20 +3332,12 @@ export default function App({ runtime = "web" }) {
               <div className="corner-controls" role="group" aria-label="Matrix quick controls">
                 <button
                   type="button"
-                  className={`corner-control-btn corner-control-tl ${powerOn ? "active" : ""}${(!isHoverDetail && transientMuteAll) ? " muted" : ""}`}
-                  onClick={() => {
-                    if (!isHoverDetail && transientMuteAll) {
-                      handleTransientMuteAllToggle();
-                      return;
-                    }
-                    togglePowerState();
-                  }}
-                  title={!isHoverDetail && transientMuteAll
-                    ? "Global mute active. Click to unmute first."
-                    : (powerOn ? "Power on (click to power off)" : "Power off (click to power on)")}
+                  className={`corner-control-btn corner-control-tl ${powerOn ? "active" : ""}`}
+                  onClick={togglePowerState}
+                  title={powerOn ? "Power on (click to power off)" : "Power off (click to power on)"}
                   aria-label="Toggle power"
                 >
-                  <span aria-hidden="true">{(!isHoverDetail && transientMuteAll) ? "🔇" : "⏻"}</span>
+                  <span aria-hidden="true">⏻</span>
                 </button>
                 <button
                   type="button"
@@ -3171,62 +3354,113 @@ export default function App({ runtime = "web" }) {
                     className={`corner-control-btn corner-control-btn--buffer ${isApplyingCaptureBuffer ? "active" : ""}`}
                     onClick={(event) => {
                       event.stopPropagation();
-                      if (locked || isApplyingCaptureBuffer) return;
-                      setShowBufferMenu((prev) => !prev);
+                      if (locked) return;
+                      if (bufferDragSuppressClickRef.current) {
+                        bufferDragSuppressClickRef.current = false;
+                        return;
+                      }
+                      setCaptureBufferFromMenu(CAPTURE_BUFFER_DEFAULT);
                     }}
-                    title={`${isApplyingCaptureBuffer ? "Applying" : "Capture buffer"} ${captureBufferMs}ms. Click to open list.`}
-                    aria-label="Open capture buffer size list"
-                    disabled={locked || isApplyingCaptureBuffer}
+                    onPointerDown={(event) => {
+                      if (locked) return;
+                      event.currentTarget.setPointerCapture(event.pointerId);
+                      bufferDragRef.current = {
+                        startY: event.clientY,
+                        startMs: captureBufferMs,
+                      };
+                      bufferDragSuppressClickRef.current = false;
+                    }}
+                    onPointerMove={(event) => {
+                      if (!bufferDragRef.current || locked) return;
+                      const deltaSteps = Math.trunc((bufferDragRef.current.startY - event.clientY) / 10);
+                      const next = clamp(bufferDragRef.current.startMs + deltaSteps * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
+                      if (next !== captureBufferMs) {
+                        applyBufferDelta(next - captureBufferMs);
+                        bufferDragSuppressClickRef.current = true;
+                      }
+                    }}
+                    onPointerUp={() => {
+                      bufferDragRef.current = null;
+                    }}
+                    onPointerCancel={() => {
+                      bufferDragRef.current = null;
+                      bufferDragSuppressClickRef.current = false;
+                    }}
+                    onWheel={(event) => {
+                      if (locked) return;
+                      event.preventDefault();
+                      event.stopPropagation();
+                      applyBufferDelta(event.deltaY < 0 ? 5 : -5);
+                    }}
+                    title={`${isApplyingCaptureBuffer ? "Applying" : "Capture buffer"} ${captureBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
+                    aria-label="Adjust capture buffer"
+                    disabled={locked}
                   >
                     <span className="buffer-readout" aria-hidden="true">
                       <span>{`${captureBufferMs}`}</span>
                       <span className="buffer-unit">ms</span>
                     </span>
                   </button>
-                  {showBufferMenu ? (
-                    <div className="buffer-menu" role="listbox" aria-label="Capture buffer sizes" onClick={(event) => event.stopPropagation()}>
-                      {CAPTURE_BUFFER_OPTIONS.map((ms) => (
-                        <button
-                          key={ms}
-                          type="button"
-                          className={`buffer-menu-option${captureBufferMs === ms ? " is-active" : ""}`}
-                          onClick={() => setCaptureBufferFromMenu(ms)}
-                          role="option"
-                          aria-selected={captureBufferMs === ms}
-                        >
-                          {ms}ms
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
                 </div>
                 <div
                   className="corner-control-mid corner-gain-wheel"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (!canEditGlobalGain) return;
+                    if (wheelDragSuppressClickRef.current) {
+                      wheelDragSuppressClickRef.current = false;
+                      return;
+                    }
+                    setMasterGainDb(0);
+                  }}
                   onPointerDown={(e) => {
-                    if (!canEditSelectedRoute) return;
+                    if (!canEditGlobalGain) return;
                     e.currentTarget.setPointerCapture(e.pointerId);
-                    wheelDragRef.current = { startY: e.clientY, startDb: selectedGainDb };
+                    wheelDragRef.current = { startY: e.clientY, startDb: globalGainDb };
+                    wheelDragSuppressClickRef.current = false;
                   }}
                   onPointerMove={(e) => {
                     if (!wheelDragRef.current) return;
                     const delta = (wheelDragRef.current.startY - e.clientY) / 8;
-                    updateSelectedRoute({ gainDb: clamp(Math.round((wheelDragRef.current.startDb + delta) * 2) / 2, DB_MIN, DB_MAX) });
+                    const next = clamp(Math.round((wheelDragRef.current.startDb + delta) * 2) / 2, DB_MIN, DB_MAX);
+                    const diff = next - globalGainDb;
+                    if (Math.abs(diff) >= 0.49) {
+                      applyGlobalGainDelta(diff);
+                      wheelDragRef.current = { startY: e.clientY, startDb: next };
+                      wheelDragSuppressClickRef.current = true;
+                    }
+                  }}
+                  onWheel={(e) => {
+                    if (!canEditGlobalGain) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    applyGlobalGainDelta(e.deltaY < 0 ? 0.5 : -0.5);
                   }}
                   onPointerUp={() => { wheelDragRef.current = null; }}
                   onPointerCancel={() => { wheelDragRef.current = null; }}
-                  style={{ cursor: canEditSelectedRoute ? "ns-resize" : "default", opacity: canEditSelectedRoute ? 1 : 0.45 }}
-                  title={canEditSelectedRoute ? "Drag up/down to adjust route gain" : "Select a route to adjust gain"}
+                  style={{ cursor: canEditGlobalGain ? "ns-resize" : "default", opacity: canEditGlobalGain ? 1 : 0.45 }}
+                  title={canEditGlobalGain ? "Master gain: drag up/down or scroll wheel" : "Unlock matrix to edit master gain"}
                   role="spinbutton"
-                  aria-valuenow={selectedGainDb}
+                  aria-valuenow={globalGainDb}
                   aria-valuemin={DB_MIN}
                   aria-valuemax={DB_MAX}
-                  aria-label="Route gain"
+                  aria-label="Global gain"
                 >
                   <span className="corner-gain-wheel-value">
-                    {selectedGainDb > 0 ? `+${selectedGainDb.toFixed(1)}` : selectedGainDb.toFixed(1)}
+                    {globalGainDb > 0 ? `+${globalGainDb.toFixed(1)}` : globalGainDb.toFixed(1)}
                     <span className="corner-gain-wheel-unit">dB</span>
                   </span>
                 </div>
+                <button
+                  type="button"
+                  className={`corner-control-btn corner-control-global-mute ${transientMuteAll ? "active muted" : ""}`}
+                  onClick={handleTransientMuteAllToggle}
+                  disabled={!hasAnyActiveRoute}
+                  title={transientMuteAll ? "Global mute on (click to unmute)" : "Global mute off (click to mute all)"}
+                  aria-label="Toggle global mute"
+                >
+                  <span aria-hidden="true">🔈︎</span>
+                </button>
                 <button
                   type="button"
                   className={`corner-control-btn corner-control-br ${viewMode === "channel" ? "active" : ""}`}
@@ -3402,9 +3636,6 @@ export default function App({ runtime = "web" }) {
                   const key = getCellKey(row.id, col.id);
                   const state = activeMatrix[key] || makeDefaultConnection();
                   const selected = selectedCell?.rowId === row.id && selectedCell?.colId === col.id;
-                  const isMenuOpen = tileMenuCell?.rowId === row.id && tileMenuCell?.colId === col.id;
-                  const isMenuDropUp = !!tileMenuCell?.dropUp;
-                  const isGainAdjustOpen = gainAdjustCell?.rowId === row.id && gainAdjustCell?.colId === col.id;
                   const colSpan = viewMode === "device" ? Math.max(1, col.channelCount || 1) : 1;
                   const tileWidth = scaledCellSize * colSpan + GRID_GAP_SIZE * (colSpan - 1);
                   const tileHeight = scaledCellSize * rowSpan + GRID_GAP_SIZE * (rowSpan - 1);
@@ -3427,7 +3658,6 @@ export default function App({ runtime = "web" }) {
                           "cell",
                           state.on ? "on" : "off",
                           selected && "selected",
-                          state.on && state.muted && "muted",
                           state.phaseInverted && "phase-inverted",
                           selectedCell && row.id === selectedCell.rowId && "active-row",
                           selectedCell && col.id === selectedCell.colId && "active-col",
@@ -3447,76 +3677,31 @@ export default function App({ runtime = "web" }) {
                           updateConnection(row.id, col.id, {
                             ...state,
                             on: !state.on,
-                            muted: false,
                           });
+                        }}
+                        onWheel={(event) => {
+                          if (locked) return;
+                          event.preventDefault();
+                          event.stopPropagation();
+                          adjustGainForCell(row.id, col.id, event.deltaY < 0 ? 0.5 : -0.5);
                         }}
                         onContextMenu={(event) => {
                           if (locked) return;
                           event.preventDefault();
                           event.stopPropagation();
                           setSelectedCell({ rowId: row.id, colId: col.id });
-                          if (isMenuOpen) {
-                            setTileMenuCell(null);
-                            setGainAdjustCell(null);
-                            return;
-                          }
-                          openTileMenuForCell(event, row.id, col.id);
+                          updateConnection(row.id, col.id, (prev) => ({
+                            ...prev,
+                            on: true,
+                            phaseInverted: !prev.phaseInverted,
+                          }));
                         }}
                         title={`${row.label} -> ${col.label}`}
                       >
                         {Math.abs(state.gainDb || 0) >= 0.5 ? (
-                          <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${Math.round(state.gainDb)}dB`}</span>
+                          <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${(Number(state.gainDb) || 0).toFixed(1)}dB`}</span>
                         ) : null}
                       </button>
-                      {isMenuOpen ? (
-                        <div className={`tile-context-menu ${isMenuDropUp ? "drop-up" : ""}`} onClick={(event) => event.stopPropagation()}>
-                          <button
-                            type="button"
-                            className={`tile-menu-btn ${state.phaseInverted ? "active" : ""}`}
-                            onClick={() => updateConnection(row.id, col.id, (prev) => ({ ...prev, on: true, phaseInverted: !prev.phaseInverted }))}
-                            title="Flip phase"
-                            aria-label="Flip phase"
-                            disabled={locked}
-                          >
-                            Ø
-                          </button>
-
-                          <div className="tile-gain-wrap">
-                            <button
-                              type="button"
-                              className={`tile-menu-btn tile-gain-btn ${isGainAdjustOpen ? "active" : ""}`}
-                              onClick={() =>
-                                setGainAdjustCell((prev) =>
-                                  prev?.rowId === row.id && prev?.colId === col.id ? null : { rowId: row.id, colId: col.id }
-                                )
-                              }
-                              onWheel={(event) => {
-                                if (locked) return;
-                                if (!isGainAdjustOpen) return;
-                                event.preventDefault();
-                                event.stopPropagation();
-                                adjustGainForCell(row.id, col.id, event.deltaY < 0 ? 1 : -1);
-                              }}
-                              title="Edit gain"
-                              aria-label="Edit gain"
-                              disabled={locked}
-                            >
-                              {`${Math.round(state.gainDb || 0)} dB`}
-                            </button>
-                          </div>
-
-                          <button
-                            type="button"
-                            className={`tile-menu-btn ${state.muted ? "active warn" : ""}`}
-                            onClick={() => updateConnection(row.id, col.id, (prev) => ({ ...prev, on: true, muted: !prev.muted }))}
-                            title="Toggle mute"
-                            aria-label="Toggle mute"
-                            disabled={locked}
-                          >
-                            M
-                          </button>
-                        </div>
-                      ) : null}
                     </div>
                   );
                 })}
@@ -3530,24 +3715,24 @@ export default function App({ runtime = "web" }) {
 
       <div className="inline-editor docked rack-panel">
         <div className="dock-col dock-card">
-          <div className="card-main-copy card-main-copy-split">
-            <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedSourceChannelLabels.length}, 1fr)` }}>
-              {selectedSourceChannelLabels.map((_, i) => (
-                <span key={i} className={`meter-bar meter-bar-${i === 0 ? "l" : "r"}`} style={{ width: `${Math.round((selectedSourceSplit[i] ?? 0) * 100)}%` }} />
-              ))}
-            </div>
-            {selectedSource?.isMaster ? <span className="detail-master-badge">MASTER</span> : null}
-            <div className="detail-device-row">
+          <div className="dock-card-main-wrap">
+            <div className="card-main-copy card-main-copy-split">
+              <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedSourceChannelLabels.length}, 1fr)` }}>
+                {selectedSourceChannelLabels.map((_, i) => (
+                  <span key={i} className={`meter-bar meter-bar-${i === 0 ? "l" : "r"}`} style={{ width: `${Math.round((selectedSourceSplit[i] ?? 0) * 100)}%` }} />
+                ))}
+              </div>
+              {selectedSourceDeviceId && selectedSourceDeviceId === inputMasterId ? <span className="detail-master-badge detail-master-badge-vert">MASTER</span> : null}
               <div className="detail-name-stack">
                 <span className="detail-name-main">{selectedSource?.label || "Source"}</span>
                 {selectedSource?.hardwareLabel ? <span className="detail-name-sub">{selectedSource.hardwareLabel}</span> : null}
               </div>
-              <span className="row-channels-box detail-channels-vert" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedSourceChannelLabels.length}, 1fr)` }}>
-                {selectedSourceChannelLabels.map((label, i) => (
-                  <span key={`src-${i}`} className="axis-split-label axis-split-cell">{label}</span>
-                ))}
-              </span>
             </div>
+            <span className="row-channels-box detail-channels-vert detail-channels-outside" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedSourceChannelLabels.length}, 1fr)` }}>
+              {selectedSourceChannelLabels.map((label, i) => (
+                <span key={`src-${i}`} className="axis-split-label axis-split-cell">{label}</span>
+              ))}
+            </span>
           </div>
           <div className="card-metrics-box">
             <div className="metric-tile">
@@ -3565,40 +3750,16 @@ export default function App({ runtime = "web" }) {
           <div className="dock-center-stack">
             <button
               type="button"
-              className={`mute-btn ${muteButtonIsMuted ? "muted" : ""}`}
-              disabled={!hasAnyActiveRoute}
-              onClick={handleTransientMuteAllToggle}
-              title={isHoverDetail
-                ? `Tile mute: ${selectedConnection?.muted ? "muted" : "unmuted"}. Click for transient mute all.`
-                : transientMuteAll
-                  ? "Transient mute all is ON. Click to restore previous mute state."
-                  : "Global mute status is OFF. Click for transient mute all."}
+              className={`route-indicator-btn ${routeIndicatorActive ? "active" : "inactive"}`}
+              title={routeIndicatorActive ? "Selected route is active" : "Selected route is disabled"}
+              aria-label={routeIndicatorActive ? "Selected route active" : "Selected route disabled"}
             >
-              {muteButtonIsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+              <span aria-hidden="true">{routeIndicatorIcon}</span>
             </button>
           </div>
         </div>
 
         <div className="dock-col dock-card">
-          <div className="card-main-copy card-main-copy-split">
-            <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
-              {selectedDestinationChannelLabels.map((_, i) => (
-                <span key={i} className={`meter-bar meter-bar-${i === 0 ? "l" : "r"}`} style={{ width: `${Math.round((selectedDestinationSplit[i] ?? 0) * 100)}%` }} />
-              ))}
-            </div>
-            {selectedDestination?.isMaster ? <span className="detail-master-badge">MASTER</span> : null}
-            <div className="detail-device-row">
-              <div className="detail-name-stack">
-                <span className="detail-name-main">{selectedDestination?.label || "Destination"}</span>
-                {selectedDestination?.hardwareLabel ? <span className="detail-name-sub">{selectedDestination.hardwareLabel}</span> : null}
-              </div>
-              <span className="row-channels-box detail-channels-vert" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
-                {selectedDestinationChannelLabels.map((label, i) => (
-                  <span key={`dst-${i}`} className="axis-split-label axis-split-cell">{label}</span>
-                ))}
-              </span>
-            </div>
-          </div>
           <div className="card-metrics-box">
             <div className="metric-tile">
               <span className="metric-title">Latency</span>
@@ -3608,6 +3769,25 @@ export default function App({ runtime = "web" }) {
               <span className="metric-title">Jitter</span>
               <span className="metric-value">{jitterLabel}</span>
             </div>
+          </div>
+          <div className="dock-card-main-wrap">
+            <div className="card-main-copy card-main-copy-split">
+              <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
+                {selectedDestinationChannelLabels.map((_, i) => (
+                  <span key={i} className={`meter-bar meter-bar-${i === 0 ? "l" : "r"}`} style={{ width: `${Math.round((selectedDestinationSplit[i] ?? 0) * 100)}%` }} />
+                ))}
+              </div>
+              {selectedDestinationDeviceId && selectedDestinationDeviceId === outputMasterId ? <span className="detail-master-badge detail-master-badge-vert">MASTER</span> : null}
+              <div className="detail-name-stack">
+                <span className="detail-name-main">{selectedDestination?.label || "Destination"}</span>
+                {selectedDestination?.hardwareLabel ? <span className="detail-name-sub">{selectedDestination.hardwareLabel}</span> : null}
+              </div>
+            </div>
+            <span className="row-channels-box detail-channels-vert detail-channels-outside" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
+              {selectedDestinationChannelLabels.map((label, i) => (
+                <span key={`dst-${i}`} className="axis-split-label axis-split-cell">{label}</span>
+              ))}
+            </span>
           </div>
         </div>
       </div>

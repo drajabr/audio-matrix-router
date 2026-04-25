@@ -158,6 +158,19 @@ public sealed class MainForm : Form
     {
         base.OnHandleCreated(e);
         ApplyDarkTitleBar();
+        try
+        {
+            var iconHandle = _trayAppIcon.Handle;
+            if (iconHandle != IntPtr.Zero)
+            {
+                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_SMALL, iconHandle);
+                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_BIG, iconHandle);
+            }
+        }
+        catch
+        {
+            // Keep running if icon assignment fails.
+        }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -1001,4 +1014,11 @@ public sealed class MainForm : Form
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int valueSize);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    private const int WM_SETICON = 0x0080;
+    private const int ICON_SMALL = 0;
+    private const int ICON_BIG = 1;
 }
