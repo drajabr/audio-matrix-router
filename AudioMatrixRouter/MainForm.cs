@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using AudioMatrixRouter.Audio;
@@ -24,6 +25,7 @@ public sealed class MainForm : Form
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 500 };
     private readonly System.Windows.Forms.Timer _deviceRefreshTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 500 };
     private readonly NotifyIcon _trayIcon = new();
     private readonly ContextMenuStrip _trayMenu = new();
     private readonly Icon _trayAppIcon;
@@ -34,6 +36,7 @@ public sealed class MainForm : Form
     private bool _startMinimizedFromConfig;
     private string _uiPreferencesJson = "";
     private const string StartupRunEntryName = "AudioMatrixRouter";
+
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -86,6 +89,23 @@ public sealed class MainForm : Form
                 _deviceRefreshTimer.Start();
             }
         };
+        _engine.StateChanged += () =>
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired)
+            {
+                BeginInvoke(() => { _ = PushStateToUiAsync(); });
+            }
+            else
+            {
+                _ = PushStateToUiAsync();
+            }
+        };
+        _metricsPushTimer.Tick += async (_, _) =>
+        {
+            await PushStateToUiAsync();
+        };
+        _metricsPushTimer.Start();
 
         LoadConfigAndDevices();
 
@@ -227,7 +247,8 @@ public sealed class MainForm : Form
             if (e.Uri.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
             {
                 e.Cancel = true;
-                _webView.Source = new Uri("https://appassets.local/index.html");
+                var cacheBuster = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                _webView.Source = new Uri($"https://appassets.local/index.html?v={cacheBuster}");
                 System.Diagnostics.Debug.WriteLine("[WebView] Blocked file:// navigation and redirected to virtual host");
             }
         };
@@ -254,8 +275,9 @@ public sealed class MainForm : Form
             uiDistPath,
             CoreWebView2HostResourceAccessKind.Allow);
 
-        _webView.Source = new Uri("https://appassets.local/index.html");
-        System.Diagnostics.Debug.WriteLine("[WebView] Navigating to https://appassets.local/index.html");
+        var startupCacheBuster = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _webView.Source = new Uri($"https://appassets.local/index.html?v={startupCacheBuster}");
+        System.Diagnostics.Debug.WriteLine("[WebView] Navigating to https://appassets.local/index.html?v=<ts>");
     }
 
     private static string? ResolveUiDistPath()
@@ -305,6 +327,15 @@ public sealed class MainForm : Form
                 SyncDevicesWithSystem(addAllAvailableIfEmpty: true);
             }
 
+            // If saved routes exist, start the engine immediately so audio flows from launch.
+            if (!_engine.IsRunning
+                && _engine.InputDevices.Count > 0
+                && _engine.OutputDevices.Count > 0
+                && _engine.RoutingMatrix.HasAnyCrosspoints())
+            {
+                _engine.Start();
+            }
+
             return;
         }
 
@@ -315,18 +346,23 @@ public sealed class MainForm : Form
     {
         _engine.RefreshDevices();
 
-        if (addAllAvailableIfEmpty && _engine.InputDevices.Count == 0)
+        var captureDevices = _engine.GetAvailableDevices(DataFlow.Capture);
+        var renderDevices = _engine.GetAvailableDevices(DataFlow.Render);
+
+        // Always include real capture endpoints in addition to loopback endpoints.
+        foreach (var capture in captureDevices)
         {
-            var captureDevices = _engine.GetAvailableDevices(DataFlow.Capture);
-            foreach (var device in captureDevices)
-            {
-                _engine.AddInputDevice(device.Id);
-            }
+            _engine.AddInputDevice(capture.Id);
+        }
+
+        foreach (var render in renderDevices)
+        {
+            // Always expose render endpoints as loopback capture sources.
+            _engine.AddInputDevice($"loop:{render.Id}");
         }
 
         if (addAllAvailableIfEmpty && _engine.OutputDevices.Count == 0)
         {
-            var renderDevices = _engine.GetAvailableDevices(DataFlow.Render);
             foreach (var device in renderDevices)
             {
                 _engine.AddOutputDevice(device.Id);
@@ -653,14 +689,16 @@ public sealed class MainForm : Form
             StartupAtBoot = IsStartupAtBootEnabled(),
             CaptureBufferMs = _engine.CaptureBufferMs,
             TotalLatencyMs = maxWorkingLatencyMs,
-            AvailableInputs = _engine.GetAvailableDevices(DataFlow.Capture).Select(d => new DeviceState
+            AvailableInputs = _engine.GetAvailableInputDevices(includeCapture: true, includeLoopback: true)
+                .Select(d => new DeviceState
             {
                 DeviceId = d.Id,
                 Label = d.Name,
                 Channels = d.Channels,
                 Offset = 0,
                 IsMaster = false,
-                DelayMs = 0
+                DelayMs = 0,
+                IsLoopback = d.Id.StartsWith("loop:", StringComparison.Ordinal)
             }).ToList(),
             AvailableOutputs = _engine.GetAvailableDevices(DataFlow.Render).Select(d => new DeviceState
             {
@@ -678,7 +716,13 @@ public sealed class MainForm : Form
                 Channels = d.Info.Channels,
                 Offset = d.GlobalChannelOffset,
                 IsMaster = d.IsMasterDevice,
-                DelayMs = 0
+                DelayMs = 0,
+                SampleRate = d.Info.SampleRate,
+                DriverLatencyMs = d.CaptureLatencyMs,
+                Overflows = Interlocked.Read(ref d.InputOverflowCount),
+                DroppedFrames = d.RingBuffer?.TotalFramesDropped ?? 0,
+                IsLoopback = d.IsLoopback,
+                PeakLevels = SnapshotPeaks(d.PeakLevels)
             }).ToList(),
             Outputs = _engine.OutputDevices.Select(d => new DeviceState
             {
@@ -687,10 +731,25 @@ public sealed class MainForm : Form
                 Channels = d.Info.Channels,
                 Offset = d.GlobalChannelOffset,
                 IsMaster = d.IsMasterDevice,
-                DelayMs = d.OutputDelayMs
+                DelayMs = d.OutputDelayMs,
+                SampleRate = d.Info.SampleRate,
+                DriverLatencyMs = d.RenderLatencyMs,
+                Underruns = d.MixProvider?.UnderrunCount ?? 0,
+                PeakLevels = d.MixProvider?.PeekPeakLevels() ?? Array.Empty<float>()
             }).ToList(),
             Routes = routes
         };
+    }
+
+    private static float[] SnapshotPeaks(float[]? peaks)
+    {
+        if (peaks == null || peaks.Length == 0) return Array.Empty<float>();
+        var snapshot = new float[peaks.Length];
+        for (int i = 0; i < peaks.Length; i++)
+        {
+            snapshot[i] = peaks[i];
+        }
+        return snapshot;
     }
 
     private bool IsStartupAtBootEnabled()
@@ -780,6 +839,13 @@ public sealed class MainForm : Form
         public int Offset { get; set; }
         public bool IsMaster { get; set; }
         public int DelayMs { get; set; }
+        public int SampleRate { get; set; }
+        public int DriverLatencyMs { get; set; }
+        public long Underruns { get; set; }
+        public long Overflows { get; set; }
+        public long DroppedFrames { get; set; }
+        public bool IsLoopback { get; set; }
+        public float[] PeakLevels { get; set; } = Array.Empty<float>();
     }
 
     private sealed class RouteState

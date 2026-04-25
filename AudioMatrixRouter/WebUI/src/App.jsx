@@ -65,6 +65,8 @@ const FONT_SIZE_PRESETS = [
 ];
 
 const UI_SCALE_PRESETS = [
+  { key: "xxxs", label: "XXXS", scale: 0.70 },
+  { key: "xxs", label: "XXS", scale: 0.78 },
   { key: "xs", label: "XS", scale: 0.86 },
   { key: "sm", label: "SM", scale: 0.93 },
   { key: "md", label: "MD", scale: 1.0 },
@@ -700,6 +702,8 @@ export default function App({ runtime = "web" }) {
 
   const devicesDiscoveredRef = useRef(false);
   const quickControlsRef = useRef(null);
+  const matrixWrapRef = useRef(null);
+  const dragScrollRef = useRef({ tracking: false, dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0, pointerId: 0, blockNextClick: false });
   const latencyLastRef = useRef(null);
   const latencyJitterRef = useRef(0);
 
@@ -726,18 +730,24 @@ export default function App({ runtime = "web" }) {
     return configuredOutputIds.size > 0 ? next : [];
   }, [outputs, configuredOutputIds]);
 
-  const visibleInputs = showAllDevices ? inputs : routedInputs;
-  const visibleOutputs = showAllDevices ? outputs : routedOutputs;
+  const visibleInputs = showAllDevices
+    ? inputs
+    : (routedInputs.length > 0 ? routedInputs : inputs);
+  const visibleOutputs = showAllDevices
+    ? outputs
+    : (routedOutputs.length > 0 ? routedOutputs : outputs);
 
   const monitoredInputs = useMemo(() => {
+    if (!hasNativeBridge) return inputs;
     if (locked) return routedInputs;
     return showAllDevices ? inputs : routedInputs;
-  }, [locked, showAllDevices, inputs, routedInputs]);
+  }, [hasNativeBridge, locked, showAllDevices, inputs, routedInputs]);
 
   const monitoredOutputs = useMemo(() => {
+    if (!hasNativeBridge) return outputs;
     if (locked) return routedOutputs;
     return showAllDevices ? outputs : routedOutputs;
-  }, [locked, showAllDevices, outputs, routedOutputs]);
+  }, [hasNativeBridge, locked, showAllDevices, outputs, routedOutputs]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -844,6 +854,82 @@ export default function App({ runtime = "web" }) {
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
+    let lastPushTs = 0;
+
+    const applyNativeState = (state) => {
+      if (!state || cancelled) return;
+      lastPushTs = performance.now();
+
+      if (Number.isFinite(state?.captureBufferMs)) {
+        setCaptureBufferMs(state.captureBufferMs);
+      }
+
+      const total = Number.isFinite(state?.totalLatencyMs) ? Number(state.totalLatencyMs) : null;
+      setNativeTotalLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
+      setLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
+
+      const routeLatency = {};
+      (Array.isArray(state?.routes) ? state.routes : []).forEach((route) => {
+        if (!Number.isFinite(route?.inCh) || !Number.isFinite(route?.outCh)) return;
+        if (!Number.isFinite(route?.workingLatencyMs)) return;
+        routeLatency[`${route.inCh}::${route.outCh}`] = Number(route.workingLatencyMs);
+      });
+      setNativeRouteLatencyByCh(routeLatency);
+
+      const inMeta = {};
+      (Array.isArray(state?.inputs) ? state.inputs : []).forEach((d) => {
+        if (!d?.deviceId) return;
+        inMeta[d.deviceId] = {
+          offset: Number.isFinite(d?.offset) ? d.offset : 0,
+          channels: Number.isFinite(d?.channels) ? d.channels : 0,
+          sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
+          driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          overflows: Number.isFinite(d?.overflows) ? d.overflows : 0,
+          droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
+          isLoopback: !!d?.isLoopback,
+          peakLevels: Array.isArray(d?.peakLevels) ? d.peakLevels.map((v) => Number(v) || 0) : [],
+        };
+      });
+      setNativeInputChannelMeta(inMeta);
+
+      const outMeta = {};
+      (Array.isArray(state?.outputs) ? state.outputs : []).forEach((d) => {
+        if (!d?.deviceId) return;
+        outMeta[d.deviceId] = {
+          offset: Number.isFinite(d?.offset) ? d.offset : 0,
+          channels: Number.isFinite(d?.channels) ? d.channels : 0,
+          sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
+          driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
+          peakLevels: Array.isArray(d?.peakLevels) ? d.peakLevels.map((v) => Number(v) || 0) : [],
+        };
+      });
+      setNativeOutputChannelMeta(outMeta);
+
+      if (total != null) {
+        if (latencyLastRef.current != null) {
+          const delta = Math.abs(total - latencyLastRef.current);
+          latencyJitterRef.current = latencyJitterRef.current === 0
+            ? delta
+            : latencyJitterRef.current * 0.82 + delta * 0.18;
+          setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
+        } else {
+          latencyJitterRef.current = 0;
+          setJitterMs(0);
+        }
+        latencyLastRef.current = total;
+      }
+
+      const sr = (() => {
+        const inSr = Object.values(inMeta).find((m) => m.sampleRate)?.sampleRate;
+        const outSr = Object.values(outMeta).find((m) => m.sampleRate)?.sampleRate;
+        return outSr || inSr || null;
+      })();
+      setClockKhz(sr ? Math.round((sr / 1000) * 10) / 10 : null);
+      setInputLatencyMs(null);
+      setOutputLatencyMs(null);
+      setBufferMs(null);
+    };
 
     const poll = async () => {
       if (inFlight) return;
@@ -851,61 +937,12 @@ export default function App({ runtime = "web" }) {
 
       try {
         if (hasNativeBridge) {
+          // If the native side recently pushed a state, skip the redundant fetch.
+          if (performance.now() - lastPushTs < 800) {
+            return;
+          }
           const state = await window.__nativeBridgeInvoke("getState", {});
-          if (cancelled) return;
-
-          if (Number.isFinite(state?.captureBufferMs)) {
-            setCaptureBufferMs(state.captureBufferMs);
-          }
-
-          const total = Number.isFinite(state?.totalLatencyMs) ? Number(state.totalLatencyMs) : null;
-          setNativeTotalLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
-          setLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
-
-          const routeLatency = {};
-          (Array.isArray(state?.routes) ? state.routes : []).forEach((route) => {
-            if (!Number.isFinite(route?.inCh) || !Number.isFinite(route?.outCh)) return;
-            if (!Number.isFinite(route?.workingLatencyMs)) return;
-            routeLatency[`${route.inCh}::${route.outCh}`] = Number(route.workingLatencyMs);
-          });
-          setNativeRouteLatencyByCh(routeLatency);
-
-          const inMeta = {};
-          (Array.isArray(state?.inputs) ? state.inputs : []).forEach((d) => {
-            if (!d?.deviceId) return;
-            inMeta[d.deviceId] = {
-              offset: Number.isFinite(d?.offset) ? d.offset : 0,
-              channels: Number.isFinite(d?.channels) ? d.channels : 0,
-            };
-          });
-          setNativeInputChannelMeta(inMeta);
-
-          const outMeta = {};
-          (Array.isArray(state?.outputs) ? state.outputs : []).forEach((d) => {
-            if (!d?.deviceId) return;
-            outMeta[d.deviceId] = {
-              offset: Number.isFinite(d?.offset) ? d.offset : 0,
-              channels: Number.isFinite(d?.channels) ? d.channels : 0,
-            };
-          });
-          setNativeOutputChannelMeta(outMeta);
-
-          if (total != null) {
-            if (latencyLastRef.current != null) {
-              const delta = Math.abs(total - latencyLastRef.current);
-              latencyJitterRef.current = latencyJitterRef.current === 0
-                ? delta
-                : latencyJitterRef.current * 0.82 + delta * 0.18;
-              setJitterMs(Math.round(latencyJitterRef.current * 10) / 10);
-            }
-            latencyLastRef.current = total;
-          }
-
-          const ctx = managerRef.current.context;
-          setClockKhz(ctx?.sampleRate ? Math.round((ctx.sampleRate / 1000) * 10) / 10 : null);
-          setInputLatencyMs(null);
-          setOutputLatencyMs(null);
-          setBufferMs(null);
+          applyNativeState(state);
           return;
         }
 
@@ -951,11 +988,21 @@ export default function App({ runtime = "web" }) {
       }
     };
 
+    const onNativeState = (event) => applyNativeState(event?.detail);
+    if (hasNativeBridge) {
+      window.addEventListener("native-state", onNativeState);
+    }
+
     void poll();
-    const id = setInterval(() => { void poll(); }, 250);
+    // Native: rely on engine push (~200ms). Web: poll WebAudio context.
+    const intervalMs = hasNativeBridge ? 1000 : 250;
+    const id = setInterval(() => { void poll(); }, intervalMs);
     return () => {
       cancelled = true;
       clearInterval(id);
+      if (hasNativeBridge) {
+        window.removeEventListener("native-state", onNativeState);
+      }
     };
   }, [hasNativeBridge]);
 
@@ -971,6 +1018,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           deviceId: input.deviceId,
+          isLoopback: !!input.isLoopback,
           isMaster: input.deviceId === inputMasterId,
         };
       });
@@ -988,6 +1036,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           deviceId: input.deviceId,
+          isLoopback: !!input.isLoopback,
           isChannelStart: true,
           isMaster: input.deviceId === inputMasterId,
         },
@@ -999,6 +1048,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           deviceId: input.deviceId,
+          isLoopback: !!input.isLoopback,
           isChannelEnd: true,
           isMaster: input.deviceId === inputMasterId,
         },
@@ -1259,6 +1309,9 @@ export default function App({ runtime = "web" }) {
   };
 
   const rebuildAudioGraph = async (mode, nextMatrixByView = matrixRef.current) => {
+    // Native mode owns the audio graph in C#. Don't double-capture/play in the browser.
+    if (hasNativeBridge) return;
+
     if (!powerOn) {
       await managerRef.current.teardown();
       setContextState("suspended");
@@ -1310,49 +1363,66 @@ export default function App({ runtime = "web" }) {
       if (Number.isFinite(saved?.captureBufferMs)) setCaptureBufferMs(saved.captureBufferMs);
       if (!hasNativeBridge && typeof saved?.locked === "boolean") setLocked(saved.locked);
 
-      await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const discoveredInputs = devices
-        .filter((d) => d.kind === "audioinput" && d.deviceId !== "default" && d.deviceId !== "communications")
-        .map((d, i) => ({
-          deviceId: d.deviceId,
-          label: d.label || `Input ${i + 1}`,
-        }));
-
-      let discoveredOutputs = devices
-        .filter((d) => d.kind === "audiooutput" && d.deviceId !== "default" && d.deviceId !== "communications")
-        .map((d, i) => ({
-          deviceId: d.deviceId,
-          label: d.label || `Output ${i + 1}`,
-          delayMs: 0,
-        }));
+      let discoveredInputs = [];
+      let discoveredOutputs = [];
 
       if (hasNativeBridge) {
-        try {
-          const state = await window.__nativeBridgeInvoke("getState", {});
-          if (Number.isFinite(state?.captureBufferMs)) {
-            setCaptureBufferMs(state.captureBufferMs);
-          }
-          const nativeOutputs = [
-            ...(Array.isArray(state?.outputs) ? state.outputs : []),
-            ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
-          ];
-
-          const delayByDeviceId = new Map(
-            nativeOutputs.map((output) => [
-              output?.deviceId,
-              Number.isFinite(output?.delayMs) ? output.delayMs : 0,
-            ]),
-          );
-
-          discoveredOutputs = discoveredOutputs.map((output) => ({
-            ...output,
-            delayMs: delayByDeviceId.get(output.deviceId) ?? 0,
-          }));
-        } catch (_) {
-          // no-op
+        const state = await window.__nativeBridgeInvoke("getState", {});
+        if (Number.isFinite(state?.captureBufferMs)) {
+          setCaptureBufferMs(state.captureBufferMs);
         }
+
+        const nativeInputs = [
+          ...(Array.isArray(state?.inputs) ? state.inputs : []),
+          ...(Array.isArray(state?.availableInputs) ? state.availableInputs : []),
+        ];
+        const nativeOutputs = [
+          ...(Array.isArray(state?.outputs) ? state.outputs : []),
+          ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
+        ];
+
+        const uniqByDeviceId = (list) => {
+          const map = new Map();
+          list.forEach((d, i) => {
+            if (!d?.deviceId || map.has(d.deviceId)) return;
+            map.set(d.deviceId, {
+              deviceId: d.deviceId,
+              label: d.label || `Device ${i + 1}`,
+              delayMs: Number.isFinite(d?.delayMs) ? d.delayMs : 0,
+              isLoopback: !!d?.isLoopback || String(d.deviceId).startsWith("loop:"),
+            });
+          });
+          return [...map.values()];
+        };
+
+        discoveredInputs = uniqByDeviceId(nativeInputs).map((d) => ({
+          deviceId: d.deviceId,
+          label: d.label,
+          isLoopback: d.isLoopback,
+        }));
+        discoveredOutputs = uniqByDeviceId(nativeOutputs).map((d) => ({
+          deviceId: d.deviceId,
+          label: d.label,
+          delayMs: d.delayMs,
+        }));
+      } else {
+        await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        discoveredInputs = devices
+          .filter((d) => d.kind === "audioinput" && d.deviceId !== "default" && d.deviceId !== "communications")
+          .map((d, i) => ({
+            deviceId: d.deviceId,
+            label: d.label || `Input ${i + 1}`,
+            isLoopback: false,
+          }));
+
+        discoveredOutputs = devices
+          .filter((d) => d.kind === "audiooutput" && d.deviceId !== "default" && d.deviceId !== "communications")
+          .map((d, i) => ({
+            deviceId: d.deviceId,
+            label: d.label || `Output ${i + 1}`,
+            delayMs: 0,
+          }));
       }
 
       const savedInputOrder = saved?.inputOrder || [];
@@ -1466,10 +1536,17 @@ export default function App({ runtime = "web" }) {
       const discoveredConfigured = collectConfiguredDeviceIds(nextMatrixByView);
       const discoveredRoutedInputs = orderedInputs.filter((d) => discoveredConfigured.configuredInputIds.has(d.deviceId));
       const discoveredRoutedOutputs = orderedOutputs.filter((d) => discoveredConfigured.configuredOutputIds.has(d.deviceId));
-      const setupInputs = locked ? discoveredRoutedInputs : (showAllDevices ? orderedInputs : discoveredRoutedInputs);
-      const setupOutputs = locked ? discoveredRoutedOutputs : (showAllDevices ? orderedOutputs : discoveredRoutedOutputs);
+      // In web mode the browser is the audio engine — always wire up all enumerated devices so meters animate
+      // for every tile, regardless of routing or showAllDevices. In native mode, the C# engine handles audio,
+      // so skip the WebAudio graph entirely.
+      const setupInputs = hasNativeBridge
+        ? []
+        : orderedInputs;
+      const setupOutputs = hasNativeBridge
+        ? []
+        : orderedOutputs;
 
-      if (powerOn && setupInputs.length > 0 && setupOutputs.length > 0) {
+      if (!hasNativeBridge && powerOn && setupInputs.length > 0 && setupOutputs.length > 0) {
         await managerRef.current.setup(setupInputs, setupOutputs, nextViewMode);
         applyMatrixToEngine(nextViewMode, nextMatrixByView[nextViewMode]);
 
@@ -2155,6 +2232,13 @@ export default function App({ runtime = "web" }) {
   const getRowSplitLevels = (row) => {
     if (!row) return [0, 0];
     const devId = row.deviceId || (row.id.startsWith("dev:") ? row.id.slice(4) : row.id.split(":")[1]);
+    if (hasNativeBridge) {
+      const peaks = nativeInputChannelMeta[devId]?.peakLevels;
+      if (Array.isArray(peaks) && peaks.length) {
+        return [peaks[0] ?? 0, peaks[1] ?? peaks[0] ?? 0];
+      }
+      return [0, 0];
+    }
     const leftId = `ch:${devId}:0`;
     const rightId = `ch:${devId}:1`;
     return [
@@ -2166,6 +2250,13 @@ export default function App({ runtime = "web" }) {
   const getColSplitLevels = (col) => {
     if (!col) return [0, 0];
     const devId = col.outputDeviceId || outputDeviceFromColId(col.id);
+    if (hasNativeBridge) {
+      const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
+      if (Array.isArray(peaks) && peaks.length) {
+        return [peaks[0] ?? 0, peaks[1] ?? peaks[0] ?? 0];
+      }
+      return [0, 0];
+    }
     const leftId = `ch:${devId}:0`;
     const rightId = `ch:${devId}:1`;
     return [
@@ -2309,17 +2400,19 @@ export default function App({ runtime = "web" }) {
     ? nativeTotalLatencyMs
     : null;
   const runningLatencyDisplayMs = hasNativeBridge
-    ? nativeTopbarTotalLatencyMs
+    ? (nativeTopbarTotalLatencyMs ?? latencyMs)
     : latencyMs;
   const sourceLatencyDisplayMs = hasNativeBridge
-    ? detailRouteLatencyMs
+    ? (detailRouteLatencyMs ?? inputLatencyMs)
     : inputLatencyMs;
   const latencyLabel = runningLatencyDisplayMs != null ? `${runningLatencyDisplayMs}ms` : "n/a";
   const sourceLatencyLabel = sourceLatencyDisplayMs != null ? `${sourceLatencyDisplayMs}ms` : "n/a";
   const selectedDestinationDelayMs = Number.isFinite(selectedDestination?.delayMs) ? selectedDestination.delayMs : 0;
   const destinationLatencyResolvedMs =
     hasNativeBridge
-      ? detailRouteLatencyMs
+      ? (detailRouteLatencyMs ?? (outputLatencyMs != null || selectedDestinationDelayMs > 0
+        ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
+        : null))
       : (outputLatencyMs != null || selectedDestinationDelayMs > 0
         ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
         : null)
@@ -2330,6 +2423,11 @@ export default function App({ runtime = "web" }) {
   const handleTransientMuteAllToggle = () => {
     if (!hasAnyActiveRoute) return;
     setTransientMuteAll((prev) => !prev);
+  };
+
+  const normalizePhysicalDeviceId = (deviceId) => {
+    if (!deviceId) return "";
+    return deviceId.startsWith("loop:") ? deviceId.slice(5) : deviceId;
   };
 
   const handleRootClick = (event) => {
@@ -2433,7 +2531,72 @@ export default function App({ runtime = "web" }) {
       {error ? <div className="error-banner">{error}</div> : null}
 
       <main className="main-layout">
-        <section className="matrix-wrap rack-panel">
+        <section
+          className="matrix-wrap rack-panel"
+          ref={matrixWrapRef}
+          onPointerDown={(event) => {
+            // Drag-scroll can start from nearly anywhere in the board, including tiles.
+            if (event.button !== 0) return;
+            const target = event.target;
+            if (target.closest && target.closest(".matrix-corner, .corner-controls, .resize-handle, .tile-context-menu, .tile-menu-btn, .tile-gain-step, .tile-gain-btn, input, a")) {
+              return;
+            }
+            const wrap = matrixWrapRef.current;
+            if (!wrap) return;
+            dragScrollRef.current = {
+              tracking: true,
+              dragging: false,
+              startX: event.clientX,
+              startY: event.clientY,
+              scrollLeft: wrap.scrollLeft,
+              scrollTop: wrap.scrollTop,
+              pointerId: event.pointerId,
+              blockNextClick: false,
+            };
+          }}
+          onPointerMove={(event) => {
+            const s = dragScrollRef.current;
+            if (!s.tracking) return;
+            const wrap = matrixWrapRef.current;
+            if (!wrap) return;
+            const dx = event.clientX - s.startX;
+            const dy = event.clientY - s.startY;
+            if (!s.dragging && Math.abs(dx) + Math.abs(dy) > 12) {
+              s.dragging = true;
+              try { wrap.setPointerCapture(event.pointerId); } catch (_) {}
+              wrap.classList.add("is-drag-scrolling");
+            }
+            if (!s.dragging) return;
+            wrap.scrollLeft = s.scrollLeft - dx;
+            wrap.scrollTop = s.scrollTop - dy;
+          }}
+          onPointerUp={(event) => {
+            const s = dragScrollRef.current;
+            if (!s.tracking) return;
+            const wrap = matrixWrapRef.current;
+            const hadDragged = s.dragging;
+            s.tracking = false;
+            s.dragging = false;
+            s.blockNextClick = hadDragged;
+            try { wrap?.releasePointerCapture(event.pointerId); } catch (_) {}
+            wrap?.classList.remove("is-drag-scrolling");
+          }}
+          onPointerCancel={() => {
+            const s = dragScrollRef.current;
+            s.tracking = false;
+            s.dragging = false;
+            s.blockNextClick = false;
+            matrixWrapRef.current?.classList.remove("is-drag-scrolling");
+          }}
+          onPointerLeave={() => {
+            // Discard hover selection as soon as the pointer leaves the matrix surface.
+            setShowResizeGuides(false);
+            if (locked) return;
+            if (!tileMenuCell && !gainAdjustCell) {
+              setSelectedCell(null);
+            }
+          }}
+        >
           <div
             className={`matrix-grid${selectedCell ? " has-selection" : ""}${showResizeGuides ? " show-resize-guides" : ""}`}
             style={{
@@ -2453,24 +2616,25 @@ export default function App({ runtime = "web" }) {
                 setShowResizeGuides(nextVisible);
               }
             }}
-            onMouseLeave={() => {
-              setShowResizeGuides(false);
-              if (locked) return;
-              if (!tileMenuCell && !gainAdjustCell) {
-                setSelectedCell(null);
-              }
-            }}
           >
             <div className="matrix-corner matrix-corner-content">
               <div className="corner-controls" role="group" aria-label="Matrix quick controls">
                 <button
                   type="button"
-                  className={`corner-control-btn corner-control-tl ${powerOn ? "active" : ""}`}
-                  onClick={togglePowerState}
-                  title={powerOn ? "Power on (click to power off)" : "Power off (click to power on)"}
+                  className={`corner-control-btn corner-control-tl ${powerOn ? "active" : ""}${(!isHoverDetail && transientMuteAll) ? " muted" : ""}`}
+                  onClick={() => {
+                    if (!isHoverDetail && transientMuteAll) {
+                      handleTransientMuteAllToggle();
+                      return;
+                    }
+                    togglePowerState();
+                  }}
+                  title={!isHoverDetail && transientMuteAll
+                    ? "Global mute active. Click to unmute first."
+                    : (powerOn ? "Power on (click to power off)" : "Power off (click to power on)")}
                   aria-label="Toggle power"
                 >
-                  <span aria-hidden="true">⏻</span>
+                  <span aria-hidden="true">{(!isHoverDetail && transientMuteAll) ? "🔇" : "⏻"}</span>
                 </button>
                 <button
                   type="button"
@@ -2483,9 +2647,9 @@ export default function App({ runtime = "web" }) {
                 </button>
                 <button
                   type="button"
-                  className="corner-control-btn corner-control-buffer corner-control-btn--buffer"
+                  className={`corner-control-btn corner-control-buffer corner-control-btn--buffer ${isApplyingCaptureBuffer ? "active" : ""}`}
                   onClick={cycleCaptureBuffer}
-                  title={`Capture buffer ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
+                  title={`${isApplyingCaptureBuffer ? "Applying" : "Capture buffer"} ${captureBufferMs}ms. Click to cycle ${CAPTURE_BUFFER_OPTIONS.join(" / ")} ms.`}
                   aria-label="Cycle capture buffer size"
                   disabled={locked || isApplyingCaptureBuffer}
                 >
@@ -2520,7 +2684,7 @@ export default function App({ runtime = "web" }) {
                   type="button"
                   className={`corner-control-btn corner-control-mid ${isReloadingDevices ? "active" : ""}`}
                   onClick={handleReloadDevices}
-                  disabled={isReloadingDevices}
+                  disabled={isReloadingDevices || locked}
                   title="Restart and reload devices"
                   aria-label="Restart and reload devices"
                 >
@@ -2649,6 +2813,10 @@ export default function App({ runtime = "web" }) {
                 {cols.map((col) => {
                   const key = getCellKey(row.id, col.id);
                   const state = activeMatrix[key] || makeDefaultConnection();
+                  const rowDeviceId = row.deviceId || parseChannelId(row.id)?.deviceId || "";
+                  const colDeviceId = col.outputDeviceId || outputDeviceFromColId(col.id);
+                  const loopBlocked = !!row.isLoopback
+                    && normalizePhysicalDeviceId(rowDeviceId) === normalizePhysicalDeviceId(colDeviceId);
                   const selected = selectedCell?.rowId === row.id && selectedCell?.colId === col.id;
                   const isMenuOpen = tileMenuCell?.rowId === row.id && tileMenuCell?.colId === col.id;
                   const isMenuDropUp = !!tileMenuCell?.dropUp;
@@ -2662,23 +2830,30 @@ export default function App({ runtime = "web" }) {
                           state.on ? "on" : "off",
                           selected && "selected",
                           state.on && state.muted && "muted",
+                          loopBlocked && "loop-blocked",
                           state.phaseInverted && "phase-inverted",
                           selectedCell && row.id === selectedCell.rowId && "active-row",
                           selectedCell && col.id === selectedCell.colId && "active-col",
                         ].filter(Boolean).join(" ")}
                         style={{ width: `${scaledCellSize}px`, height: `${scaledCellSize}px` }}
                         onMouseEnter={() => {
-                          if (!locked) {
-                            setSelectedCell({ rowId: row.id, colId: col.id });
-                          }
+                          if (locked) return;
+                          if (dragScrollRef.current.dragging) return;
+                          if (selectedCell?.rowId === row.id && selectedCell?.colId === col.id) return;
+                          setSelectedCell({ rowId: row.id, colId: col.id });
                         }}
-                        onClick={() =>
+                        onClick={() => {
+                          if (dragScrollRef.current.blockNextClick) {
+                            dragScrollRef.current.blockNextClick = false;
+                            return;
+                          }
+                          if (loopBlocked) return;
                           updateConnection(row.id, col.id, {
                             ...state,
                             on: !state.on,
                             muted: false,
-                          })
-                        }
+                          });
+                        }}
                         onContextMenu={(event) => {
                           if (locked) return;
                           event.preventDefault();
@@ -2692,7 +2867,7 @@ export default function App({ runtime = "web" }) {
                           openTileMenuForCell(event, row.id, col.id);
                         }}
                         title={`${row.label} -> ${col.label}`}
-                        disabled={locked}
+                        disabled={locked || loopBlocked}
                       >
                         {Math.abs(state.gainDb || 0) >= 0.5 ? (
                           <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${Math.round(state.gainDb)}dB`}</span>

@@ -82,7 +82,7 @@ textarea {
 }
 
 .studio-root {
-  height: 100%;
+  height: calc(100% / var(--ui-scale));
   padding: 10px;
   display: flex;
   flex-direction: column;
@@ -428,10 +428,23 @@ textarea {
   overflow: auto;
   position: relative;
   z-index: 1;
+  cursor: grab;
+  overscroll-behavior: contain;
+}
+
+.matrix-wrap.is-drag-scrolling {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.matrix-wrap.is-drag-scrolling .cell,
+.matrix-wrap.is-drag-scrolling .row-head,
+.matrix-wrap.is-drag-scrolling .col-head {
+  pointer-events: none;
 }
 
 .matrix-grid {
-  min-width: 980px;
+  min-width: 100%;
   min-height: 100%;
   display: grid;
   position: relative;
@@ -498,6 +511,12 @@ textarea {
   background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
 }
 
+.corner-control-btn.muted {
+  color: color-mix(in srgb, var(--danger) 35%, white 65%);
+  border-color: color-mix(in srgb, var(--danger-line) 70%, var(--line));
+  background: color-mix(in srgb, var(--danger-soft) 62%, var(--surface) 38%);
+}
+
 .corner-control-btn:disabled {
   opacity: 0.6;
   cursor: wait;
@@ -561,7 +580,7 @@ textarea {
   align-items: stretch;
   gap: 4px;
   border: 0;
-  background: transparent;
+  background: var(--panel);
   color: var(--text-strong);
   font-size: var(--font-size-xs);
   min-height: 56px;
@@ -578,7 +597,7 @@ textarea {
   align-items: stretch;
   gap: 4px;
   border: 0;
-  background: transparent;
+  background: var(--panel);
   overflow: hidden;
   isolation: isolate;
 }
@@ -927,6 +946,14 @@ textarea {
   transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease;
 }
 
+.cell.loop-blocked,
+.cell:disabled {
+  cursor: not-allowed;
+  opacity: 0.28;
+  border-color: color-mix(in srgb, var(--line) 75%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 45%, transparent);
+}
+
 .cell.phase-inverted {
   border-color: color-mix(in srgb, var(--phase) 72%, white 28%);
   background-image: repeating-linear-gradient(
@@ -1096,7 +1123,10 @@ textarea {
   height: 112px;
   min-height: 112px;
   max-height: 112px;
-  overflow-x: auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px minmax(0, 1fr);
+  align-items: stretch;
+  overflow-x: hidden;
   overflow-y: hidden;
 }
 
@@ -1137,11 +1167,15 @@ textarea {
 }
 
 .dock-center {
-  width: auto;
-  flex: 0 0 auto;
+  width: 96px;
+  max-width: 96px;
   display: flex;
   align-items: stretch;
   justify-content: center;
+  z-index: 3;
+  padding: 0 4px;
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
 .dock-center-stack {
@@ -1149,6 +1183,7 @@ textarea {
   flex-direction: column;
   gap: 8px;
   align-items: stretch;
+  height: 100%;
 }
 
 .dock-meter {
@@ -1158,9 +1193,10 @@ textarea {
 .mute-btn {
   border: 2px solid color-mix(in srgb, var(--line) 88%, white 12%);
   border-radius: 6px;
-  width: auto;
-  min-width: 64px;
-  height: 100%;
+  width: 100%;
+  max-width: 88px;
+  min-width: 0;
+  height: auto;
   aspect-ratio: 1 / 1;
   padding: 0;
   background: color-mix(in srgb, var(--surface) 76%, black 24%);
@@ -1169,6 +1205,8 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  align-self: center;
+  flex: 0 0 auto;
 }
 
 .mute-btn.muted {
@@ -1407,5 +1445,27 @@ textarea {
 
   .matrix-wrap {
     min-height: 460px;
+  }
+}
+
+@media (max-width: 900px) {
+  .matrix-grid {
+    grid-auto-rows: 92px;
+  }
+  .topbar {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+}
+
+@media (max-width: 640px) {
+  .matrix-grid {
+    grid-auto-rows: 78px;
+  }
+  .label-main {
+    font-size: var(--font-size-md);
+  }
+  .label-sub {
+    display: none;
   }
 }

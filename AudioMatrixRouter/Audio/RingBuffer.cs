@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace AudioMatrixRouter.Audio;
 
 /// <summary>
@@ -11,6 +13,9 @@ public class RingBuffer
     private readonly int _channels;
     private readonly object _cursorLock = new();
     private readonly Dictionary<string, int> _consumerReadPos = new(StringComparer.Ordinal);
+    private long _totalFramesDropped;
+
+    public long TotalFramesDropped => Interlocked.Read(ref _totalFramesDropped);
 
     public RingBuffer(int frameCount, int channels)
     {
@@ -98,6 +103,10 @@ public class RingBuffer
 
                     int advance = unread - allowedUnread;
                     _consumerReadPos[key] = (rp + advance) % _capacity;
+                    if (_channels > 0)
+                    {
+                        Interlocked.Add(ref _totalFramesDropped, advance / _channels);
+                    }
                 }
             }
         }

@@ -16,6 +16,11 @@ public class ActiveDevice
     public int OutputDelayMs { get; set; }
     public string ConsumerId { get; set; } = string.Empty;
     public long InputOverflowCount;
+    public int CaptureLatencyMs { get; set; }
+    public int RenderLatencyMs { get; set; }
+    public bool IsLoopback { get; set; }
+    // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
+    public float[]? PeakLevels;
 }
 
 public class AudioEngine : IDisposable
@@ -70,7 +75,11 @@ public class AudioEngine : IDisposable
             ? (queuedFrames * 1000.0) / input.Info.SampleRate
             : 0;
 
-        latencyMs = captureQueueMs + RenderPeriodMs + output.OutputDelayMs;
+        // Real driver latencies queried at Start(); fall back to the requested period if unavailable.
+        int captureDriverMs = input.CaptureLatencyMs > 0 ? input.CaptureLatencyMs : _captureBufferMs;
+        int renderDriverMs = output.RenderLatencyMs > 0 ? output.RenderLatencyMs : RenderPeriodMs;
+
+        latencyMs = captureDriverMs + captureQueueMs + renderDriverMs + output.OutputDelayMs;
         return true;
     }
 
@@ -139,9 +148,43 @@ public class AudioEngine : IDisposable
 
     public List<DeviceInfo> GetAvailableDevices(DataFlow flow) => _enumerator.GetDevices(flow);
 
+    /// <summary>
+    /// Returns DeviceInfo entries usable as capture inputs. Render devices are also returned as
+    /// loopback sources (their Id is prefixed with "loop:" to disambiguate from real capture endpoints).
+    /// </summary>
+    public List<DeviceInfo> GetAvailableInputDevices(bool includeCapture, bool includeLoopback)
+    {
+        var list = new List<DeviceInfo>();
+        if (includeCapture)
+        {
+            list.AddRange(_enumerator.GetDevices(DataFlow.Capture));
+        }
+        if (includeLoopback)
+        {
+            foreach (var d in _enumerator.GetDevices(DataFlow.Render))
+            {
+                list.Add(new DeviceInfo($"loop:{d.Id}", $"{d.Name} (loopback)", d.Channels, d.SampleRate, DataFlow.Render));
+            }
+        }
+        return list;
+    }
+
     public bool AddInputDevice(string deviceId)
     {
+        if (string.IsNullOrWhiteSpace(deviceId)) return false;
         if (_inputDevices.Any(d => d.Info.Id == deviceId)) return false;
+
+        bool isLoopback = deviceId.StartsWith("loop:", StringComparison.Ordinal);
+        if (isLoopback)
+        {
+            var renderId = deviceId.Substring("loop:".Length);
+            var render = _enumerator.GetDevices(DataFlow.Render).FirstOrDefault(d => d.Id == renderId);
+            if (render == null) return false;
+            var info = new DeviceInfo(deviceId, $"{render.Name} (loopback)", render.Channels, render.SampleRate, DataFlow.Render);
+            _inputDevices.Add(new ActiveDevice { Info = info, IsLoopback = true });
+            RecalcChannelOffsets();
+            return true;
+        }
 
         var devices = _enumerator.GetDevices(DataFlow.Capture);
         var found = devices.FirstOrDefault(d => d.Id == deviceId);
@@ -267,27 +310,53 @@ public class AudioEngine : IDisposable
             // Setup captures
             foreach (var dev in _inputDevices)
             {
-                var mmDevice = _enumerator.GetDevice(dev.Info.Id);
+                var mmDevice = _enumerator.GetDevice(dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
+                    ? dev.Info.Id.Substring("loop:".Length)
+                    : dev.Info.Id);
                 if (mmDevice == null) continue;
 
                 int ringFrames = Math.Max(dev.Info.SampleRate * _captureBufferMs / 1000, dev.Info.SampleRate / 200);
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
-                dev.Capture = new WasapiCapture(mmDevice, true, _captureBufferMs);
+                dev.PeakLevels = new float[dev.Info.Channels];
+                if (dev.IsLoopback)
+                {
+                    var loop = new WasapiLoopbackCapture(mmDevice);
+                    dev.Capture = loop;
+                }
+                else
+                {
+                    dev.Capture = new WasapiCapture(mmDevice, true, _captureBufferMs);
+                }
                 dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
+                int channels = dev.Info.Channels;
                 dev.Capture.DataAvailable += (s, e) =>
                 {
-                    // Convert bytes to floats and push to ring buffer
                     int floatCount = e.BytesRecorded / 4;
-                    int frames = floatCount / dev.Info.Channels;
+                    int frames = floatCount / channels;
                     var floats = new float[floatCount];
                     Buffer.BlockCopy(e.Buffer, 0, floats, 0, e.BytesRecorded);
+                    var peaks = dev.PeakLevels;
+                    if (peaks != null)
+                    {
+                        for (int f = 0; f < frames; f++)
+                        {
+                            int baseIdx = f * channels;
+                            for (int c = 0; c < channels; c++)
+                            {
+                                float v = floats[baseIdx + c];
+                                if (v < 0) v = -v;
+                                if (v > peaks[c]) peaks[c] = v;
+                            }
+                        }
+                    }
                     if (!dev.RingBuffer.Write(floats, 0, frames))
                     {
                         Interlocked.Increment(ref dev.InputOverflowCount);
                     }
                 };
                 dev.Capture.StartRecording();
+                dev.CaptureLatencyMs = _captureBufferMs;
             }
 
             var sources = _inputDevices
@@ -312,9 +381,10 @@ public class AudioEngine : IDisposable
                     dev.ConsumerId,
                     _syncCoordinator);
 
-                dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, 10);
+                dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, RenderPeriodMs);
                 dev.Render.Init(dev.MixProvider);
                 dev.Render.Play();
+                dev.RenderLatencyMs = RenderPeriodMs;
             }
 
             _running = true;
@@ -420,7 +490,18 @@ public class AudioEngine : IDisposable
         var captureDevices = _enumerator.GetDevices(DataFlow.Capture);
         var renderDevices = _enumerator.GetDevices(DataFlow.Render);
 
-        bool changed = _inputDevices.Any(d => !captureDevices.Any(cd => cd.Id == d.Info.Id))
+        static bool IsInputStillAvailable(ActiveDevice input, List<DeviceInfo> captures, List<DeviceInfo> renders)
+        {
+            if (input.IsLoopback && input.Info.Id.StartsWith("loop:", StringComparison.Ordinal))
+            {
+                var renderId = input.Info.Id.Substring("loop:".Length);
+                return renders.Any(r => r.Id == renderId);
+            }
+
+            return captures.Any(c => c.Id == input.Info.Id);
+        }
+
+        bool changed = _inputDevices.Any(d => !IsInputStillAvailable(d, captureDevices, renderDevices))
             || _outputDevices.Any(d => !renderDevices.Any(rd => rd.Id == d.Info.Id));
 
         if (!changed)
@@ -437,7 +518,7 @@ public class AudioEngine : IDisposable
 
         for (int i = _inputDevices.Count - 1; i >= 0; i--)
         {
-            if (!captureDevices.Any(d => d.Id == _inputDevices[i].Info.Id))
+            if (!IsInputStillAvailable(_inputDevices[i], captureDevices, renderDevices))
             {
                 _inputDevices.RemoveAt(i);
             }

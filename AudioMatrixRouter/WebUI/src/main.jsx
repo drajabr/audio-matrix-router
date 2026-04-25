@@ -14,14 +14,17 @@ ReactDOM.createRoot(document.getElementById("root")).render(
 );
 
 if ("serviceWorker" in navigator) {
+  // Caching disabled globally (web + desktop): unregister every service worker and clear Cache API stores.
   window.addEventListener("load", async () => {
-    // Keep service workers disabled for this app to avoid stale cached bundles on Pages.
+    try {
     const registrations = await navigator.serviceWorker.getRegistrations();
     await Promise.all(registrations.map((registration) => registration.unregister()));
-
-    if ("caches" in window) {
-      const keys = await caches.keys();
-      await Promise.all(keys.map((key) => caches.delete(key)));
+      if ("caches" in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((key) => caches.delete(key)));
+      }
+    } catch (_) {
+      // Non-fatal: app remains usable even if cleanup fails.
     }
   });
 }

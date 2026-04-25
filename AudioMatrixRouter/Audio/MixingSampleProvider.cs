@@ -130,6 +130,7 @@ public class MixingSampleProvider : ISampleProvider
     private float[] _delayBuffer = [];
     private int _delayWriteIndex;
     private long _underrunCount;
+    private readonly float[] _peakLevels;
 
     public record struct CaptureSource(RingBuffer Buffer, int GlobalChannelOffset, int Channels);
 
@@ -151,12 +152,40 @@ public class MixingSampleProvider : ISampleProvider
         _consumerId = consumerId;
         _syncCoordinator = syncCoordinator;
         _waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, outputChannels);
+        _peakLevels = new float[outputChannels];
         _syncCoordinator.RegisterConsumer(_consumerId);
         SetOutputDelayMs(outputDelayMs);
     }
 
     public WaveFormat WaveFormat => _waveFormat;
     public long UnderrunCount => Interlocked.Read(ref _underrunCount);
+
+    /// <summary>
+    /// Returns a snapshot of per-output-channel peak levels (0..1) without resetting.
+    /// </summary>
+    public float[] PeekPeakLevels()
+    {
+        var snapshot = new float[_peakLevels.Length];
+        for (int i = 0; i < _peakLevels.Length; i++)
+        {
+            snapshot[i] = _peakLevels[i];
+        }
+        return snapshot;
+    }
+
+    /// <summary>
+    /// Returns a snapshot of per-output-channel peak levels (0..1) and resets the running peaks.
+    /// </summary>
+    public float[] SamplePeakLevels()
+    {
+        var snapshot = new float[_peakLevels.Length];
+        for (int i = 0; i < _peakLevels.Length; i++)
+        {
+            snapshot[i] = _peakLevels[i];
+            _peakLevels[i] = 0f;
+        }
+        return snapshot;
+    }
 
     public void SetOutputDelayMs(int delayMs)
     {
@@ -242,6 +271,19 @@ public class MixingSampleProvider : ISampleProvider
         FitMixedFramesToOutput(buffer, offset, frames, sourceFrames);
 
         ApplyOutputDelay(buffer, offset, count);
+
+        // Per-channel peak after delay (what actually leaves the device).
+        for (int f = 0; f < frames; f++)
+        {
+            int baseIdx = offset + f * _outputChannels;
+            for (int c = 0; c < _outputChannels; c++)
+            {
+                float v = buffer[baseIdx + c];
+                if (v < 0) v = -v;
+                if (v > _peakLevels[c]) _peakLevels[c] = v;
+            }
+        }
+
         _syncCoordinator.OnFramesRendered(_consumerId, frames);
 
         return count;
