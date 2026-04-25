@@ -829,6 +829,7 @@ export default function App({ runtime = "web" }) {
   const latencyJitterRef = useRef(0);
   const nativeInputPeakTargetsRef = useRef({});
   const nativeOutputPeakTargetsRef = useRef({});
+  const localEditHoldUntilRef = useRef(0);
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -1072,12 +1073,15 @@ export default function App({ runtime = "web" }) {
           return Array.from({ length: ch }, (_, idx) => ({ id: `ch:${o.deviceId}:${idx}` }));
         });
 
-        const nextNativeMatrix = buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols);
-        setMatrixByView((prev) => {
-          if (matrixByViewEqual(prev, nextNativeMatrix)) return prev;
-          matrixRef.current = nextNativeMatrix;
-          return nextNativeMatrix;
-        });
+        const now = performance.now();
+        if (now >= localEditHoldUntilRef.current) {
+          const nextNativeMatrix = buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols);
+          setMatrixByView((prev) => {
+            if (matrixByViewEqual(prev, nextNativeMatrix)) return prev;
+            matrixRef.current = nextNativeMatrix;
+            return nextNativeMatrix;
+          });
+        }
 
         const masterInput = (Array.isArray(state?.inputs) ? state.inputs : []).find((d) => d?.isMaster)?.deviceId || "";
         const masterOutput = (Array.isArray(state?.outputs) ? state.outputs : []).find((d) => d?.isMaster)?.deviceId || "";
@@ -1330,7 +1334,8 @@ export default function App({ runtime = "web" }) {
     });
   }, [visibleOutputs, outputLabels, viewMode, outputMasterId]);
 
-  const cellSize = viewMode === "channel" ? CHANNEL_CELL_SIZE : DEVICE_CELL_SIZE;
+  // One base unit everywhere: device view is a span of channel-sized cells.
+  const cellSize = CHANNEL_CELL_SIZE;
 
   const activeMatrix = matrixByView[viewMode] || {};
 
@@ -1424,6 +1429,13 @@ export default function App({ runtime = "web" }) {
     if (routesPayload.length > 0) {
       try {
         await window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload });
+        localEditHoldUntilRef.current = 0;
+        try {
+          const refreshed = await window.__nativeBridgeInvoke("getState", {});
+          window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
+        } catch (_) {
+          // no-op
+        }
       } catch (_) {
         // Backward-compatible fallback for hosts that only expose setCrosspoint.
         await Promise.all(routesPayload.map((route) => {
@@ -1435,6 +1447,13 @@ export default function App({ runtime = "web" }) {
           };
           return window.__nativeBridgeInvoke("setCrosspoint", legacy);
         }));
+        localEditHoldUntilRef.current = 0;
+        try {
+          const refreshed = await window.__nativeBridgeInvoke("getState", {});
+          window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
+        } catch (_) {
+          // no-op
+        }
       }
     }
   };
@@ -1670,12 +1689,44 @@ export default function App({ runtime = "web" }) {
       } else {
         await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
         const devices = await navigator.mediaDevices.enumerateDevices();
+
+        const readInputChannelCount = async (deviceId) => {
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                deviceId: deviceId ? { exact: deviceId } : undefined,
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+              },
+              video: false,
+            });
+            const track = stream.getAudioTracks()[0];
+            const settings = track?.getSettings?.() || {};
+            const capabilities = track?.getCapabilities?.() || {};
+            const fromSettings = Number.isFinite(settings.channelCount) ? Math.floor(settings.channelCount) : 0;
+            const fromCapsMax = Number.isFinite(capabilities?.channelCount?.max) ? Math.floor(capabilities.channelCount.max) : 0;
+            const fromCapsMin = Number.isFinite(capabilities?.channelCount?.min) ? Math.floor(capabilities.channelCount.min) : 0;
+            stream.getTracks().forEach((t) => t.stop());
+            return Math.max(1, fromSettings || fromCapsMax || fromCapsMin || 2);
+          } catch (_) {
+            return 2;
+          }
+        };
+
+        const inputCandidates = devices
+          .filter((d) => d.kind === "audioinput" && d.deviceId !== "default" && d.deviceId !== "communications");
+        const discoveredInputChannels = {};
+        await Promise.all(inputCandidates.map(async (d) => {
+          discoveredInputChannels[d.deviceId] = await readInputChannelCount(d.deviceId);
+        }));
+
         discoveredInputs = devices
           .filter((d) => d.kind === "audioinput" && d.deviceId !== "default" && d.deviceId !== "communications")
           .map((d, i) => ({
             deviceId: d.deviceId,
             label: d.label || `Input ${i + 1}`,
-            channels: 2,
+            channels: Math.max(1, discoveredInputChannels[d.deviceId] || 2),
           }));
 
         discoveredOutputs = devices
@@ -2036,6 +2087,12 @@ export default function App({ runtime = "web" }) {
 
   const updateConnection = (rowId, colId, updater) => {
     if (locked) return;
+
+    if (hasNativeBridge) {
+      // Hold native matrix overwrite briefly so click feedback isn't immediately reverted
+      // while the setCrosspoints round-trip is still in flight.
+      localEditHoldUntilRef.current = performance.now() + 1200;
+    }
 
     const key = getCellKey(rowId, colId);
     let shouldReloadForMasterSwitch = false;
@@ -2497,6 +2554,9 @@ export default function App({ runtime = "web" }) {
   const scaledCellSize = Math.round(cellSize * uiScale.scale);
   const scaledSourceWidth = Math.round(labelSizing.sourceWidth * uiScale.scale);
   const scaledDestinationHeight = Math.round(labelSizing.destinationHeight * uiScale.scale);
+  const matrixColumnCount = viewMode === "device"
+    ? Math.max(1, cols.reduce((acc, col) => acc + Math.max(1, col.channelCount || 1), 0))
+    : Math.max(cols.length, 1);
 
   const cycleCaptureBuffer = () => {
     if (locked || isApplyingCaptureBuffer) return;
@@ -2926,7 +2986,7 @@ export default function App({ runtime = "web" }) {
           <div
             className={`matrix-grid${selectedCell ? " has-selection" : ""}${showResizeGuides ? " show-resize-guides" : ""}`}
             style={{
-              gridTemplateColumns: `${scaledSourceWidth}px repeat(${Math.max(cols.length, 1)}, ${scaledCellSize}px)`,
+              gridTemplateColumns: `${scaledSourceWidth}px repeat(${matrixColumnCount}, ${scaledCellSize}px)`,
               gridTemplateRows: `${scaledDestinationHeight}px`,
               gridAutoRows: `${scaledCellSize}px`,
             }}
@@ -3038,7 +3098,7 @@ export default function App({ runtime = "web" }) {
 
               const channelCount = Math.max(1, col.channelCount || 1);
               const isActive = activeRoutes.has(col.id) || (col.pairedIds || []).some((pid) => activeRoutes.has(pid));
-              const span = viewMode === "channel" ? channelCount : 1;
+              const span = channelCount;
               const colChannelLevels = getColChannelLevels(col);
 
               const isColSelected = selectedCell?.colId === col.id || (col.pairedIds || []).some((pid) => selectedCell?.colId === pid);
@@ -3101,6 +3161,7 @@ export default function App({ runtime = "web" }) {
               const isRowAxisActive = selectedCell?.rowId === row.id || (row.pairedIds || []).some((pid) => selectedCell?.rowId === pid);
               const skipHead = viewMode === "channel" && !row.isChannelStart;
               const rowChannelLevels = getRowChannelLevels(row);
+              const rowSpan = viewMode === "device" ? channelCount : 1;
               return (
               <React.Fragment key={row.id}>
                 {!skipHead && (
@@ -3114,7 +3175,7 @@ export default function App({ runtime = "web" }) {
 
                   ].filter(Boolean).join(" ")}
                   title={`${row.fullLabel || row.label}\nDouble-click to set input master`}
-                  style={viewMode === "channel" && channelCount > 1 ? { gridRow: `span ${channelCount}` } : undefined}
+                  style={channelCount > 1 ? { gridRow: `span ${channelCount}` } : undefined}
                   draggable={!locked}
                   onDragStart={beginSortDrag("source", row.deviceId)}
                   onDragEnd={endSortDrag("source")}
@@ -3161,8 +3222,20 @@ export default function App({ runtime = "web" }) {
                   const isMenuOpen = tileMenuCell?.rowId === row.id && tileMenuCell?.colId === col.id;
                   const isMenuDropUp = !!tileMenuCell?.dropUp;
                   const isGainAdjustOpen = gainAdjustCell?.rowId === row.id && gainAdjustCell?.colId === col.id;
+                  const colSpan = viewMode === "device" ? Math.max(1, col.channelCount || 1) : 1;
+                  const tileWidth = scaledCellSize * colSpan + GRID_GAP_SIZE * (colSpan - 1);
+                  const tileHeight = scaledCellSize * rowSpan + GRID_GAP_SIZE * (rowSpan - 1);
                   return (
-                      <div key={key} className="tile-cell-wrap" style={{ width: `${scaledCellSize}px`, height: `${scaledCellSize}px` }}>
+                      <div
+                        key={key}
+                        className="tile-cell-wrap"
+                        style={{
+                          width: `${tileWidth}px`,
+                          height: `${tileHeight}px`,
+                          ...(rowSpan > 1 ? { gridRow: `span ${rowSpan}` } : {}),
+                          ...(colSpan > 1 ? { gridColumn: `span ${colSpan}` } : {}),
+                        }}
+                      >
                       <button
                         type="button"
                         className={[
@@ -3174,7 +3247,7 @@ export default function App({ runtime = "web" }) {
                           selectedCell && row.id === selectedCell.rowId && "active-row",
                           selectedCell && col.id === selectedCell.colId && "active-col",
                         ].filter(Boolean).join(" ")}
-                        style={{ width: `${scaledCellSize}px`, height: `${scaledCellSize}px` }}
+                        style={{ width: `${tileWidth}px`, height: `${tileHeight}px` }}
                         onMouseEnter={() => {
                           if (locked) return;
                           if (dragScrollRef.current.dragging) return;
