@@ -400,7 +400,7 @@ public class AudioEngine : IDisposable
 
     public bool SetCaptureBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 5, 100);
+        int clamped = Math.Clamp(bufferMs, 5, 200);
         if (_captureBufferMs == clamped)
         {
             return true;

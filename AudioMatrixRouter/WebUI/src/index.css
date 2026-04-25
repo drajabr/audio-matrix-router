@@ -635,6 +635,7 @@ textarea {
   position: sticky;
   left: 0;
   z-index: 24;
+  background: var(--panel);
   display: grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   align-items: stretch;
@@ -645,6 +646,7 @@ textarea {
   position: sticky;
   top: 0;
   z-index: 24;
+  background: var(--panel);
   display: grid;
   grid-template-rows: minmax(0, 1fr) 28px;
   align-items: stretch;
@@ -865,6 +867,7 @@ textarea {
   display: block;
   height: 100%;
   background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 24%, transparent), color-mix(in srgb, var(--accent-hl) 34%, transparent));
+  transition: width 70ms linear;
 }
 
 .card-meter-bg-row-split {
@@ -879,6 +882,7 @@ textarea {
   border-radius: var(--radius-micro);
   border: 0;
   background: linear-gradient(90deg, color-mix(in srgb, var(--accent) 22%, transparent), color-mix(in srgb, var(--accent-hl) 32%, transparent));
+  transition: width 70ms linear;
 }
 
 .card-meter-bg-col-split {
@@ -896,6 +900,7 @@ textarea {
   width: 100%;
   background: linear-gradient(0deg, color-mix(in srgb, var(--accent) 20%, transparent), color-mix(in srgb, var(--accent-hl) 32%, transparent));
   align-self: end;
+  transition: height 70ms linear;
 }
 
 .resize-handle {

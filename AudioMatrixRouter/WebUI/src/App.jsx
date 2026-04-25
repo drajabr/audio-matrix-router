@@ -4,6 +4,7 @@ const APP_VERSION = __APP_VERSION__;
 const STORAGE_KEY = "audio-router-matrix-v3";
 const DB_MIN = -60;
 const DB_MAX = 12;
+const GLOBAL_MUTE_GAIN_DB = -90;
 const DEVICE_CELL_SIZE = 112;
 const GRID_GAP_SIZE = 4;
 const CHANNEL_CELL_SIZE = (DEVICE_CELL_SIZE - GRID_GAP_SIZE) / 2;
@@ -21,9 +22,9 @@ const FONT_SIZE_KEY = "amrFontSizePreference";
 const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
-const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 29 }, (_, i) => 10 + i * 5);
+const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
 const CAPTURE_BUFFER_MIN = 10;
-const CAPTURE_BUFFER_MAX = 150;
+const CAPTURE_BUFFER_MAX = 200;
 const CAPTURE_BUFFER_DEFAULT = 40;
 
 const BACKGROUND_PRESETS = [
@@ -67,14 +68,26 @@ const FONT_SIZE_PRESETS = [
 ];
 
 const UI_SCALE_PRESETS = [
-  { key: "xxxs", label: "XXXS", scale: 0.70 },
-  { key: "xxs", label: "XXS", scale: 0.78 },
-  { key: "xs", label: "XS", scale: 0.86 },
-  { key: "sm", label: "SM", scale: 0.93 },
-  { key: "md", label: "MD", scale: 1.0 },
-  { key: "lg", label: "LG", scale: 1.08 },
-  { key: "xl", label: "XL", scale: 1.16 },
+  { key: "xxxs", label: "XXS", scale: 0.70 },
+  { key: "xxs", label: "XS", scale: 0.78 },
+  { key: "xs", label: "SM", scale: 0.86 },
+  { key: "sm", label: "MD", scale: 0.93 },
+  { key: "md", label: "LG", scale: 1.0 },
+  { key: "lg", label: "XL", scale: 1.08 },
+  { key: "xl", label: "XXL", scale: 1.16 },
 ];
+
+function getDynamicLabelSquareMax(uiScale = 1) {
+  if (typeof window === "undefined") return LABEL_SQUARE_MAX;
+  const viewportWidth = window.visualViewport?.width ?? window.innerWidth ?? LABEL_SQUARE_MAX;
+  const viewportHeight = window.visualViewport?.height ?? window.innerHeight ?? LABEL_SQUARE_MAX;
+  const available = Math.min(viewportWidth, viewportHeight) / Math.max(uiScale, 0.65);
+  return Math.max(LABEL_SQUARE_MAX, Math.round(available * 0.68));
+}
+
+function shapeMeterLevel(value) {
+  return clamp(Math.pow(clamp(Number(value) || 0, 0, 1), 0.72), 0, 1);
+}
 
 function ensureNativeBridge() {
   if (typeof window === "undefined" || !window.chrome?.webview) return false;
@@ -364,6 +377,39 @@ function collectConfiguredDeviceIds(matrixByView) {
   });
 
   return { configuredInputIds, configuredOutputIds };
+}
+
+function extractRouteDeviceIds(key) {
+  const [rowId, colId] = String(key || "").split("::");
+  const rowParsed = rowId?.startsWith("dev:") ? { deviceId: rowId.slice(4) } : parseChannelId(rowId);
+  const colParsed = colId?.startsWith("dev:") ? { deviceId: colId.slice(4) } : parseChannelId(colId);
+  if (!rowParsed?.deviceId || !colParsed?.deviceId) return null;
+  return {
+    inputDeviceId: rowParsed.deviceId,
+    outputDeviceId: colParsed.deviceId,
+  };
+}
+
+function mergeDormantRoutes(visibleView, persistedView, activeInputIds, activeOutputIds) {
+  const merged = { ...(visibleView || {}) };
+  Object.entries(persistedView || {}).forEach(([key, conn]) => {
+    if (key in merged) return;
+    const routeIds = extractRouteDeviceIds(key);
+    if (!routeIds) return;
+    const keepDormant = !activeInputIds.has(routeIds.inputDeviceId) || !activeOutputIds.has(routeIds.outputDeviceId);
+    if (!keepDormant) return;
+    merged[key] = sanitizeConnection(conn);
+  });
+  return merged;
+}
+
+function mergeMatrixByViewWithDormantRoutes(visibleMatrixByView, persistedMatrixByView, inputs, outputs) {
+  const activeInputIds = new Set((inputs || []).map((input) => input.deviceId).filter(Boolean));
+  const activeOutputIds = new Set((outputs || []).map((output) => output.deviceId).filter(Boolean));
+  return {
+    device: mergeDormantRoutes(visibleMatrixByView?.device, persistedMatrixByView?.device, activeInputIds, activeOutputIds),
+    channel: mergeDormantRoutes(visibleMatrixByView?.channel, persistedMatrixByView?.channel, activeInputIds, activeOutputIds),
+  };
 }
 
 function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols, masterGainOffsetDb = 0) {
@@ -870,6 +916,10 @@ export default function App({ runtime = "web" }) {
   const meterFrameRef = useRef({ lastTs: 0 });
   const inputAutoZoomRef = useRef(new Map());
   const outputAutoZoomRef = useRef(new Map());
+  // Mirror channel-meta state in refs so sync effects can read latest offsets
+  // without peak-level updates triggering the entire setCrosspoints re-run.
+  const nativeInputChannelMetaRef = useRef({});
+  const nativeOutputChannelMetaRef = useRef({});
   const jitterUiRef = useRef({ lastTs: 0, lastValue: null });
   const wheelDragRef = useRef(null);
   const wheelDragSuppressClickRef = useRef(false);
@@ -1063,6 +1113,7 @@ export default function App({ runtime = "web" }) {
           peakLevels,
         };
       });
+      nativeInputChannelMetaRef.current = inMeta;
       setNativeInputChannelMeta(inMeta);
 
       const outMeta = {};
@@ -1080,6 +1131,7 @@ export default function App({ runtime = "web" }) {
           peakLevels,
         };
       });
+      nativeOutputChannelMetaRef.current = outMeta;
       setNativeOutputChannelMeta(outMeta);
 
       if (hasNativeBridge && inputs.length > 0 && outputs.length > 0) {
@@ -1342,8 +1394,8 @@ export default function App({ runtime = "web" }) {
     const syncVersion = ++nativeSyncVersionRef.current;
     const findInput = (id) => inputs.find((d) => d?.deviceId === id);
     const findOutput = (id) => outputs.find((d) => d?.deviceId === id);
-    const getInputOffset = (id) => Number.isFinite(nativeInputChannelMeta[id]?.offset) ? nativeInputChannelMeta[id].offset : null;
-    const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMeta[id]?.offset) ? nativeOutputChannelMeta[id].offset : null;
+    const getInputOffset = (id) => Number.isFinite(nativeInputChannelMetaRef.current[id]?.offset) ? nativeInputChannelMetaRef.current[id].offset : null;
+    const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMetaRef.current[id]?.offset) ? nativeOutputChannelMetaRef.current[id].offset : null;
 
     const active = !!connection?.on;
     const routeGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
@@ -1512,10 +1564,14 @@ export default function App({ runtime = "web" }) {
     controlsCollapsed,
     showAllDevices,
     powerOn,
+    locked,
     inputLabels,
     outputLabels,
+    inputMasterId,
+    outputMasterId,
     viewMode,
     labelSizing,
+    matrixByView: matrixRef.current,
     inputOrder: inputs.map((d) => d.deviceId),
     outputOrder: outputs.map((d) => d.deviceId),
     ...overrides,
@@ -1536,10 +1592,14 @@ export default function App({ runtime = "web" }) {
             controlsCollapsed: next?.controlsCollapsed,
             showAllDevices: next?.showAllDevices,
             powerOn: next?.powerOn,
+            locked: next?.locked,
             inputLabels: next?.inputLabels,
             outputLabels: next?.outputLabels,
+            inputMasterId: next?.inputMasterId,
+            outputMasterId: next?.outputMasterId,
             viewMode: next?.viewMode,
             labelSizing: next?.labelSizing,
+            matrixByView: next?.matrixByView,
             inputOrder: next?.inputOrder,
             outputOrder: next?.outputOrder,
           }
@@ -1783,14 +1843,6 @@ export default function App({ runtime = "web" }) {
       const orderedOutputs = sortByOrder(discoveredOutputs, savedOutputOrder);
 
       const currentMatrixByView = matrixRef.current || {};
-      const activeDeviceMatrix =
-        Object.keys(currentMatrixByView.device || {}).length > 0
-          ? currentMatrixByView.device
-          : saved?.matrixByView?.device || saved?.matrixState || {};
-      const activeChannelMatrix =
-        Object.keys(currentMatrixByView.channel || {}).length > 0
-          ? currentMatrixByView.channel
-          : saved?.matrixByView?.channel || {};
       setInputs(orderedInputs);
       setOutputs(orderedOutputs);
       devicesDiscoveredRef.current = true;
@@ -1811,12 +1863,18 @@ export default function App({ runtime = "web" }) {
         return Array.from({ length: ch }, (_, idx) => ({ id: `ch:${o.deviceId}:${idx}` }));
       });
 
-      const sourceDeviceMatrix = Object.keys(currentMatrixByView.device || {}).length > 0
-        ? currentMatrixByView.device
-        : saved?.matrixByView?.device || saved?.matrixState || {};
-      const sourceChannelMatrix = Object.keys(currentMatrixByView.channel || {}).length > 0
-        ? currentMatrixByView.channel
-        : saved?.matrixByView?.channel || {};
+      const persistedMatrixByView = {
+        device: {
+          ...(saved?.matrixByView?.device || saved?.matrixState || {}),
+          ...(currentMatrixByView.device || {}),
+        },
+        channel: {
+          ...(saved?.matrixByView?.channel || {}),
+          ...(currentMatrixByView.channel || {}),
+        },
+      };
+      const sourceDeviceMatrix = persistedMatrixByView.device;
+      const sourceChannelMatrix = persistedMatrixByView.channel;
 
       const savedBackedMatrixByView = {
         device: createMatrix(deviceRows, deviceCols, sourceDeviceMatrix),
@@ -1834,17 +1892,24 @@ export default function App({ runtime = "web" }) {
           )
         : null;
 
-      const nextMatrixByView = nativeMatrixByView || savedBackedMatrixByView;
+      const nextMatrixByView = mergeMatrixByViewWithDormantRoutes(
+        nativeMatrixByView || savedBackedMatrixByView,
+        persistedMatrixByView,
+        orderedInputs,
+        orderedOutputs,
+      );
 
       const nextViewMode = saved?.viewMode === "channel" ? "channel" : "device";
       const hasSavedLabelSizing = !!saved?.labelSizing;
       const fallbackSource = DEFAULT_LABEL_SQUARE_SIZE;
+      const persistedUiScale = UI_SCALE_PRESETS.find((preset) => preset.key === saved?.uiScaleKey)?.scale
+        ?? (UI_SCALE_PRESETS[uiScaleIndex] || UI_SCALE_PRESETS[2]).scale;
       const seedSquare = clamp(
         hasSavedLabelSizing
           ? saved?.labelSizing?.sourceWidth ?? saved?.labelSizing?.destinationHeight ?? fallbackSource
           : fallbackSource,
         LABEL_SQUARE_MIN,
-        LABEL_SQUARE_MAX,
+        getDynamicLabelSquareMax(persistedUiScale),
       );
       const nextLabelSizing = {
         sourceWidth: seedSquare,
@@ -2190,9 +2255,10 @@ export default function App({ runtime = "web" }) {
     if (locked) return;
 
     if (hasNativeBridge) {
-      // Hold native matrix overwrite briefly so click feedback isn't immediately reverted
-      // while the native mutation round-trip is still in flight.
-      localEditHoldUntilRef.current = performance.now() + 250;
+      // Hold native matrix overwrite long enough that native confirms the user's edit
+      // before applyNativeState can flip it back. The native push cycle is ~200ms;
+      // 600ms covers 3 cycles to give the bridge time to confirm the change.
+      localEditHoldUntilRef.current = performance.now() + 600;
     }
 
     const key = getCellKey(rowId, colId);
@@ -2275,6 +2341,8 @@ export default function App({ runtime = "web" }) {
             },
           };
         }
+      } else {
+        next.channel = convertDeviceMatrixToChannelMatrix(nextModeMatrix, prev.channel || {});
       }
 
       const deviceMatrix = next.device || {};
@@ -2409,7 +2477,11 @@ export default function App({ runtime = "web" }) {
 
       if (prevMode === "device" && nextMode === "channel") {
         setMatrixByView((prevMatrix) => {
-          const nextChannelMatrix = convertDeviceMatrixToChannelMatrix(prevMatrix.device || {}, prevMatrix.channel || {});
+          const currentChannelMatrix = prevMatrix.channel || {};
+          const hasCustomChannelRouting = Object.values(currentChannelMatrix).some((conn) => conn?.on);
+          const nextChannelMatrix = hasCustomChannelRouting
+            ? currentChannelMatrix
+            : convertDeviceMatrixToChannelMatrix(prevMatrix.device || {}, currentChannelMatrix);
           const nextMatrix = {
             ...prevMatrix,
             channel: nextChannelMatrix,
@@ -2593,11 +2665,12 @@ export default function App({ runtime = "web" }) {
     const {
       includeMasterGain = true,
       muteAll = false,
+      mode = viewMode,
     } = options;
     const findInput = (id) => inputs.find((d) => d?.deviceId === id);
     const findOutput = (id) => outputs.find((d) => d?.deviceId === id);
-    const getInputOffset = (id) => Number.isFinite(nativeInputChannelMeta[id]?.offset) ? nativeInputChannelMeta[id].offset : null;
-    const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMeta[id]?.offset) ? nativeOutputChannelMeta[id].offset : null;
+    const getInputOffset = (id) => Number.isFinite(nativeInputChannelMetaRef.current[id]?.offset) ? nativeInputChannelMetaRef.current[id].offset : null;
+    const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMetaRef.current[id]?.offset) ? nativeOutputChannelMetaRef.current[id].offset : null;
     const routesPayload = [];
 
     Object.entries(matrix).forEach(([key, conn]) => {
@@ -2608,7 +2681,7 @@ export default function App({ runtime = "web" }) {
         ? clamp(routeGainDb + masterGainDbRef.current, DB_MIN, DB_MAX)
         : routeGainDb;
 
-      if (viewMode === "channel") {
+      if (mode === "channel") {
         const rowParsed = parseChannelId(rowId);
         const colParsed = parseChannelId(colId);
         if (!rowParsed || !colParsed) return;
@@ -2619,8 +2692,8 @@ export default function App({ runtime = "web" }) {
           outChannel: colParsed.channelIndex,
           ...(getInputOffset(rowParsed.deviceId) != null ? { inCh: getInputOffset(rowParsed.deviceId) + rowParsed.channelIndex } : {}),
           ...(getOutputOffset(colParsed.deviceId) != null ? { outCh: getOutputOffset(colParsed.deviceId) + colParsed.channelIndex } : {}),
-          active: !muteAll,
-          gainDb: baseGainDb,
+          active: true,
+          gainDb: muteAll ? GLOBAL_MUTE_GAIN_DB : baseGainDb,
         });
         return;
       }
@@ -2651,8 +2724,8 @@ export default function App({ runtime = "web" }) {
           outChannel: route.outChannel,
           ...(getInputOffset(inputDeviceId) != null ? { inCh: getInputOffset(inputDeviceId) + route.inChannel } : {}),
           ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + route.outChannel } : {}),
-          active: !muteAll,
-          gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+          active: true,
+          gainDb: muteAll ? GLOBAL_MUTE_GAIN_DB : clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
         });
       });
     });
@@ -2670,25 +2743,31 @@ export default function App({ runtime = "web" }) {
       return;
     }
 
+    if (!powerOn) {
+      return;
+    }
+
     if (masterGainSyncTimerRef.current) {
       clearTimeout(masterGainSyncTimerRef.current);
     }
 
-    // Keep tile gain values visually stable while native applies master-offset gains.
-    localEditHoldUntilRef.current = performance.now() + 700;
+    const timeoutId = window.setTimeout(() => {
+      const syncMatrix = matrixRef.current.channel || {};
+      const syncMode = Object.values(syncMatrix).some((conn) => conn?.on) ? "channel" : viewMode;
+      const sourceMatrix = syncMode === "channel" ? syncMatrix : (matrixRef.current[viewMode] || {});
+      const routesPayload = buildNativeRoutesPayload(sourceMatrix, {
+        includeMasterGain: true,
+        muteAll: transientMuteAll,
+        mode: syncMode,
+      });
 
-    const matrix = matrixRef.current[viewMode] || {};
-    const routesPayload = buildNativeRoutesPayload(matrix, {
-      includeMasterGain: true,
-      muteAll: transientMuteAll,
-    });
+      if (routesPayload.length === 0) {
+        return;
+      }
 
-    if (routesPayload.length === 0) {
-      localEditHoldUntilRef.current = 0;
-      return;
-    }
+      localEditHoldUntilRef.current = performance.now() + (transientMuteAll ? 120 : 220);
 
-    window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload })
+      window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload })
         .then((refreshed) => {
           localEditHoldUntilRef.current = 0;
           if (refreshed) {
@@ -2696,8 +2775,7 @@ export default function App({ runtime = "web" }) {
           }
         })
         .catch(async () => {
-          // Avoid flooding native bridge with hundreds of legacy calls on global mute toggles.
-          if (transientMuteAll || routesPayload.length > 128) {
+          if (routesPayload.length > 128) {
             localEditHoldUntilRef.current = 0;
             return;
           }
@@ -2719,7 +2797,10 @@ export default function App({ runtime = "web" }) {
             window.dispatchEvent(new CustomEvent("native-state", { detail: refreshed }));
           }
         });
-  }, [masterGainDb, transientMuteAll, hasNativeBridge, powerOn, viewMode, inputs, outputs, nativeInputChannelMeta, nativeOutputChannelMeta]);
+    }, 0);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [masterGainDb, transientMuteAll, hasNativeBridge, powerOn, viewMode, inputs, outputs]);
 
   const beginResizeSourceWidth = (event) => {
     event.preventDefault();
@@ -2751,9 +2832,10 @@ export default function App({ runtime = "web" }) {
     const onMove = (event) => {
       const state = resizeRef.current;
       if (!state.mode) return;
+      const dynamicLabelSquareMax = getDynamicLabelSquareMax((UI_SCALE_PRESETS[uiScaleIndex] || UI_SCALE_PRESETS[2]).scale);
 
       if (state.mode === "source-width") {
-        const nextSquare = clamp(state.startWidth + (event.clientX - state.startX), LABEL_SQUARE_MIN, LABEL_SQUARE_MAX);
+        const nextSquare = clamp(state.startWidth + (event.clientX - state.startX), LABEL_SQUARE_MIN, dynamicLabelSquareMax);
         setLabelSizing({
           sourceWidth: nextSquare,
           destinationHeight: nextSquare,
@@ -2762,7 +2844,7 @@ export default function App({ runtime = "web" }) {
       }
 
       if (state.mode === "destination-height") {
-        const nextSquare = clamp(state.startHeight + (event.clientY - state.startY), LABEL_SQUARE_MIN, LABEL_SQUARE_MAX);
+        const nextSquare = clamp(state.startHeight + (event.clientY - state.startY), LABEL_SQUARE_MIN, dynamicLabelSquareMax);
         setLabelSizing({
           sourceWidth: nextSquare,
           destinationHeight: nextSquare,
@@ -2787,7 +2869,7 @@ export default function App({ runtime = "web" }) {
       window.removeEventListener("mouseup", onUp);
       document.body.style.cursor = "";
     };
-  }, [labelSizing, viewMode, inputLabels, outputLabels, inputMasterId, outputMasterId, matrixByView]);
+  }, [labelSizing, viewMode, inputLabels, outputLabels, inputMasterId, outputMasterId, matrixByView, uiScaleIndex]);
 
   const selectedRouteText = detailCell
     ? `${rows.find((r) => r.id === detailCell.rowId)?.label || "Input"} -> ${
@@ -2853,7 +2935,7 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const scaled = autoScaleLevels(peaks, inputAutoZoomRef, `in-split:${devId}`);
+        const scaled = peaks.map((value) => shapeMeterLevel(value));
         const first = scaled[0] ?? 0;
         const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
@@ -2866,8 +2948,8 @@ export default function App({ runtime = "web" }) {
     const right = inputLevels[rightId] ?? managerRef.current.getInputLevel(rightId) ?? 0;
     const scaled = autoScaleLevels([left, ch > 1 ? right : left], inputAutoZoomRef, `in-split:${devId}`);
     return [
-      scaled[0] ?? 0,
-      scaled[1] ?? 0,
+      shapeMeterLevel(scaled[0] ?? 0),
+      shapeMeterLevel(scaled[1] ?? 0),
     ];
   };
 
@@ -2878,7 +2960,7 @@ export default function App({ runtime = "web" }) {
     if (hasNativeBridge) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const scaled = autoScaleLevels(peaks, outputAutoZoomRef, `out-split:${devId}`);
+        const scaled = peaks.map((value) => shapeMeterLevel(value));
         const first = scaled[0] ?? 0;
         const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
@@ -2891,8 +2973,8 @@ export default function App({ runtime = "web" }) {
     const right = outputLevels[rightId] ?? managerRef.current.getOutputLevel(rightId) ?? 0;
     const scaled = autoScaleLevels([left, ch > 1 ? right : left], outputAutoZoomRef, `out-split:${devId}`);
     return [
-      scaled[0] ?? 0,
-      scaled[1] ?? 0,
+      shapeMeterLevel(scaled[0] ?? 0),
+      shapeMeterLevel(scaled[1] ?? 0),
     ];
   };
 
@@ -2905,7 +2987,7 @@ export default function App({ runtime = "web" }) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        const scaled = autoScaleLevels(peaks, inputAutoZoomRef, `in:${devId}`);
+        const scaled = peaks.map((value) => shapeMeterLevel(value));
         for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
@@ -2914,7 +2996,7 @@ export default function App({ runtime = "web" }) {
       const id = `ch:${devId}:${i}`;
       return inputLevels[id] ?? managerRef.current.getInputLevel(id) ?? 0;
     });
-    return autoScaleLevels(raw, inputAutoZoomRef, `in:${devId}`);
+    return autoScaleLevels(raw, inputAutoZoomRef, `in:${devId}`).map((value) => shapeMeterLevel(value));
   };
 
   const getColChannelLevels = (col) => {
@@ -2925,7 +3007,7 @@ export default function App({ runtime = "web" }) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        const scaled = autoScaleLevels(peaks, outputAutoZoomRef, `out:${devId}`);
+        const scaled = peaks.map((value) => shapeMeterLevel(value));
         for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
@@ -2934,7 +3016,7 @@ export default function App({ runtime = "web" }) {
       const id = `ch:${devId}:${i}`;
       return outputLevels[id] ?? managerRef.current.getOutputLevel(id) ?? 0;
     });
-    return autoScaleLevels(raw, outputAutoZoomRef, `out:${devId}`);
+    return autoScaleLevels(raw, outputAutoZoomRef, `out:${devId}`).map((value) => shapeMeterLevel(value));
   };
 
   const getChannelAxisLabel = (channelCount, channelIndex) => {
@@ -3304,6 +3386,11 @@ export default function App({ runtime = "web" }) {
               gridTemplateRows: `${scaledDestinationHeight}px`,
               gridAutoRows: `${scaledCellSize}px`,
             }}
+            onMouseLeave={() => {
+              // Clear hover selection the moment the pointer exits the grid (not just the wrap).
+              if (!locked) setSelectedCell(null);
+              setShowResizeGuides(false);
+            }}
             onMouseMove={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               const x = event.clientX - rect.left;
@@ -3324,6 +3411,8 @@ export default function App({ runtime = "web" }) {
                   if (rowId && colId && (selectedCell?.rowId !== rowId || selectedCell?.colId !== colId)) {
                     setSelectedCell({ rowId, colId });
                   }
+                } else if (selectedCell) {
+                  setSelectedCell(null);
                 }
               }
             }}
