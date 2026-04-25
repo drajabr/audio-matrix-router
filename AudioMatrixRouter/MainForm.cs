@@ -15,6 +15,11 @@ public sealed class MainForm : Form
     private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
     private const int DWMWA_CAPTION_COLOR = 35;
     private const int DWMWA_TEXT_COLOR = 36;
+    private static readonly Color AppBackgroundColor = ColorTranslator.FromHtml("#101113");
+    private static readonly Color AppPanelColor = ColorTranslator.FromHtml("#1a1d22");
+    private static readonly Color AppLineColor = ColorTranslator.FromHtml("#39404d");
+    private static readonly Color AppTextColor = ColorTranslator.FromHtml("#dbe0e8");
+    private static readonly Color AppAccentColor = ColorTranslator.FromHtml("#2dd4bf");
 
     // COLORREF format: 0x00bbggrr
     private const int DARK_CAPTION_COLOR = 0x001d1a17;
@@ -28,6 +33,8 @@ public sealed class MainForm : Form
     private readonly NotifyIcon _trayIcon = new();
     private readonly ContextMenuStrip _trayMenu = new();
     private readonly Icon _trayAppIcon;
+    private readonly Icon _windowAppIcon;
+    private readonly Icon _windowSmallAppIcon;
 
     private bool _locked;
     private bool _allowRealClose;
@@ -44,6 +51,7 @@ public sealed class MainForm : Form
     private List<DeviceInfo> _cachedAvailableInputs = new();
     private List<DeviceInfo> _cachedAvailableOutputs = new();
     private bool _availableDevicesDirty = true;
+    private string _inputDeviceMode = "both";
     // Whether to include the bulky available-device list in the next push. Hot metric
     // pushes (peaks/latency) skip it to keep the JSON small and React work cheap.
     private bool _pendingFullStatePush = true;
@@ -62,10 +70,15 @@ public sealed class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new System.Drawing.Size(1100, 750);
         Size = new System.Drawing.Size(1600, 1000);
+        BackColor = AppBackgroundColor;
+        ForeColor = AppTextColor;
+        _webView.BackColor = AppBackgroundColor;
         _trayAppIcon = LoadAppIcon();
+        _windowAppIcon = new Icon(_trayAppIcon, SystemInformation.IconSize);
+        _windowSmallAppIcon = new Icon(_trayAppIcon, SystemInformation.SmallIconSize);
         try
         {
-            Icon = (Icon)_trayAppIcon.Clone();
+            Icon = _windowAppIcon;
         }
         catch
         {
@@ -160,16 +173,18 @@ public sealed class MainForm : Form
         ApplyDarkTitleBar();
         try
         {
-            var iconHandle = _trayAppIcon.Handle;
-            if (iconHandle != IntPtr.Zero)
+            if (_windowSmallAppIcon.Handle != IntPtr.Zero)
             {
-                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_SMALL, iconHandle);
-                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_BIG, iconHandle);
+                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_SMALL, _windowSmallAppIcon.Handle);
+            }
+            if (_windowAppIcon.Handle != IntPtr.Zero)
+            {
+                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_BIG, _windowAppIcon.Handle);
             }
         }
         catch
         {
-            // Keep running if icon assignment fails.
+            // Keep running if explicit window icon assignment fails.
         }
     }
 
@@ -189,6 +204,8 @@ public sealed class MainForm : Form
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _trayMenu.Dispose();
+        _windowSmallAppIcon.Dispose();
+        _windowAppIcon.Dispose();
         _trayAppIcon.Dispose();
         base.OnFormClosing(e);
     }
@@ -205,7 +222,7 @@ public sealed class MainForm : Form
         }
         catch
         {
-            // Fallback below.
+            // Fall back below.
         }
 
         try
@@ -218,7 +235,7 @@ public sealed class MainForm : Form
         }
         catch
         {
-            // Fallback below.
+            // Fall back below.
         }
 
         return (Icon)SystemIcons.Application.Clone();
@@ -226,8 +243,19 @@ public sealed class MainForm : Form
 
     private void InitializeTrayIcon()
     {
+        _trayMenu.ShowImageMargin = false;
+        _trayMenu.Renderer = new TrayMenuRenderer();
+        _trayMenu.BackColor = AppPanelColor;
+        _trayMenu.ForeColor = AppTextColor;
+
         _trayMenu.Items.Add("Show", null, (_, _) => RestoreFromTray());
         _trayMenu.Items.Add("Quit", null, (_, _) => QuitFromTray());
+
+        foreach (ToolStripItem item in _trayMenu.Items)
+        {
+            item.BackColor = AppPanelColor;
+            item.ForeColor = AppTextColor;
+        }
 
         _trayIcon.Text = "Audio Router Matrix";
         _trayIcon.Icon = _trayAppIcon;
@@ -279,6 +307,7 @@ public sealed class MainForm : Form
 
         var webViewEnv = await CoreWebView2Environment.CreateAsync(options: envOptions);
         await _webView.EnsureCoreWebView2Async(webViewEnv);
+        _webView.DefaultBackgroundColor = AppBackgroundColor;
 
         _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
         _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
@@ -344,6 +373,67 @@ public sealed class MainForm : Form
         return null;
     }
 
+    private sealed class TrayMenuRenderer : ToolStripProfessionalRenderer
+    {
+        public TrayMenuRenderer() : base(new TrayMenuColorTable())
+        {
+            RoundedEdges = false;
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            e.TextColor = AppTextColor;
+            base.OnRenderItemText(e);
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            var bounds = new Rectangle(Point.Empty, e.Item.Size);
+            var fill = e.Item.Selected
+                ? Color.FromArgb(40, AppAccentColor)
+                : AppPanelColor;
+
+            using var backgroundBrush = new SolidBrush(fill);
+            e.Graphics.FillRectangle(backgroundBrush, bounds);
+
+            if (e.Item.Selected)
+            {
+                using var borderPen = new Pen(Color.FromArgb(120, AppAccentColor));
+                var borderBounds = Rectangle.Inflate(bounds, -1, -1);
+                e.Graphics.DrawRectangle(borderPen, borderBounds);
+            }
+        }
+
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            using var borderPen = new Pen(AppLineColor);
+            var borderBounds = new Rectangle(Point.Empty, e.ToolStrip.Size - new Size(1, 1));
+            e.Graphics.DrawRectangle(borderPen, borderBounds);
+        }
+
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
+        {
+            using var brush = new SolidBrush(AppPanelColor);
+            e.Graphics.FillRectangle(brush, e.AffectedBounds);
+        }
+
+        private sealed class TrayMenuColorTable : ProfessionalColorTable
+        {
+            public override Color ToolStripDropDownBackground => AppPanelColor;
+            public override Color MenuBorder => AppLineColor;
+            public override Color MenuItemBorder => Color.FromArgb(120, AppAccentColor);
+            public override Color MenuItemSelected => Color.FromArgb(40, AppAccentColor);
+            public override Color MenuItemSelectedGradientBegin => Color.FromArgb(40, AppAccentColor);
+            public override Color MenuItemSelectedGradientEnd => Color.FromArgb(40, AppAccentColor);
+            public override Color MenuItemPressedGradientBegin => AppPanelColor;
+            public override Color MenuItemPressedGradientMiddle => AppPanelColor;
+            public override Color MenuItemPressedGradientEnd => AppPanelColor;
+            public override Color ImageMarginGradientBegin => AppPanelColor;
+            public override Color ImageMarginGradientMiddle => AppPanelColor;
+            public override Color ImageMarginGradientEnd => AppPanelColor;
+        }
+    }
+
     private void LoadConfigAndDevices()
     {
         _suppressConfigSave = true;
@@ -356,6 +446,9 @@ public sealed class MainForm : Form
             _locked = loadedConfig.Locked;
             _uiPreferencesJson = loadedConfig.UiPreferencesJson ?? "";
             _startupAtBoot = loadedConfig.StartupAtBoot;
+            _inputDeviceMode = loadedConfig.InputDeviceMode is "input" or "loopback" or "both"
+                ? loadedConfig.InputDeviceMode
+                : "both";
 
             if (loadedConfig.Window.Width > 0 && loadedConfig.Window.Height > 0)
             {
@@ -429,7 +522,7 @@ public sealed class MainForm : Form
         }
 
         var startMinimized = WindowState == FormWindowState.Minimized || !Visible || !ShowInTaskbar;
-        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _startupAtBoot, _uiPreferencesJson);
+        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _startupAtBoot, _uiPreferencesJson, _inputDeviceMode);
         config.Save();
     }
 
@@ -546,6 +639,14 @@ public sealed class MainForm : Form
                     _locked = request.Params.TryGetProperty("locked", out var lockValue) && lockValue.GetBoolean();
                     ScheduleSave();
                     await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setTransientMuteAll":
+                    // No lock check — mute must work even when UI is locked.
+                    // Not persisted — transient only.
+                    _engine.RoutingMatrix.TransientMuteAll =
+                        request.Params.TryGetProperty("muted", out var muteValue) && muteValue.GetBoolean();
+                    await SendResultAsync(request.Id, true);
                     return;
 
                 case "getUiPreferences":
@@ -722,6 +823,21 @@ public sealed class MainForm : Form
                     await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
+                case "setInputDeviceMode":
+                    if (request.Params.TryGetProperty("mode", out var inputModeValue))
+                    {
+                        var mode = inputModeValue.GetString() ?? "input";
+                        if (mode == "input" || mode == "loopback" || mode == "both")
+                        {
+                            _inputDeviceMode = mode;
+                            _availableDevicesDirty = true;
+                            _pendingFullStatePush = true;
+                            ScheduleSave();
+                        }
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
                 case "getStartupAtBoot":
                     await SendResultAsync(request.Id, IsStartupAtBootEnabled());
                     return;
@@ -760,7 +876,9 @@ public sealed class MainForm : Form
         if (!_availableDevicesDirty) return;
         try
         {
-            _cachedAvailableInputs = _engine.GetAvailableInputDevices(includeCapture: true, includeLoopback: false);
+            bool includeCapture = _inputDeviceMode != "loopback";
+            bool includeLoopback = _inputDeviceMode != "input";
+            _cachedAvailableInputs = _engine.GetAvailableInputDevices(includeCapture, includeLoopback);
             _cachedAvailableOutputs = _engine.GetAvailableDevices(DataFlow.Render);
         }
         catch
@@ -814,7 +932,7 @@ public sealed class MainForm : Form
                 Offset = 0,
                 IsMaster = false,
                 DelayMs = 0,
-                IsLoopback = false
+                IsLoopback = d.Id.StartsWith("loop:", StringComparison.Ordinal)
             }).ToList();
             availableOutputs = _cachedAvailableOutputs.Select(d => new DeviceState
             {
@@ -833,6 +951,7 @@ public sealed class MainForm : Form
             Locked = _locked,
             StartupAtBoot = _startupAtBoot,
             CaptureBufferMs = _engine.CaptureBufferMs,
+            InputDeviceMode = _inputDeviceMode,
             TotalLatencyMs = maxWorkingLatencyMs,
             HasFullDeviceLists = includeAvailableDevices,
             AvailableInputs = availableInputs,
@@ -1003,6 +1122,7 @@ public sealed class MainForm : Form
         public bool Locked { get; set; }
         public bool StartupAtBoot { get; set; }
         public int CaptureBufferMs { get; set; }
+        public string InputDeviceMode { get; set; } = "both";
         public double? TotalLatencyMs { get; set; }
         public bool HasFullDeviceLists { get; set; }
         public List<DeviceState>? AvailableInputs { get; set; }
@@ -1021,4 +1141,5 @@ public sealed class MainForm : Form
     private const int WM_SETICON = 0x0080;
     private const int ICON_SMALL = 0;
     private const int ICON_BIG = 1;
+
 }

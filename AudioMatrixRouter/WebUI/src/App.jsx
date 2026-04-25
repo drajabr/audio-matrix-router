@@ -5,6 +5,7 @@ const STORAGE_KEY = "audio-router-matrix-v3";
 const DB_MIN = -60;
 const DB_MAX = 12;
 const GLOBAL_MUTE_GAIN_DB = -90;
+const GLOBAL_GAIN_DRAG_PX_PER_STEP = 24;
 const DEVICE_CELL_SIZE = 112;
 const GRID_GAP_SIZE = 4;
 const CHANNEL_CELL_SIZE = (DEVICE_CELL_SIZE - GRID_GAP_SIZE) / 2;
@@ -223,6 +224,12 @@ function outputDeviceFromColId(colId) {
   if (colId.startsWith("dev:")) return colId.slice(4);
   if (colId.startsWith("ch:")) return colId.split(":")[1];
   return "";
+}
+
+function isLoopbackSelfRoute(inputDeviceId, outputDeviceId) {
+  if (!inputDeviceId || !outputDeviceId) return false;
+  if (!String(inputDeviceId).startsWith("loop:")) return false;
+  return String(inputDeviceId).slice("loop:".length) === String(outputDeviceId);
 }
 
 function parseChannelId(id) {
@@ -846,18 +853,20 @@ export default function App({ runtime = "web" }) {
   const [uiScaleIndex, setUiScaleIndex] = useState(() => getStoredIndex(UI_SCALE_KEY, UI_SCALE_PRESETS, Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === "md"))));
   const [captureBufferMs, setCaptureBufferMs] = useState(CAPTURE_BUFFER_DEFAULT);
   const [masterGainDb, setMasterGainDb] = useState(0);
+  const [wheelVisualOffsetPx, setWheelVisualOffsetPx] = useState(0);
   const [isApplyingCaptureBuffer, setIsApplyingCaptureBuffer] = useState(false);
   const [nativeTotalLatencyMs, setNativeTotalLatencyMs] = useState(null);
   const [nativeRouteLatencyByCh, setNativeRouteLatencyByCh] = useState({});
   const [nativeInputChannelMeta, setNativeInputChannelMeta] = useState({});
   const [nativeOutputChannelMeta, setNativeOutputChannelMeta] = useState({});
+  const [inputDeviceMode, setInputDeviceMode] = useState("both");
   const [controlsCollapsed, setControlsCollapsed] = useState(() => {
     if (typeof window === "undefined") return true;
     return localStorage.getItem(QUICK_CONTROLS_COLLAPSED_KEY) !== "0";
   });
   const [activeQuickPicker, setActiveQuickPicker] = useState("");
   const [startupAtBoot, setStartupAtBoot] = useState(false);
-  const [showAllDevices, setShowAllDevices] = useState(false);
+  const [showAllDevices, setShowAllDevices] = useState(true);
   const [locked, setLocked] = useState(false);
   const [powerOn, setPowerOn] = useState(() => {
     if (typeof window === "undefined") return true;
@@ -906,6 +915,7 @@ export default function App({ runtime = "web" }) {
   const devicesDiscoveredRef = useRef(false);
   const quickControlsRef = useRef(null);
   const matrixWrapRef = useRef(null);
+  const matrixWheelScrollRef = useRef({ targetLeft: 0, targetTop: 0, rafId: 0 });
   const dragScrollRef = useRef({ tracking: false, dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0, pointerId: 0, blockNextClick: false });
   const latencyLastRef = useRef(null);
   const latencyJitterRef = useRef(0);
@@ -920,7 +930,11 @@ export default function App({ runtime = "web" }) {
   // without peak-level updates triggering the entire setCrosspoints re-run.
   const nativeInputChannelMetaRef = useRef({});
   const nativeOutputChannelMetaRef = useRef({});
+  const nativeMeterLastUpdateRef = useRef(0);
   const jitterUiRef = useRef({ lastTs: 0, lastValue: null });
+  const latencyUiRef = useRef({ lastTs: 0, lastValue: null });
+  const latencySmoothRef = useRef(null);
+  const latencyMissingSinceRef = useRef(0);
   const wheelDragRef = useRef(null);
   const wheelDragSuppressClickRef = useRef(false);
   const bufferDragRef = useRef(null);
@@ -932,6 +946,9 @@ export default function App({ runtime = "web" }) {
 
   useEffect(() => {
     masterGainDbRef.current = masterGainDb;
+    if (!wheelDragRef.current) {
+      setWheelVisualOffsetPx(Math.round(masterGainDb / 0.5) * GLOBAL_GAIN_DRAG_PX_PER_STEP);
+    }
   }, [masterGainDb]);
 
   useEffect(() => {
@@ -955,6 +972,48 @@ export default function App({ runtime = "web" }) {
     if (lastValue == null || Math.abs(rounded - lastValue) >= 0.4 || (now - lastTs) >= 320) {
       jitterUiRef.current = { lastTs: now, lastValue: rounded };
       setJitterMs(rounded);
+    }
+  };
+
+  const updateLatencyDisplay = (nextLatency) => {
+    const LATENCY_NULL_GRACE_MS = 6000;
+    const LATENCY_MIN_UPDATE_MS = 900;
+    const LATENCY_STEP_THRESHOLD_MS = 1.2;
+    const LATENCY_EMA_ALPHA = 0.1;
+
+    if (!Number.isFinite(nextLatency)) {
+      const now = performance.now();
+      if (!latencyMissingSinceRef.current) {
+        latencyMissingSinceRef.current = now;
+        return;
+      }
+      if ((now - latencyMissingSinceRef.current) < LATENCY_NULL_GRACE_MS) {
+        return;
+      }
+      latencyUiRef.current = { lastTs: 0, lastValue: null };
+      latencySmoothRef.current = null;
+      setLatencyMs(null);
+      return;
+    }
+
+    latencyMissingSinceRef.current = 0;
+
+    const rounded = Math.round(nextLatency * 10) / 10;
+    const smoothed = latencySmoothRef.current == null
+      ? rounded
+      : (latencySmoothRef.current * (1 - LATENCY_EMA_ALPHA) + rounded * LATENCY_EMA_ALPHA);
+    latencySmoothRef.current = smoothed;
+
+    const display = Math.round(smoothed * 10) / 10;
+    const now = performance.now();
+    const { lastTs, lastValue } = latencyUiRef.current;
+    if (
+      lastValue == null ||
+      Math.abs(display - lastValue) >= LATENCY_STEP_THRESHOLD_MS ||
+      (now - lastTs) >= LATENCY_MIN_UPDATE_MS
+    ) {
+      latencyUiRef.current = { lastTs: now, lastValue: display };
+      setLatencyMs(display);
     }
   };
 
@@ -1075,6 +1134,10 @@ export default function App({ runtime = "web" }) {
       if (!state || cancelled) return;
       lastPushTs = performance.now();
 
+      if (typeof state?.inputDeviceMode === "string" && state.inputDeviceMode) {
+        setInputDeviceMode(state.inputDeviceMode);
+      }
+
       if (Number.isFinite(state?.captureBufferMs)) {
         const pendingCaptureBuffer = pendingCaptureBufferRef.current;
         if (!Number.isFinite(pendingCaptureBuffer)) {
@@ -1087,7 +1150,7 @@ export default function App({ runtime = "web" }) {
 
       const total = Number.isFinite(state?.totalLatencyMs) ? Number(state.totalLatencyMs) : null;
       setNativeTotalLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
-      setLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
+      updateLatencyDisplay(total);
 
       const routeLatency = {};
       (Array.isArray(state?.routes) ? state.routes : []).forEach((route) => {
@@ -1133,6 +1196,7 @@ export default function App({ runtime = "web" }) {
       });
       nativeOutputChannelMetaRef.current = outMeta;
       setNativeOutputChannelMeta(outMeta);
+      nativeMeterLastUpdateRef.current = performance.now();
 
       if (hasNativeBridge && inputs.length > 0 && outputs.length > 0) {
         const deviceRows = inputs.map((i) => ({ id: `dev:${i.deviceId}` }));
@@ -1216,7 +1280,7 @@ export default function App({ runtime = "web" }) {
           const out = (ctx.outputLatency || 0) * 1000;
           const lat = base + out;
 
-          setLatencyMs(lat > 0 ? Math.round(lat) : null);
+          updateLatencyDisplay(lat > 0 ? lat : null);
           setInputLatencyMs(base > 0 ? Math.round(base * 10) / 10 : null);
           setOutputLatencyMs(out > 0 ? Math.round(out * 10) / 10 : null);
           setBufferMs(base > 0 ? Math.round(base * 10) / 10 : null);
@@ -1231,7 +1295,7 @@ export default function App({ runtime = "web" }) {
           }
           latencyLastRef.current = lat;
         } else {
-          setLatencyMs(null);
+          updateLatencyDisplay(null);
           setInputLatencyMs(null);
           setOutputLatencyMs(null);
           setBufferMs(null);
@@ -1244,7 +1308,7 @@ export default function App({ runtime = "web" }) {
         }
       } catch (_) {
         if (!cancelled) {
-          setLatencyMs(null);
+          updateLatencyDisplay(null);
           setNativeTotalLatencyMs(null);
         }
       } finally {
@@ -1269,6 +1333,56 @@ export default function App({ runtime = "web" }) {
       }
     };
   }, [hasNativeBridge, inputs, outputs, inputMasterId, outputMasterId]);
+
+  useEffect(() => {
+    if (!hasNativeBridge) return undefined;
+
+    const staleAfterMs = Math.max(300, Number(captureBufferMs) || 1);
+    const intervalMs = Math.max(16, Math.min(100, Math.round(staleAfterMs / 2)));
+
+    const id = setInterval(() => {
+      if (nativeMeterLastUpdateRef.current <= 0) return;
+      if ((performance.now() - nativeMeterLastUpdateRef.current) <= staleAfterMs) return;
+
+      const currentInput = nativeInputChannelMetaRef.current || {};
+      if (Object.keys(currentInput).length > 0) {
+        const nextInput = {};
+        let changed = false;
+        Object.entries(currentInput).forEach(([deviceId, meta]) => {
+          const prevPeaks = Array.isArray(meta?.peakLevels) ? meta.peakLevels : [];
+          if (prevPeaks.some((v) => (Number(v) || 0) !== 0)) changed = true;
+          nextInput[deviceId] = {
+            ...(meta || {}),
+            peakLevels: prevPeaks.length > 0 ? new Array(prevPeaks.length).fill(0) : [],
+          };
+        });
+        if (changed) {
+          nativeInputChannelMetaRef.current = nextInput;
+          setNativeInputChannelMeta(nextInput);
+        }
+      }
+
+      const currentOutput = nativeOutputChannelMetaRef.current || {};
+      if (Object.keys(currentOutput).length > 0) {
+        const nextOutput = {};
+        let changed = false;
+        Object.entries(currentOutput).forEach(([deviceId, meta]) => {
+          const prevPeaks = Array.isArray(meta?.peakLevels) ? meta.peakLevels : [];
+          if (prevPeaks.some((v) => (Number(v) || 0) !== 0)) changed = true;
+          nextOutput[deviceId] = {
+            ...(meta || {}),
+            peakLevels: prevPeaks.length > 0 ? new Array(prevPeaks.length).fill(0) : [],
+          };
+        });
+        if (changed) {
+          nativeOutputChannelMetaRef.current = nextOutput;
+          setNativeOutputChannelMeta(nextOutput);
+        }
+      }
+    }, intervalMs);
+
+    return () => clearInterval(id);
+  }, [hasNativeBridge, captureBufferMs]);
 
   const rows = useMemo(() => {
     if (viewMode === "device") {
@@ -1531,12 +1645,27 @@ export default function App({ runtime = "web" }) {
   useEffect(() => {
     const inputIds = new Set(inputs.map((d) => d.deviceId));
     const outputIds = new Set(outputs.map((d) => d.deviceId));
-    if (inputMasterId && !inputIds.has(inputMasterId)) {
-      setInputMasterId("");
+    let nextIn = inputMasterId;
+    let nextOut = outputMasterId;
+    if (inputMasterId && !inputIds.has(inputMasterId)) nextIn = "";
+    if (outputMasterId && !outputIds.has(outputMasterId)) nextOut = "";
+    // If either master just became empty, try to fill from any active route.
+    if (!nextIn || !nextOut) {
+      const deviceMatrix = matrixRef.current?.device || {};
+      const fallback = findActiveMasterPair(deviceMatrix);
+      if (fallback) {
+        if (!nextIn && fallback.inputDeviceId && inputIds.has(fallback.inputDeviceId)) {
+          nextIn = fallback.inputDeviceId;
+          pushInputMasterToNative(nextIn);
+        }
+        if (!nextOut && fallback.outputDeviceId && outputIds.has(fallback.outputDeviceId)) {
+          nextOut = fallback.outputDeviceId;
+          pushOutputMasterToNative(nextOut);
+        }
+      }
     }
-    if (outputMasterId && !outputIds.has(outputMasterId)) {
-      setOutputMasterId("");
-    }
+    if (nextIn !== inputMasterId) setInputMasterId(nextIn);
+    if (nextOut !== outputMasterId) setOutputMasterId(nextOut);
   }, [inputs, outputs, inputMasterId, outputMasterId]);
 
   const masterDetailCell = (() => {
@@ -1563,6 +1692,7 @@ export default function App({ runtime = "web" }) {
     masterGainDb,
     controlsCollapsed,
     showAllDevices,
+    inputDeviceMode,
     powerOn,
     locked,
     inputLabels,
@@ -1591,6 +1721,7 @@ export default function App({ runtime = "web" }) {
             masterGainDb: next?.masterGainDb,
             controlsCollapsed: next?.controlsCollapsed,
             showAllDevices: next?.showAllDevices,
+            inputDeviceMode: next?.inputDeviceMode,
             powerOn: next?.powerOn,
             locked: next?.locked,
             inputLabels: next?.inputLabels,
@@ -1713,10 +1844,17 @@ export default function App({ runtime = "web" }) {
         if (uiScaleMatch >= 0) setUiScaleIndex(uiScaleMatch);
       }
       if (typeof saved?.controlsCollapsed === "boolean") setControlsCollapsed(saved.controlsCollapsed);
-      if (typeof saved?.showAllDevices === "boolean") setShowAllDevices(saved.showAllDevices);
+      setShowAllDevices(typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : true);
+      if (typeof saved?.inputDeviceMode === "string" && saved.inputDeviceMode) {
+        setInputDeviceMode(saved.inputDeviceMode);
+      }
       if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
       if (Number.isFinite(saved?.captureBufferMs)) setCaptureBufferMs(saved.captureBufferMs);
-      if (Number.isFinite(saved?.masterGainDb)) setMasterGainDb(clamp(saved.masterGainDb, DB_MIN, DB_MAX));
+      if (Number.isFinite(saved?.masterGainDb)) {
+        const savedGain = clamp(saved.masterGainDb, DB_MIN, DB_MAX);
+        setMasterGainDb(savedGain);
+        masterGainDbRef.current = savedGain; // sync ref immediately so buildMatrixByViewFromNativeState below uses correct offset
+      }
       if (!hasNativeBridge && typeof saved?.locked === "boolean") setLocked(saved.locked);
 
       let discoveredInputs = [];
@@ -1733,18 +1871,32 @@ export default function App({ runtime = "web" }) {
         }
 
         const state = await window.__nativeBridgeInvoke("getState", {});
-        nativeState = state;
-        if (Number.isFinite(state?.captureBufferMs)) {
-          setCaptureBufferMs(state.captureBufferMs);
+        const savedMode = (typeof saved?.inputDeviceMode === "string") ? saved.inputDeviceMode : "";
+        if (savedMode && (savedMode === "input" || savedMode === "loopback" || savedMode === "both") && state?.inputDeviceMode !== savedMode) {
+          nativeState = await window.__nativeBridgeInvoke("setInputDeviceMode", { mode: savedMode });
+        } else {
+          nativeState = state;
+        }
+        if (Number.isFinite(nativeState?.captureBufferMs)) {
+          setCaptureBufferMs(nativeState.captureBufferMs);
+        }
+        if (typeof nativeState?.inputDeviceMode === "string" && nativeState.inputDeviceMode) {
+          setInputDeviceMode(nativeState.inputDeviceMode);
         }
 
+        const includeCapture = nativeState?.inputDeviceMode !== "loopback";
+        const includeLoopback = nativeState?.inputDeviceMode !== "input";
+        const inputMatchesMode = (d) => {
+          const isLoopback = !!d?.isLoopback || String(d?.deviceId || "").startsWith("loop:");
+          return isLoopback ? includeLoopback : includeCapture;
+        };
         const nativeInputs = [
-          ...(Array.isArray(state?.inputs) ? state.inputs : []),
-          ...(Array.isArray(state?.availableInputs) ? state.availableInputs : []),
+          ...(Array.isArray(nativeState?.availableInputs) ? nativeState.availableInputs : []),
+          ...(Array.isArray(nativeState?.inputs) ? nativeState.inputs.filter(inputMatchesMode) : []),
         ];
         const nativeOutputs = [
-          ...(Array.isArray(state?.outputs) ? state.outputs : []),
-          ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
+          ...(Array.isArray(nativeState?.outputs) ? nativeState.outputs : []),
+          ...(Array.isArray(nativeState?.availableOutputs) ? nativeState.availableOutputs : []),
         ];
 
         const uniqByDeviceId = (list) => {
@@ -1888,7 +2040,7 @@ export default function App({ runtime = "web" }) {
             deviceCols,
             channelRows,
             channelCols,
-            masterGainDb,
+            masterGainDbRef.current, // use ref — state update above is batched and not yet committed
           )
         : null;
 
@@ -1930,12 +2082,28 @@ export default function App({ runtime = "web" }) {
       const nativeOutputMaster = hasNativeBridge
         ? ((Array.isArray(nativeState?.outputs) ? nativeState.outputs : []).find((d) => d?.isMaster)?.deviceId || "")
         : "";
-      const nextInputMaster = hasNativeBridge
+      let nextInputMaster = hasNativeBridge
         ? nativeInputMaster
         : (orderedInputs.some((d) => d.deviceId === saved?.inputMasterId) ? saved?.inputMasterId || "" : "");
-      const nextOutputMaster = hasNativeBridge
+      let nextOutputMaster = hasNativeBridge
         ? nativeOutputMaster
         : (orderedOutputs.some((d) => d.deviceId === saved?.outputMasterId) ? saved?.outputMasterId || "" : "");
+      // If no master resolved, auto-pick from any active route in the loaded matrix.
+      if (!nextInputMaster || !nextOutputMaster) {
+        const loadedDeviceMatrix = nextMatrixByView?.device || {};
+        for (const [routeKey, conn] of Object.entries(loadedDeviceMatrix)) {
+          if (!conn?.on) continue;
+          const sep = routeKey.indexOf("::");
+          if (sep < 0) continue;
+          const rowPart = routeKey.slice(0, sep);
+          const colPart = routeKey.slice(sep + 2);
+          const inId = rowPart.startsWith("dev:") ? rowPart.slice(4) : "";
+          const outId = colPart.startsWith("dev:") ? colPart.slice(4) : "";
+          if (inId && !nextInputMaster && orderedInputs.some((d) => d.deviceId === inId)) nextInputMaster = inId;
+          if (outId && !nextOutputMaster && orderedOutputs.some((d) => d.deviceId === outId)) nextOutputMaster = outId;
+          if (nextInputMaster && nextOutputMaster) break;
+        }
+      }
       setInputMasterId(nextInputMaster);
       setOutputMasterId(nextOutputMaster);
       if (!hasNativeBridge) {
@@ -2017,6 +2185,19 @@ export default function App({ runtime = "web" }) {
     managerRef.current = new AudioMatrixManager();
     setContextState("suspended");
     await discoverDevices(true);
+  };
+
+  const handleToggleInputDeviceMode = async () => {
+    if (!hasNativeBridge || locked) return;
+    const modes = ["input", "loopback", "both"];
+    const currentIndex = modes.indexOf(inputDeviceMode);
+    const nextMode = modes[(currentIndex + 1 + modes.length) % modes.length];
+    try {
+      await window.__nativeBridgeInvoke("setInputDeviceMode", { mode: nextMode });
+      await discoverDevices(false);
+    } catch (_) {
+      // no-op
+    }
   };
 
   const handleResetMatrix = async (event) => {
@@ -2149,6 +2330,109 @@ export default function App({ runtime = "web" }) {
   }, []);
 
   useEffect(() => {
+    // Page must never wheel-scroll. Allow wheel scrolling only inside matrix list.
+    const preventPageWheel = (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const insideMatrix = !!target?.closest(".matrix-wrap");
+
+      if (!insideMatrix) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    };
+
+    document.addEventListener("wheel", preventPageWheel, { passive: false, capture: true });
+    return () => {
+      document.removeEventListener("wheel", preventPageWheel, { capture: true });
+    };
+  }, []);
+
+  useEffect(() => {
+    // Handle matrix wheel natively so edge scrolling cannot leak to page scrolling.
+    const wrap = matrixWrapRef.current;
+    if (!wrap) return undefined;
+
+    const scrollState = matrixWheelScrollRef.current;
+    scrollState.targetLeft = wrap.scrollLeft;
+    scrollState.targetTop = wrap.scrollTop;
+
+    const animateScroll = () => {
+      const dx = scrollState.targetLeft - wrap.scrollLeft;
+      const dy = scrollState.targetTop - wrap.scrollTop;
+
+      if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+        wrap.scrollLeft = scrollState.targetLeft;
+        wrap.scrollTop = scrollState.targetTop;
+        scrollState.rafId = 0;
+        return;
+      }
+
+      wrap.scrollLeft += dx * 0.22;
+      wrap.scrollTop += dy * 0.22;
+      scrollState.rafId = requestAnimationFrame(animateScroll);
+    };
+
+    const onMatrixWheel = (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const cornerValueControl = target?.closest(".corner-gain-wheel, .corner-control-btn--buffer");
+      if (cornerValueControl) {
+        event.preventDefault();
+        return;
+      }
+
+      const tile = target?.closest(".cell");
+      if (tile && tile.classList.contains("on")) {
+        event.preventDefault();
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const maxLeft = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+      const maxTop = Math.max(0, wrap.scrollHeight - wrap.clientHeight);
+
+      const deltaModeScale = event.deltaMode === 1 ? 16 : (event.deltaMode === 2 ? wrap.clientHeight : 1);
+      const baseLeft = scrollState.rafId ? scrollState.targetLeft : wrap.scrollLeft;
+      const baseTop = scrollState.rafId ? scrollState.targetTop : wrap.scrollTop;
+      const nextLeft = clamp(baseLeft + event.deltaX * deltaModeScale, 0, maxLeft);
+      const nextTop = clamp(baseTop + event.deltaY * deltaModeScale, 0, maxTop);
+
+      scrollState.targetLeft = nextLeft;
+      scrollState.targetTop = nextTop;
+      if (!scrollState.rafId) {
+        scrollState.rafId = requestAnimationFrame(animateScroll);
+      }
+    };
+
+    wrap.addEventListener("wheel", onMatrixWheel, { passive: false, capture: true });
+    return () => {
+      if (scrollState.rafId) {
+        cancelAnimationFrame(scrollState.rafId);
+        scrollState.rafId = 0;
+      }
+      wrap.removeEventListener("wheel", onMatrixWheel, { capture: true });
+    };
+  }, []);
+
+  useEffect(() => {
+    const wrap = matrixWrapRef.current;
+    if (!wrap) return undefined;
+
+    const syncHeaderOffsets = () => {
+      wrap.style.setProperty("--matrix-scroll-x", `${Math.round(wrap.scrollLeft)}px`);
+      wrap.style.setProperty("--matrix-scroll-y", `${Math.round(wrap.scrollTop)}px`);
+    };
+
+    syncHeaderOffsets();
+    wrap.addEventListener("scroll", syncHeaderOffsets, { passive: true });
+
+    return () => {
+      wrap.removeEventListener("scroll", syncHeaderOffsets);
+    };
+  }, []);
+
+  useEffect(() => {
     if (hasNativeBridge) return undefined;
 
     const tick = () => {
@@ -2218,6 +2502,12 @@ export default function App({ runtime = "web" }) {
     applyMatrixToEngine(viewMode, matrixRef.current[viewMode] || {});
   }, [transientMuteAll, powerOn, viewMode]);
 
+  // Send transient mute to native engine — no lock check, mute must work even when UI is locked.
+  useEffect(() => {
+    if (!hasNativeBridge) return;
+    window.__nativeBridgeInvoke("setTransientMuteAll", { muted: transientMuteAll }).catch(() => {});
+  }, [transientMuteAll, hasNativeBridge]);
+
   useEffect(() => {
     if (!selectedCell) return;
 
@@ -2251,6 +2541,22 @@ export default function App({ runtime = "web" }) {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  // Returns { inputDeviceId, outputDeviceId } from the first active device-level route in the
+  // given matrix, or null if no active routes exist.
+  const findActiveMasterPair = (deviceMatrix) => {
+    for (const [routeKey, conn] of Object.entries(deviceMatrix)) {
+      if (!conn?.on) continue;
+      const sep = routeKey.indexOf("::");
+      if (sep < 0) continue;
+      const rowPart = routeKey.slice(0, sep);
+      const colPart = routeKey.slice(sep + 2);
+      const inId = rowPart.startsWith("dev:") ? rowPart.slice(4) : "";
+      const outId = colPart.startsWith("dev:") ? colPart.slice(4) : "";
+      if (inId && outId) return { inputDeviceId: inId, outputDeviceId: outId };
+    }
+    return null;
+  };
+
   const updateConnection = (rowId, colId, updater) => {
     if (locked) return;
 
@@ -2263,8 +2569,25 @@ export default function App({ runtime = "web" }) {
 
     const key = getCellKey(rowId, colId);
     let shouldReloadForMasterSwitch = false;
+    // Derive masters from any currently-active route when none is set, BEFORE blocking ops.
     let nextInputMasterId = inputMasterId;
     let nextOutputMasterId = outputMasterId;
+    if (!nextInputMasterId || !nextOutputMasterId) {
+      const deviceMatrix = matrixRef.current?.device || {};
+      const fallback = findActiveMasterPair(deviceMatrix);
+      if (fallback) {
+        if (!nextInputMasterId && fallback.inputDeviceId) {
+          nextInputMasterId = fallback.inputDeviceId;
+          setInputMaster(fallback.inputDeviceId, true);
+          shouldReloadForMasterSwitch = true;
+        }
+        if (!nextOutputMasterId && fallback.outputDeviceId) {
+          nextOutputMasterId = fallback.outputDeviceId;
+          setOutputMaster(fallback.outputDeviceId, true);
+          shouldReloadForMasterSwitch = true;
+        }
+      }
+    }
 
     // IMPORTANT: compute the next connection synchronously here using matrixRef (always current),
     // BEFORE calling setMatrixByView. React state updaters run lazily during render, so any
@@ -2281,12 +2604,12 @@ export default function App({ runtime = "web" }) {
 
       if (nextConnection.on) {
         const pair = getDevicePairFromRoute(rowId, colId);
-        if (!inputMasterId && pair.inputDeviceId) {
+        if (!nextInputMasterId && pair.inputDeviceId) {
           setInputMaster(pair.inputDeviceId, true);
           nextInputMasterId = pair.inputDeviceId;
           shouldReloadForMasterSwitch = true;
         }
-        if (!outputMasterId && pair.outputDeviceId) {
+        if (!nextOutputMasterId && pair.outputDeviceId) {
           setOutputMaster(pair.outputDeviceId, true);
           nextOutputMasterId = pair.outputDeviceId;
           shouldReloadForMasterSwitch = true;
@@ -2355,10 +2678,10 @@ export default function App({ runtime = "web" }) {
         const pair = getDevicePairFromRoute(rowId, colId);
 
         if (
-          inputMasterId &&
+          nextInputMasterId &&
           pair.inputDeviceId &&
-          inputMasterId !== pair.inputDeviceId &&
-          !isInputDeviceUsed(inputMasterId)
+          nextInputMasterId !== pair.inputDeviceId &&
+          !isInputDeviceUsed(nextInputMasterId)
         ) {
           setInputMaster(pair.inputDeviceId, true);
           nextInputMasterId = pair.inputDeviceId;
@@ -2366,14 +2689,31 @@ export default function App({ runtime = "web" }) {
         }
 
         if (
-          outputMasterId &&
+          nextOutputMasterId &&
           pair.outputDeviceId &&
-          outputMasterId !== pair.outputDeviceId &&
-          !isOutputDeviceUsed(outputMasterId)
+          nextOutputMasterId !== pair.outputDeviceId &&
+          !isOutputDeviceUsed(nextOutputMasterId)
         ) {
           setOutputMaster(pair.outputDeviceId, true);
           nextOutputMasterId = pair.outputDeviceId;
           shouldReloadForMasterSwitch = true;
+        }
+      }
+
+      // After this connection update, if still no master, pick from any active route.
+      if (!nextInputMasterId || !nextOutputMasterId) {
+        const fallback = findActiveMasterPair(next.device || {});
+        if (fallback) {
+          if (!nextInputMasterId && fallback.inputDeviceId) {
+            setInputMaster(fallback.inputDeviceId, true);
+            nextInputMasterId = fallback.inputDeviceId;
+            shouldReloadForMasterSwitch = true;
+          }
+          if (!nextOutputMasterId && fallback.outputDeviceId) {
+            setOutputMaster(fallback.outputDeviceId, true);
+            nextOutputMasterId = fallback.outputDeviceId;
+            shouldReloadForMasterSwitch = true;
+          }
         }
       }
 
@@ -2635,7 +2975,7 @@ export default function App({ runtime = "web" }) {
   };
 
   const adjustGainForCell = (rowId, colId, stepDb) => {
-    if (locked) return;
+    if (locked || !inputMasterId || !outputMasterId) return;
     const key = getCellKey(rowId, colId);
     const state = activeMatrix[key] || makeDefaultConnection();
     const baseGainDb = Number.isFinite(state.gainDb) ? state.gainDb : 0;
@@ -2647,11 +2987,16 @@ export default function App({ runtime = "web" }) {
   };
 
   const applyGlobalGainDelta = (deltaDb) => {
-    if (locked || !Number.isFinite(deltaDb) || Math.abs(deltaDb) < 0.001) return;
+    if (locked || !inputMasterId || !outputMasterId || !Number.isFinite(deltaDb) || Math.abs(deltaDb) < 0.001) return;
     setMasterGainDb((prev) => {
       const next = clamp(Math.round((prev + deltaDb) * 2) / 2, DB_MIN, DB_MAX);
       return Math.abs(next - prev) < 0.001 ? prev : next;
     });
+  };
+
+  const finishWheelDrag = () => {
+    wheelDragRef.current = null;
+    setWheelVisualOffsetPx(Math.round(masterGainDbRef.current / 0.5) * GLOBAL_GAIN_DRAG_PX_PER_STEP);
   };
 
   const applyBufferDelta = (deltaMs) => {
@@ -2884,6 +3229,9 @@ export default function App({ runtime = "web" }) {
   const matrixColumnCount = viewMode === "device"
     ? Math.max(1, cols.reduce((acc, col) => acc + Math.max(1, col.channelCount || 1), 0))
     : Math.max(cols.length, 1);
+  const matrixRowCount = viewMode === "device"
+    ? Math.max(1, rows.reduce((acc, row) => acc + Math.max(1, row.channelCount || 1), 0))
+    : Math.max(rows.length, 1);
 
   const setCaptureBufferFromMenu = (next) => {
     if (locked) return;
@@ -2892,28 +3240,33 @@ export default function App({ runtime = "web" }) {
 
   const selectedSource = detailCell ? rows.find((r) => r.id === detailCell.rowId) : null;
   const selectedDestination = detailCell ? cols.find((c) => c.id === detailCell.colId) : null;
+  const nativeMeterDataFresh = !hasNativeBridge
+    || (
+      nativeMeterLastUpdateRef.current > 0
+      && (performance.now() - nativeMeterLastUpdateRef.current) <= Math.max(1, Number(captureBufferMs) || 1)
+    );
   const autoScaleLevels = (levels, scaleMapRef, scaleKey) => {
     const source = Array.isArray(levels) ? levels : [];
     const values = source.map((v) => clamp(Number(v) || 0, 0, 1));
     if (values.length === 0) return values;
 
-    const tracker = scaleMapRef.current.get(scaleKey) || { floor: 0.006, peak: 0.22 };
+    const tracker = scaleMapRef.current.get(scaleKey) || { floor: 0.003, peak: 0.1 };
     const observedPeak = values.reduce((acc, val) => Math.max(acc, val), 0);
     const observedFloor = values.reduce((acc, val) => Math.min(acc, val), 1);
 
     if (observedPeak > tracker.peak) {
-      tracker.peak += (observedPeak - tracker.peak) * 0.24;
+      tracker.peak += (observedPeak - tracker.peak) * 0.32;
     } else {
-      tracker.peak = Math.max(observedPeak, tracker.peak * 0.985);
+      tracker.peak = Math.max(observedPeak, tracker.peak * 0.975);
     }
 
     if (observedFloor < tracker.floor) {
-      tracker.floor += (observedFloor - tracker.floor) * 0.12;
+      tracker.floor += (observedFloor - tracker.floor) * 0.18;
     } else {
-      tracker.floor = Math.min(observedFloor, tracker.floor * 1.01 + 0.0003);
+      tracker.floor = Math.min(observedFloor, tracker.floor * 1.015 + 0.0002);
     }
 
-    const dynamicRange = clamp(tracker.peak - tracker.floor, 0.08, 0.95);
+    const dynamicRange = clamp(tracker.peak - tracker.floor, 0.035, 0.7);
     const nextTracker = {
       floor: tracker.floor,
       peak: tracker.floor + dynamicRange,
@@ -2933,9 +3286,10 @@ export default function App({ runtime = "web" }) {
     const devId = row.deviceId || (row.id.startsWith("dev:") ? row.id.slice(4) : row.id.split(":")[1]);
     const ch = Math.max(1, Number.isFinite(row?.channelCount) ? Math.floor(row.channelCount) : 2);
     if (hasNativeBridge) {
+      if (!nativeMeterDataFresh) return [0, 0];
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const scaled = peaks.map((value) => shapeMeterLevel(value));
+        const scaled = autoScaleLevels(peaks, inputAutoZoomRef, `in-split:${devId}`).map((value) => shapeMeterLevel(value));
         const first = scaled[0] ?? 0;
         const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
@@ -2958,9 +3312,10 @@ export default function App({ runtime = "web" }) {
     const devId = col.outputDeviceId || outputDeviceFromColId(col.id);
     const ch = Math.max(1, Number.isFinite(col?.channelCount) ? Math.floor(col.channelCount) : 2);
     if (hasNativeBridge) {
+      if (!nativeMeterDataFresh) return [0, 0];
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        const scaled = peaks.map((value) => shapeMeterLevel(value));
+        const scaled = autoScaleLevels(peaks, outputAutoZoomRef, `out-split:${devId}`).map((value) => shapeMeterLevel(value));
         const first = scaled[0] ?? 0;
         const second = ch > 1 ? (scaled[1] ?? 0) : first;
         return [first, second];
@@ -2984,10 +3339,11 @@ export default function App({ runtime = "web" }) {
     const ch = Math.max(1, row.channelCount || 2);
     const devId = row.deviceId || (row.id.startsWith("dev:") ? row.id.slice(4) : row.id.split(":")[1]);
     if (hasNativeBridge) {
+      if (!nativeMeterDataFresh) return new Array(ch).fill(0);
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        const scaled = peaks.map((value) => shapeMeterLevel(value));
+        const scaled = autoScaleLevels(peaks, inputAutoZoomRef, `in:${devId}`).map((value) => shapeMeterLevel(value));
         for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
@@ -3004,10 +3360,11 @@ export default function App({ runtime = "web" }) {
     const ch = Math.max(1, col.channelCount || 2);
     const devId = col.outputDeviceId || outputDeviceFromColId(col.id);
     if (hasNativeBridge) {
+      if (!nativeMeterDataFresh) return new Array(ch).fill(0);
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       const out = new Array(ch).fill(0);
       if (Array.isArray(peaks)) {
-        const scaled = peaks.map((value) => shapeMeterLevel(value));
+        const scaled = autoScaleLevels(peaks, outputAutoZoomRef, `out:${devId}`).map((value) => shapeMeterLevel(value));
         for (let i = 0; i < ch; i += 1) out[i] = scaled[i] ?? 0;
       }
       return out;
@@ -3205,14 +3562,23 @@ export default function App({ runtime = "web" }) {
   const routeIndicatorIcon = routeIndicatorActive
     ? (routeIndicatorMultiChannel ? "⮆" : "🡢")
     : "⏸";
+  const selectedRowPathIndex = selectedCell ? rows.findIndex((row) => row.id === selectedCell.rowId) : -1;
+  const selectedColPathIndex = selectedCell ? cols.findIndex((col) => col.id === selectedCell.colId) : -1;
+  const mastersReady = !!inputMasterId && !!outputMasterId;
 
   const globalGainDb = masterGainDb;
-  const canEditGlobalGain = !locked;
+  const canEditGlobalGain = !locked && mastersReady;
 
   const handleTransientMuteAllToggle = () => {
-    if (!hasAnyActiveRoute) return;
+    if (!mastersReady || !hasAnyActiveRoute) return;
     setTransientMuteAll((prev) => !prev);
   };
+
+  const inputModeLabel = inputDeviceMode === "loopback"
+    ? "🔊"
+    : inputDeviceMode === "both"
+      ? "⥮"
+      : "🎤";
 
   const handleRootClick = (event) => {
     if (event.target.closest(".matrix-grid")) return;
@@ -3351,8 +3717,15 @@ export default function App({ runtime = "web" }) {
               wrap.classList.add("is-drag-scrolling");
             }
             if (!s.dragging) return;
+            const wheelState = matrixWheelScrollRef.current;
+            if (wheelState.rafId) {
+              cancelAnimationFrame(wheelState.rafId);
+              wheelState.rafId = 0;
+            }
             wrap.scrollLeft = s.scrollLeft - dx;
             wrap.scrollTop = s.scrollTop - dy;
+            wheelState.targetLeft = wrap.scrollLeft;
+            wheelState.targetTop = wrap.scrollTop;
           }}
           onPointerUp={(event) => {
             const s = dragScrollRef.current;
@@ -3399,6 +3772,12 @@ export default function App({ runtime = "web" }) {
               const nearSourceAxis = Math.abs(x - scaledSourceWidth) <= threshold;
               const nearDestAxis = Math.abs(y - scaledDestinationHeight) <= threshold;
               const nextVisible = nearSourceAxis || nearDestAxis;
+              const tileAreaWidth = matrixColumnCount * scaledCellSize + Math.max(0, matrixColumnCount - 1) * GRID_GAP_SIZE;
+              const tileAreaHeight = matrixRowCount * scaledCellSize + Math.max(0, matrixRowCount - 1) * GRID_GAP_SIZE;
+              const insideTileBounds = x >= scaledSourceWidth
+                && y >= scaledDestinationHeight
+                && x <= (scaledSourceWidth + tileAreaWidth)
+                && y <= (scaledDestinationHeight + tileAreaHeight);
               if (nextVisible !== showResizeGuides) {
                 setShowResizeGuides(nextVisible);
               }
@@ -3410,6 +3789,31 @@ export default function App({ runtime = "web" }) {
                   const colId = tileWrap.getAttribute("data-colid");
                   if (rowId && colId && (selectedCell?.rowId !== rowId || selectedCell?.colId !== colId)) {
                     setSelectedCell({ rowId, colId });
+                  }
+                } else if (insideTileBounds) {
+                  // Keep nearest tile selected even when hovering a grid gap.
+                  const candidates = event.currentTarget.querySelectorAll(".tile-cell-wrap[data-rowid][data-colid]");
+                  let nearest = null;
+                  let nearestDistSq = Number.POSITIVE_INFINITY;
+                  candidates.forEach((candidate) => {
+                    const r = candidate.getBoundingClientRect();
+                    const cx = r.left + (r.width / 2);
+                    const cy = r.top + (r.height / 2);
+                    const dx = event.clientX - cx;
+                    const dy = event.clientY - cy;
+                    const distSq = dx * dx + dy * dy;
+                    if (distSq < nearestDistSq) {
+                      nearestDistSq = distSq;
+                      nearest = candidate;
+                    }
+                  });
+
+                  if (nearest) {
+                    const rowId = nearest.getAttribute("data-rowid");
+                    const colId = nearest.getAttribute("data-colid");
+                    if (rowId && colId && (selectedCell?.rowId !== rowId || selectedCell?.colId !== colId)) {
+                      setSelectedCell({ rowId, colId });
+                    }
                   }
                 } else if (selectedCell) {
                   setSelectedCell(null);
@@ -3505,17 +3909,22 @@ export default function App({ runtime = "web" }) {
                   onPointerDown={(e) => {
                     if (!canEditGlobalGain) return;
                     e.currentTarget.setPointerCapture(e.pointerId);
-                    wheelDragRef.current = { startY: e.clientY, startDb: globalGainDb };
+                    wheelDragRef.current = {
+                      startY: e.clientY,
+                      startDb: globalGainDb,
+                      startOffsetPx: wheelVisualOffsetPx,
+                    };
                     wheelDragSuppressClickRef.current = false;
                   }}
                   onPointerMove={(e) => {
                     if (!wheelDragRef.current) return;
-                    const delta = (wheelDragRef.current.startY - e.clientY) / 8;
-                    const next = clamp(Math.round((wheelDragRef.current.startDb + delta) * 2) / 2, DB_MIN, DB_MAX);
-                    const diff = next - globalGainDb;
-                    if (Math.abs(diff) >= 0.49) {
-                      applyGlobalGainDelta(diff);
-                      wheelDragRef.current = { startY: e.clientY, startDb: next };
+                    const dragPx = e.clientY - wheelDragRef.current.startY;
+                    setWheelVisualOffsetPx(wheelDragRef.current.startOffsetPx + dragPx);
+                    const deltaDb = -(dragPx / GLOBAL_GAIN_DRAG_PX_PER_STEP) * 0.5;
+                    const next = clamp(Math.round((wheelDragRef.current.startDb + deltaDb) * 2) / 2, DB_MIN, DB_MAX);
+                    if (Math.abs(next - masterGainDbRef.current) >= 0.49) {
+                      masterGainDbRef.current = next;
+                      setMasterGainDb(next);
                       wheelDragSuppressClickRef.current = true;
                     }
                   }}
@@ -3523,10 +3932,11 @@ export default function App({ runtime = "web" }) {
                     if (!canEditGlobalGain) return;
                     e.preventDefault();
                     e.stopPropagation();
-                    applyGlobalGainDelta(e.deltaY < 0 ? 0.5 : -0.5);
+                    const primary = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+                    applyGlobalGainDelta(primary < 0 ? 0.5 : -0.5);
                   }}
-                  onPointerUp={() => { wheelDragRef.current = null; }}
-                  onPointerCancel={() => { wheelDragRef.current = null; }}
+                  onPointerUp={finishWheelDrag}
+                  onPointerCancel={finishWheelDrag}
                   style={{ cursor: canEditGlobalGain ? "ns-resize" : "default", opacity: canEditGlobalGain ? 1 : 0.45 }}
                   title={canEditGlobalGain ? "Master gain: drag up/down or scroll wheel" : "Unlock matrix to edit master gain"}
                   role="spinbutton"
@@ -3535,6 +3945,7 @@ export default function App({ runtime = "web" }) {
                   aria-valuemax={DB_MAX}
                   aria-label="Global gain"
                 >
+                  <div className="corner-gain-wheel-drum" aria-hidden="true" style={{ backgroundPositionY: `${wheelVisualOffsetPx}px` }} />
                   <span className="corner-gain-wheel-value">
                     {globalGainDb > 0 ? `+${globalGainDb.toFixed(1)}` : globalGainDb.toFixed(1)}
                     <span className="corner-gain-wheel-unit">dB</span>
@@ -3544,8 +3955,12 @@ export default function App({ runtime = "web" }) {
                   type="button"
                   className={`corner-control-btn corner-control-global-mute ${transientMuteAll ? "active muted" : ""}`}
                   onClick={handleTransientMuteAllToggle}
-                  disabled={!hasAnyActiveRoute}
-                  title={transientMuteAll ? "Global mute on (click to unmute)" : "Global mute off (click to mute all)"}
+                  disabled={!hasAnyActiveRoute || !mastersReady}
+                  title={
+                    !mastersReady
+                      ? "Select input and output masters first"
+                      : (transientMuteAll ? "Global mute on (click to unmute)" : "Global mute off (click to mute all)")
+                  }
                   aria-label="Toggle global mute"
                 >
                   <span aria-hidden="true">🔈︎</span>
@@ -3581,6 +3996,16 @@ export default function App({ runtime = "web" }) {
                   aria-label="Restart and reload devices"
                 >
                   <span aria-hidden="true">↻</span>
+                </button>
+                <button
+                  type="button"
+                  className={`corner-control-btn corner-control-input-mode ${inputDeviceMode === "both" ? "active" : ""}`}
+                  onClick={handleToggleInputDeviceMode}
+                  disabled={!hasNativeBridge || locked}
+                  title={`Input device list mode: ${inputDeviceMode} (click to cycle)`}
+                  aria-label={`Input device list mode: ${inputDeviceMode}`}
+                >
+                  <span aria-hidden="true">{inputModeLabel}</span>
                 </button>
               </div>
             </div>
@@ -3721,19 +4146,24 @@ export default function App({ runtime = "web" }) {
                 </div>
                 )}
 
-                {cols.map((col) => {
+                {cols.map((col, colIndex) => {
                   const key = getCellKey(row.id, col.id);
                   const state = activeMatrix[key] || makeDefaultConnection();
                   const selected = selectedCell?.rowId === row.id && selectedCell?.colId === col.id;
+                  const pathLeft = selectedRowPathIndex >= 0 && selectedColPathIndex >= 0
+                    && rowIndex === selectedRowPathIndex && colIndex < selectedColPathIndex;
+                  const pathUp = selectedRowPathIndex >= 0 && selectedColPathIndex >= 0
+                    && colIndex === selectedColPathIndex && rowIndex < selectedRowPathIndex;
+                  const blockedByLoopbackSelfRoute = isLoopbackSelfRoute(row.deviceId, col.outputDeviceId);
                   const colSpan = viewMode === "device" ? Math.max(1, col.channelCount || 1) : 1;
                   const tileWidth = scaledCellSize * colSpan + GRID_GAP_SIZE * (colSpan - 1);
                   const tileHeight = scaledCellSize * rowSpan + GRID_GAP_SIZE * (rowSpan - 1);
                   return (
                       <div
                         key={key}
-                        className="tile-cell-wrap"
-                        data-rowid={row.id}
-                        data-colid={col.id}
+                        className={`tile-cell-wrap${blockedByLoopbackSelfRoute ? " blocked" : ""}`}
+                        {...(!blockedByLoopbackSelfRoute ? { "data-rowid": row.id } : {})}
+                        {...(!blockedByLoopbackSelfRoute ? { "data-colid": col.id } : {})}
                         style={{
                           width: `${tileWidth}px`,
                           height: `${tileHeight}px`,
@@ -3741,6 +4171,18 @@ export default function App({ runtime = "web" }) {
                           ...(colSpan > 1 ? { gridColumn: `span ${colSpan}` } : {}),
                         }}
                       >
+                      {blockedByLoopbackSelfRoute ? (
+                        <div
+                          className={[
+                            "cell",
+                            "blocked",
+                            pathLeft && "path-left",
+                            pathUp && "path-up",
+                          ].filter(Boolean).join(" ")}
+                          style={{ width: `${tileWidth}px`, height: `${tileHeight}px` }}
+                          title="Loopback input cannot route to the same physical output device"
+                        />
+                      ) : (
                       <button
                         type="button"
                         className={[
@@ -3748,8 +4190,8 @@ export default function App({ runtime = "web" }) {
                           state.on ? "on" : "off",
                           selected && "selected",
                           state.phaseInverted && "phase-inverted",
-                          selectedCell && row.id === selectedCell.rowId && "active-row",
-                          selectedCell && col.id === selectedCell.colId && "active-col",
+                          pathLeft && "path-left",
+                          pathUp && "path-up",
                         ].filter(Boolean).join(" ")}
                         style={{ width: `${tileWidth}px`, height: `${tileHeight}px` }}
                         onMouseEnter={() => {
@@ -3770,6 +4212,7 @@ export default function App({ runtime = "web" }) {
                         }}
                         onWheel={(event) => {
                           if (locked) return;
+                          if (!state.on) return;
                           event.preventDefault();
                           event.stopPropagation();
                           adjustGainForCell(row.id, col.id, event.deltaY < 0 ? 0.5 : -0.5);
@@ -3791,6 +4234,7 @@ export default function App({ runtime = "web" }) {
                           <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${(Number(state.gainDb) || 0).toFixed(1)}dB`}</span>
                         ) : null}
                       </button>
+                      )}
                     </div>
                   );
                 })}

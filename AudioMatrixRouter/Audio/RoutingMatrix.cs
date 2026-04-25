@@ -18,9 +18,20 @@ public class RoutingMatrix
     private readonly object _writeLock = new();
     private int _inputChannels;
     private int _outputChannels;
+    private volatile int _transientMuteAll;
 
     public int InputChannels => _inputChannels;
     public int OutputChannels => _outputChannels;
+
+    /// <summary>
+    /// When true, MixingSampleProvider multiplies all output by zero (instant silence).
+    /// Bypasses lock — safe to set even when the UI is locked.
+    /// </summary>
+    public bool TransientMuteAll
+    {
+        get => _transientMuteAll != 0;
+        set => _transientMuteAll = value ? 1 : 0;
+    }
 
     public void Resize(int inputChannels, int outputChannels)
     {

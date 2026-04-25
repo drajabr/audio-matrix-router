@@ -221,6 +221,7 @@ public class MixingSampleProvider : ISampleProvider
 
         var front = _matrix.GetFrontBuffer();
         int matOutCh = _matrix.OutputChannels;
+        float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
 
         foreach (var src in _sources)
         {
@@ -258,7 +259,7 @@ public class MixingSampleProvider : ISampleProvider
                         ref var cp = ref front[matIdx];
                         if (!cp.Active) continue;
 
-                        float sample = _sourceTempBuffer[f * src.Channels + srcCh] * cp.Gain;
+                        float sample = _sourceTempBuffer[f * src.Channels + srcCh] * cp.Gain * muteLinear;
                         _mixBuffer[f * _outputChannels + dstCh] += sample;
                     }
                 }

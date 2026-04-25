@@ -56,6 +56,7 @@ html,
 body,
 #root {
   height: 100%;
+  overscroll-behavior: none;
 }
 
 html,
@@ -104,7 +105,7 @@ textarea {
 
 .topbar {
   display: flex;
-  align-items: stretch;
+  align-items: center;
   justify-content: flex-start;
   gap: 10px;
   padding: 8px;
@@ -167,6 +168,7 @@ textarea {
   align-items: center;
   justify-content: center;
   min-width: 46px;
+  min-height: 22px;
   padding: 2px 6px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--line));
@@ -175,6 +177,8 @@ textarea {
   font-size: calc(var(--font-size-2xs) * 0.92);
   font-weight: 700;
   letter-spacing: 0.05em;
+  line-height: 1;
+  text-align: center;
   text-transform: uppercase;
 }
 
@@ -213,7 +217,7 @@ textarea {
 .ui-controls-wrap {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: center;
   position: relative;
   flex-shrink: 0;
   margin-left: auto;
@@ -226,13 +230,13 @@ textarea {
 .ui-controls-toggle {
   position: absolute;
   top: 50%;
-  right: 3px;
-  transform: translateY(-50%);
+  right: 0;
+  transform: translate(0, -50%);
   z-index: 2601;
 }
 
 .ui-controls-toggle:hover {
-  transform: translateY(calc(-50% - 1px));
+  transform: translate(0, calc(-50% - 1px));
 }
 
 .ui-controls-toggle.active {
@@ -417,9 +421,13 @@ textarea {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 10px;
+  overflow: hidden;
 }
 
 .matrix-wrap {
+  --matrix-scroll-x: 0px;
+  --matrix-scroll-y: 0px;
+  --matrix-viewport-mask: 8px;
   flex: 1;
   min-height: 0;
   padding: 8px;
@@ -430,7 +438,31 @@ textarea {
   position: relative;
   z-index: 1;
   cursor: grab;
-  overscroll-behavior: contain;
+  overscroll-behavior: none;
+  touch-action: none;
+}
+
+.matrix-wrap::before,
+.matrix-wrap::after {
+  content: "";
+  position: absolute;
+  pointer-events: none;
+  z-index: 23;
+  background: color-mix(in srgb, var(--panel) 96%, black 4%);
+}
+
+.matrix-wrap::before {
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--matrix-viewport-mask);
+}
+
+.matrix-wrap::after {
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: var(--matrix-viewport-mask);
 }
 
 .matrix-wrap.is-drag-scrolling {
@@ -456,13 +488,14 @@ textarea {
 }
 
 .matrix-corner {
-  position: sticky;
-  top: 0;
-  left: 0;
+  position: relative;
   z-index: 26;
   border: 1px solid var(--line);
   background: color-mix(in srgb, var(--surface) 82%, black 18%);
   border-radius: var(--radius-tile);
+  pointer-events: auto;
+  transform: translate3d(var(--matrix-scroll-x), var(--matrix-scroll-y), 0);
+  will-change: transform;
 }
 
 .matrix-corner-content {
@@ -553,6 +586,12 @@ textarea {
   grid-row: 2;
 }
 
+.corner-control-input-mode {
+  grid-column: 1;
+  grid-row: 3;
+  font-size: var(--font-size-xs);
+}
+
 .corner-control-buffer {
   grid-column: 2 / span 2;
   grid-row: 1;
@@ -597,19 +636,85 @@ textarea {
   position: relative;
   overflow: hidden;
   border-radius: var(--radius-tile);
-  border: 1px solid color-mix(in srgb, var(--line) 86%, white 14%);
-  background: repeating-linear-gradient(
-    0deg,
-    color-mix(in srgb, var(--surface) 55%, black 45%) 0px,
-    color-mix(in srgb, var(--surface) 55%, black 45%) 2px,
-    color-mix(in srgb, var(--surface) 88%, white 12%) 2px,
-    color-mix(in srgb, var(--surface) 88%, white 12%) 8px
-  );
+  /* Recessed dark housing */
+  border: 1px solid color-mix(in srgb, var(--line) 50%, black 50%);
+  background: #050505;
+  box-shadow:
+    inset 0 5px 14px rgba(0, 0, 0, 0.85),
+    inset 0 -5px 14px rgba(0, 0, 0, 0.85),
+    0 0 18px color-mix(in srgb, var(--accent) 28%, transparent);
   display: flex;
   align-items: center;
   justify-content: center;
   touch-action: none;
-  transition: opacity 120ms ease;
+  transition: opacity 120ms ease, box-shadow 200ms ease;
+}
+
+.corner-gain-wheel:hover {
+  box-shadow:
+    inset 0 5px 14px rgba(0, 0, 0, 0.85),
+    inset 0 -5px 14px rgba(0, 0, 0, 0.85),
+    0 0 28px color-mix(in srgb, var(--accent) 52%, transparent);
+}
+
+/* The spinning ribbed drum */
+.corner-gain-wheel-drum {
+  position: absolute;
+  inset: 7px 0;
+  border-radius: 3px;
+  /*
+    Each 12 px cycle = one horizontal rib:
+      0-1px   : deep shadow groove (top shadow)
+      1-3px   : bright highlight bevel (ridge crest)
+      3-9px   : mid-tone ridge body
+      9-11px  : shadowed slope (bottom of ridge)
+      11-12px : dark gap between ribs
+  */
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0,0,0,0.90)                                                  0px  1px,
+    color-mix(in srgb, var(--surface) 90%, white 10%)                 1px  3px,
+    color-mix(in srgb, var(--surface) 68%, black 32%)                 3px  9px,
+    rgba(0,0,0,0.70)                                                  9px 11px,
+    rgba(0,0,0,0.90)                                                 11px 12px
+  );
+  background-size: 100% 12px;
+  transition: background-position-y 80ms ease-out;
+  will-change: background-position-y;
+}
+
+/* 3D barrel curvature: dark top+bottom, slight highlight at center */
+.corner-gain-wheel-drum::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.80) 0%,
+    rgba(0, 0, 0, 0.22) 28%,
+    rgba(255, 255, 255, 0.07) 50%,
+    rgba(0, 0, 0, 0.22) 72%,
+    rgba(0, 0, 0, 0.80) 100%
+  );
+  pointer-events: none;
+}
+
+/* Accent LED glow strip at the bottom of the housing (like keyboard backlight) */
+.corner-gain-wheel::after {
+  content: "";
+  position: absolute;
+  bottom: 2px;
+  left: 12%;
+  right: 12%;
+  height: 2px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-hl) 90%, white 10%);
+  box-shadow:
+    0 0 6px 2px color-mix(in srgb, var(--accent) 80%, transparent),
+    0 0 14px 4px color-mix(in srgb, var(--accent) 40%, transparent);
+  opacity: 0.85;
+  pointer-events: none;
 }
 
 .corner-gain-wheel-value {
@@ -618,11 +723,14 @@ textarea {
   font-size: var(--font-size-lg);
   font-weight: 800;
   color: var(--text-strong);
-  text-shadow: 0 1px 5px rgba(0, 0, 0, 0.9), 0 0 12px rgba(0, 0, 0, 0.7);
+  text-shadow:
+    0 1px 6px rgba(0, 0, 0, 0.95),
+    0 0 14px rgba(0, 0, 0, 0.8);
   line-height: 1;
   display: flex;
   align-items: baseline;
   gap: 2px;
+  pointer-events: none;
 }
 
 .corner-gain-wheel-unit {
@@ -632,25 +740,29 @@ textarea {
 }
 
 .row-head {
-  position: sticky;
-  left: 0;
+  position: relative;
   z-index: 24;
   background: var(--panel);
   display: grid;
   grid-template-columns: minmax(0, 1fr) 28px;
   align-items: stretch;
   gap: 4px;
+  pointer-events: auto;
+  transform: translate3d(var(--matrix-scroll-x), 0, 0);
+  will-change: transform;
 }
 
 .col-head {
-  position: sticky;
-  top: 0;
+  position: relative;
   z-index: 24;
   background: var(--panel);
   display: grid;
   grid-template-rows: minmax(0, 1fr) 28px;
   align-items: stretch;
   gap: 4px;
+  pointer-events: auto;
+  transform: translate3d(0, var(--matrix-scroll-y), 0);
+  will-change: transform;
 }
 
 .studio-root.is-locked .sort-handle,
@@ -943,6 +1055,8 @@ textarea {
   width: 12px;
   cursor: nwse-resize;
   border-left: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  transform: translate3d(var(--matrix-scroll-x), var(--matrix-scroll-y), 0);
+  will-change: transform;
 }
 
 .grid-dest-height-handle {
@@ -951,6 +1065,8 @@ textarea {
   height: 12px;
   cursor: nwse-resize;
   border-top: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+  transform: translate3d(var(--matrix-scroll-x), var(--matrix-scroll-y), 0);
+  will-change: transform;
 }
 
 .source-width-handle {
@@ -994,6 +1110,18 @@ textarea {
 .cell:disabled.cell {
   /* Cancel any hover/selected outlines on disabled cells */
   transform: none;
+}
+
+.cell.blocked {
+  cursor: not-allowed;
+  opacity: 0.5;
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--line) 75%, var(--muted) 25%);
+  background: repeating-linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--surface) 84%, black 16%) 0 8px,
+    color-mix(in srgb, var(--surface) 78%, black 22%) 8px 16px
+  );
 }
 
 .cell.phase-inverted {
@@ -1265,22 +1393,22 @@ textarea {
   color: var(--text-strong);
 }
 
-.cell.active-row,
-.cell.active-col {
+.cell.path-left,
+.cell.path-up {
   opacity: 0.9;
 }
 
-.matrix-grid.has-selection .cell:not(.selected):not(.active-row):not(.active-col) {
+.matrix-grid.has-selection .cell:not(.selected):not(.path-left):not(.path-up) {
   opacity: 0.28;
 }
 
-.matrix-grid.has-selection .cell.on:not(.selected):not(.active-row):not(.active-col) {
+.matrix-grid.has-selection .cell.on:not(.selected):not(.path-left):not(.path-up) {
   opacity: 0.38;
   box-shadow: none;
 }
 
-.cell.on.active-row,
-.cell.on.active-col {
+.cell.on.path-left,
+.cell.on.path-up {
   opacity: 1;
 }
 

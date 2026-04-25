@@ -3,16 +3,12 @@ namespace AudioMatrixRouter;
 static class Program
 {
     private const string SingleInstanceMutexName = "AudioMatrixRouter.SingleInstance";
-    private const string AppUserModelId = "AudioMatrixRouter.Desktop";
 
     [System.Runtime.InteropServices.DllImport("winmm.dll", ExactSpelling = true)]
     private static extern uint timeBeginPeriod(uint uPeriod);
 
     [System.Runtime.InteropServices.DllImport("winmm.dll", ExactSpelling = true)]
     private static extern uint timeEndPeriod(uint uPeriod);
-
-    [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, PreserveSig = false)]
-    private static extern void SetCurrentProcessExplicitAppUserModelID(string appID);
 
     [STAThread]
     static void Main(string[] args)
@@ -35,15 +31,6 @@ static class Program
         timeBeginPeriod(1);
         try
         {
-            try
-            {
-                SetCurrentProcessExplicitAppUserModelID(AppUserModelId);
-            }
-            catch
-            {
-                // Taskbar identity can fail on older/locked-down systems; continue safely.
-            }
-
             System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
             try
             {

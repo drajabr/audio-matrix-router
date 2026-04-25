@@ -40,6 +40,10 @@ public class AppConfig
     public List<OutputLatencyConfig> OutputLatencies { get; set; } = [];
     public bool Locked { get; set; }
     public bool StartupAtBoot { get; set; }
+    public int CaptureBufferMs { get; set; } = 40;
+    public string InputMasterDeviceId { get; set; } = "";
+    public string OutputMasterDeviceId { get; set; } = "";
+    public string InputDeviceMode { get; set; } = "both";
     public string UiPreferencesJson { get; set; } = "";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
@@ -98,13 +102,17 @@ public class AppConfig
         }
     }
 
-    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson)
+    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson, string inputDeviceMode)
     {
         var config = new AppConfig
         {
             Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized },
             Locked = locked,
             StartupAtBoot = startupAtBoot,
+            CaptureBufferMs = engine.CaptureBufferMs,
+            InputMasterDeviceId = engine.GetInputMasterDevice()?.Info.Id ?? "",
+            OutputMasterDeviceId = engine.GetOutputMasterDevice()?.Info.Id ?? "",
+            InputDeviceMode = inputDeviceMode is "input" or "loopback" or "both" ? inputDeviceMode : "both",
             UiPreferencesJson = uiPreferencesJson ?? ""
         };
 
@@ -130,6 +138,10 @@ public class AppConfig
 
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
+        var legacyUiPrefs = ReadLegacyUiPreferences();
+        var captureBufferMs = CaptureBufferMs > 0 ? CaptureBufferMs : (legacyUiPrefs?.CaptureBufferMs ?? 40);
+        engine.SetCaptureBufferMs(captureBufferMs);
+
         // Honor the user's configured active device lists exactly as saved, in saved order.
         // If a saved device is unavailable on this machine right now, skip it at runtime,
         // but do not infer replacements or expand the config with other system devices.
@@ -171,6 +183,18 @@ public class AppConfig
         foreach (var outputLatency in OutputLatencies)
             engine.SetOutputDelayMs(outputLatency.DeviceId, outputLatency.DelayMs);
 
+        var inputMasterDeviceId = !string.IsNullOrWhiteSpace(InputMasterDeviceId)
+            ? InputMasterDeviceId
+            : legacyUiPrefs?.InputMasterId ?? "";
+        if (!string.IsNullOrWhiteSpace(inputMasterDeviceId))
+            engine.SetInputMasterDevice(inputMasterDeviceId);
+
+        var outputMasterDeviceId = !string.IsNullOrWhiteSpace(OutputMasterDeviceId)
+            ? OutputMasterDeviceId
+            : legacyUiPrefs?.OutputMasterId ?? "";
+        if (!string.IsNullOrWhiteSpace(outputMasterDeviceId))
+            engine.SetOutputMasterDevice(outputMasterDeviceId);
+
         foreach (var cp in Crosspoints)
         {
             var inDev = inputSnapshot.FirstOrDefault(d => cp.InCh >= d.OldOffset && cp.InCh < d.OldOffset + d.Channels);
@@ -183,5 +207,26 @@ public class AppConfig
             int newOut = newOutOffset + (cp.OutCh - outDev.OldOffset);
             engine.SetCrosspoint(newIn, newOut, true, cp.GainDb);
         }
+    }
+
+    private LegacyUiPreferencesSnapshot? ReadLegacyUiPreferences()
+    {
+        if (string.IsNullOrWhiteSpace(UiPreferencesJson)) return null;
+
+        try
+        {
+            return JsonSerializer.Deserialize<LegacyUiPreferencesSnapshot>(UiPreferencesJson, _jsonOptions);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private sealed class LegacyUiPreferencesSnapshot
+    {
+        public int? CaptureBufferMs { get; set; }
+        public string InputMasterId { get; set; } = "";
+        public string OutputMasterId { get; set; } = "";
     }
 }

@@ -158,6 +158,20 @@ public class AudioEngine : IDisposable
         {
             list.AddRange(_enumerator.GetDevices(DataFlow.Capture));
         }
+        if (includeLoopback)
+        {
+            var renders = _enumerator.GetDevices(DataFlow.Render);
+            foreach (var render in renders)
+            {
+                list.Add(new DeviceInfo(
+                    $"loop:{render.Id}",
+                    $"{render.Name} (loopback)",
+                    render.Channels,
+                    render.SampleRate,
+                    DataFlow.Capture
+                ));
+            }
+        }
         return list;
     }
 
@@ -166,11 +180,31 @@ public class AudioEngine : IDisposable
         if (string.IsNullOrWhiteSpace(deviceId)) return false;
         if (_inputDevices.Any(d => d.Info.Id == deviceId)) return false;
 
-        var devices = _enumerator.GetDevices(DataFlow.Capture);
-        var found = devices.FirstOrDefault(d => d.Id == deviceId);
+        DeviceInfo? found;
+        bool isLoopback = false;
+        if (deviceId.StartsWith("loop:", StringComparison.Ordinal))
+        {
+            var renderId = deviceId.Substring("loop:".Length);
+            var renderDevices = _enumerator.GetDevices(DataFlow.Render);
+            var render = renderDevices.FirstOrDefault(d => d.Id == renderId);
+            if (render == null) return false;
+            found = new DeviceInfo(
+                deviceId,
+                $"{render.Name} (loopback)",
+                render.Channels,
+                render.SampleRate,
+                DataFlow.Capture
+            );
+            isLoopback = true;
+        }
+        else
+        {
+            var devices = _enumerator.GetDevices(DataFlow.Capture);
+            found = devices.FirstOrDefault(d => d.Id == deviceId);
+        }
         if (found == null) return false;
 
-        var ad = new ActiveDevice { Info = found };
+        var ad = new ActiveDevice { Info = found, IsLoopback = isLoopback };
         _inputDevices.Add(ad);
         RecalcChannelOffsets();
         StateChanged?.Invoke();
