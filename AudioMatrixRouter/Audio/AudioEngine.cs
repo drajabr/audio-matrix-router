@@ -149,8 +149,7 @@ public class AudioEngine : IDisposable
     public List<DeviceInfo> GetAvailableDevices(DataFlow flow) => _enumerator.GetDevices(flow);
 
     /// <summary>
-    /// Returns DeviceInfo entries usable as capture inputs. Render devices are also returned as
-    /// loopback sources (their Id is prefixed with "loop:" to disambiguate from real capture endpoints).
+    /// Returns DeviceInfo entries usable as capture inputs.
     /// </summary>
     public List<DeviceInfo> GetAvailableInputDevices(bool includeCapture, bool includeLoopback)
     {
@@ -159,13 +158,6 @@ public class AudioEngine : IDisposable
         {
             list.AddRange(_enumerator.GetDevices(DataFlow.Capture));
         }
-        if (includeLoopback)
-        {
-            foreach (var d in _enumerator.GetDevices(DataFlow.Render))
-            {
-                list.Add(new DeviceInfo($"loop:{d.Id}", $"{d.Name} (loopback)", d.Channels, d.SampleRate, DataFlow.Render));
-            }
-        }
         return list;
     }
 
@@ -173,18 +165,6 @@ public class AudioEngine : IDisposable
     {
         if (string.IsNullOrWhiteSpace(deviceId)) return false;
         if (_inputDevices.Any(d => d.Info.Id == deviceId)) return false;
-
-        bool isLoopback = deviceId.StartsWith("loop:", StringComparison.Ordinal);
-        if (isLoopback)
-        {
-            var renderId = deviceId.Substring("loop:".Length);
-            var render = _enumerator.GetDevices(DataFlow.Render).FirstOrDefault(d => d.Id == renderId);
-            if (render == null) return false;
-            var info = new DeviceInfo(deviceId, $"{render.Name} (loopback)", render.Channels, render.SampleRate, DataFlow.Render);
-            _inputDevices.Add(new ActiveDevice { Info = info, IsLoopback = true });
-            RecalcChannelOffsets();
-            return true;
-        }
 
         var devices = _enumerator.GetDevices(DataFlow.Capture);
         var found = devices.FirstOrDefault(d => d.Id == deviceId);
@@ -490,18 +470,10 @@ public class AudioEngine : IDisposable
         var captureDevices = _enumerator.GetDevices(DataFlow.Capture);
         var renderDevices = _enumerator.GetDevices(DataFlow.Render);
 
-        static bool IsInputStillAvailable(ActiveDevice input, List<DeviceInfo> captures, List<DeviceInfo> renders)
-        {
-            if (input.IsLoopback && input.Info.Id.StartsWith("loop:", StringComparison.Ordinal))
-            {
-                var renderId = input.Info.Id.Substring("loop:".Length);
-                return renders.Any(r => r.Id == renderId);
-            }
+        static bool IsInputStillAvailable(ActiveDevice input, List<DeviceInfo> captures) =>
+            captures.Any(c => c.Id == input.Info.Id);
 
-            return captures.Any(c => c.Id == input.Info.Id);
-        }
-
-        bool changed = _inputDevices.Any(d => !IsInputStillAvailable(d, captureDevices, renderDevices))
+        bool changed = _inputDevices.Any(d => !IsInputStillAvailable(d, captureDevices))
             || _outputDevices.Any(d => !renderDevices.Any(rd => rd.Id == d.Info.Id));
 
         if (!changed)
@@ -518,7 +490,7 @@ public class AudioEngine : IDisposable
 
         for (int i = _inputDevices.Count - 1; i >= 0; i--)
         {
-            if (!IsInputStillAvailable(_inputDevices[i], captureDevices, renderDevices))
+            if (!IsInputStillAvailable(_inputDevices[i], captureDevices))
             {
                 _inputDevices.RemoveAt(i);
             }

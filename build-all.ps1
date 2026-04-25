@@ -112,11 +112,15 @@ Pop-Location
 
 Write-Host ''
 Write-Host 'Starting local preview server on http://localhost:4173'
-Write-Host 'Press Ctrl+C to stop.'
+Write-Host 'Preview server will run in the background.'
 Write-Host ''
-Push-Location $webUiPath
-try {
-  npm run preview
-} finally {
-  Pop-Location
+
+$npmCommand = (Get-Command npm -ErrorAction SilentlyContinue)
+if (-not $npmCommand) {
+  Write-Host 'ERROR: npm not found on PATH; cannot start preview server.'
+  exit 1
 }
+
+$previewArgs = @('run', 'preview', '--', '--host', '127.0.0.1', '--port', '4173')
+$previewProcess = Start-Process -FilePath $npmCommand.Source -ArgumentList $previewArgs -WorkingDirectory $webUiPath -PassThru
+Write-Host "Preview process started (PID: $($previewProcess.Id))."

@@ -584,7 +584,7 @@ textarea {
   color: var(--text-strong);
   font-size: var(--font-size-xs);
   min-height: 56px;
-  overflow: hidden;
+  overflow: visible;
   isolation: isolate;
 }
 
@@ -598,7 +598,7 @@ textarea {
   gap: 4px;
   border: 0;
   background: var(--panel);
-  overflow: hidden;
+  overflow: visible;
   isolation: isolate;
 }
 
@@ -946,12 +946,18 @@ textarea {
   transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease;
 }
 
-.cell.loop-blocked,
 .cell:disabled {
   cursor: not-allowed;
-  opacity: 0.28;
-  border-color: color-mix(in srgb, var(--line) 75%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--line) 45%, transparent);
+  opacity: 0.18;
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  pointer-events: none;
+}
+
+.cell:disabled.cell {
+  /* Cancel any hover/selected outlines on disabled cells */
+  transform: none;
 }
 
 .cell.phase-inverted {
@@ -1124,7 +1130,7 @@ textarea {
   min-height: 112px;
   max-height: 112px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 96px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) 112px minmax(0, 1fr);
   align-items: stretch;
   overflow-x: hidden;
   overflow-y: hidden;
@@ -1167,13 +1173,13 @@ textarea {
 }
 
 .dock-center {
-  width: 96px;
-  max-width: 96px;
+  width: 112px;
+  max-width: 112px;
   display: flex;
-  align-items: stretch;
+  align-items: center;
   justify-content: center;
   z-index: 3;
-  padding: 0 4px;
+  padding: 0;
   box-sizing: border-box;
   overflow: hidden;
 }
@@ -1192,12 +1198,11 @@ textarea {
 
 .mute-btn {
   border: 2px solid color-mix(in srgb, var(--line) 88%, white 12%);
-  border-radius: 6px;
-  width: 100%;
-  max-width: 88px;
-  min-width: 0;
-  height: auto;
+  border-radius: 8px;
+  height: 100%;
+  width: auto;
   aspect-ratio: 1 / 1;
+  min-width: 0;
   padding: 0;
   background: color-mix(in srgb, var(--surface) 76%, black 24%);
   color: var(--text-strong);
@@ -1205,7 +1210,6 @@ textarea {
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  align-self: center;
   flex: 0 0 auto;
 }
 

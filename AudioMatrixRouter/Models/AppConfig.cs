@@ -38,6 +38,7 @@ public class AppConfig
     public List<CrosspointConfig> Crosspoints { get; set; } = [];
     public List<OutputLatencyConfig> OutputLatencies { get; set; } = [];
     public bool Locked { get; set; }
+    public bool StartupAtBoot { get; set; }
     public string UiPreferencesJson { get; set; } = "";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
@@ -75,12 +76,13 @@ public class AppConfig
         catch { }
     }
 
-    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, string uiPreferencesJson)
+    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson)
     {
         var config = new AppConfig
         {
             Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized },
             Locked = locked,
+            StartupAtBoot = startupAtBoot,
             UiPreferencesJson = uiPreferencesJson ?? ""
         };
 
@@ -106,15 +108,74 @@ public class AppConfig
 
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
+        // Migration: a previous version of SyncDevicesWithSystem auto-added every system
+        // capture + loopback endpoint as an active input and persisted that bloated list.
+        // On startup we'd then open a WasapiCapture/WasapiLoopbackCapture per device,
+        // which pegs CPU and hangs the UI. So: only add devices that are referenced by
+        // at least one saved crosspoint, then remap channel indices to the pruned layout.
+        // First pass: temporarily add all devices to learn each one's channel count.
         foreach (var d in InputDevices)
             engine.AddInputDevice(d.Id);
         foreach (var d in OutputDevices)
             engine.AddOutputDevice(d.Id);
 
+        // Snapshot original (id, channels, offset) in saved order, then clear.
+        var inputSnapshot = engine.InputDevices
+            .Select(d => (Id: d.Info.Id, Channels: d.Info.Channels, OldOffset: d.GlobalChannelOffset))
+            .ToList();
+        var outputSnapshot = engine.OutputDevices
+            .Select(d => (Id: d.Info.Id, Channels: d.Info.Channels, OldOffset: d.GlobalChannelOffset))
+            .ToList();
+
+        // Determine which devices any crosspoint references.
+        var usedInputIds = new HashSet<string>();
+        var usedOutputIds = new HashSet<string>();
+        foreach (var cp in Crosspoints)
+        {
+            var inDev = inputSnapshot.FirstOrDefault(d => cp.InCh >= d.OldOffset && cp.InCh < d.OldOffset + d.Channels);
+            if (inDev.Id != null) usedInputIds.Add(inDev.Id);
+            var outDev = outputSnapshot.FirstOrDefault(d => cp.OutCh >= d.OldOffset && cp.OutCh < d.OldOffset + d.Channels);
+            if (outDev.Id != null) usedOutputIds.Add(outDev.Id);
+        }
+
+        // Wipe and rebuild with only referenced devices, in original saved order.
+        // RemoveInputDevice/RemoveOutputDevice resize the matrix; remove from the end
+        // to avoid shifting indices repeatedly.
+        for (int i = engine.InputDevices.Count - 1; i >= 0; i--)
+            engine.RemoveInputDevice(i);
+        for (int i = engine.OutputDevices.Count - 1; i >= 0; i--)
+            engine.RemoveOutputDevice(i);
+
+        var keptInputs = inputSnapshot.Where(d => usedInputIds.Contains(d.Id)).ToList();
+        var keptOutputs = outputSnapshot.Where(d => usedOutputIds.Contains(d.Id)).ToList();
+
+        foreach (var d in keptInputs)
+            engine.AddInputDevice(d.Id);
+        foreach (var d in keptOutputs)
+            engine.AddOutputDevice(d.Id);
+
+        // Build new offset tables to remap saved crosspoint channels.
+        var newInputOffsets = new Dictionary<string, int>();
+        int inAcc = 0;
+        foreach (var d in keptInputs) { newInputOffsets[d.Id] = inAcc; inAcc += d.Channels; }
+        var newOutputOffsets = new Dictionary<string, int>();
+        int outAcc = 0;
+        foreach (var d in keptOutputs) { newOutputOffsets[d.Id] = outAcc; outAcc += d.Channels; }
+
         foreach (var outputLatency in OutputLatencies)
             engine.SetOutputDelayMs(outputLatency.DeviceId, outputLatency.DelayMs);
 
         foreach (var cp in Crosspoints)
-            engine.SetCrosspoint(cp.InCh, cp.OutCh, true, cp.GainDb);
+        {
+            var inDev = inputSnapshot.FirstOrDefault(d => cp.InCh >= d.OldOffset && cp.InCh < d.OldOffset + d.Channels);
+            var outDev = outputSnapshot.FirstOrDefault(d => cp.OutCh >= d.OldOffset && cp.OutCh < d.OldOffset + d.Channels);
+            if (inDev.Id == null || outDev.Id == null) continue;
+            if (!newInputOffsets.TryGetValue(inDev.Id, out var newInOffset)) continue;
+            if (!newOutputOffsets.TryGetValue(outDev.Id, out var newOutOffset)) continue;
+
+            int newIn = newInOffset + (cp.InCh - inDev.OldOffset);
+            int newOut = newOutOffset + (cp.OutCh - outDev.OldOffset);
+            engine.SetCrosspoint(newIn, newOut, true, cp.GainDb);
+        }
     }
 }

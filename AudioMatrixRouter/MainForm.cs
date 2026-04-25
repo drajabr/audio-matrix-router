@@ -1,7 +1,6 @@
 using System.Text.Json;
 using System.Threading;
 using System.Runtime.InteropServices;
-using Microsoft.Win32;
 using AudioMatrixRouter.Audio;
 using AudioMatrixRouter.Models;
 using Microsoft.Web.WebView2.Core;
@@ -25,7 +24,7 @@ public sealed class MainForm : Form
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
     private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 500 };
     private readonly System.Windows.Forms.Timer _deviceRefreshTimer = new() { Interval = 250 };
-    private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 500 };
+    private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 100 };
     private readonly NotifyIcon _trayIcon = new();
     private readonly ContextMenuStrip _trayMenu = new();
     private readonly Icon _trayAppIcon;
@@ -34,8 +33,20 @@ public sealed class MainForm : Form
     private bool _allowRealClose;
     private readonly bool _forceStartMinimized;
     private bool _startMinimizedFromConfig;
+    private bool _startupAtBoot;
     private string _uiPreferencesJson = "";
-    private const string StartupRunEntryName = "AudioMatrixRouter";
+    private const string StartupScriptName = "AudioMatrixRouter-startup.cmd";
+
+    // Cached enumeration of system devices. WASAPI device enumeration + AudioClient.MixFormat
+    // queries are slow (COM activation per endpoint); refresh only on hot-plug events,
+    // not every metrics tick.
+    private List<DeviceInfo> _cachedAvailableInputs = new();
+    private List<DeviceInfo> _cachedAvailableOutputs = new();
+    private bool _availableDevicesDirty = true;
+    // Whether to include the bulky available-device list in the next push. Hot metric
+    // pushes (peaks/latency) skip it to keep the JSON small and React work cheap.
+    private bool _pendingFullStatePush = true;
+    private bool _webViewReady;
 
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -72,6 +83,8 @@ public sealed class MainForm : Form
         _deviceRefreshTimer.Tick += async (_, _) =>
         {
             _deviceRefreshTimer.Stop();
+            _availableDevicesDirty = true;
+            _pendingFullStatePush = true;
             SyncDevicesWithSystem();
             await PushStateToUiAsync();
         };
@@ -80,6 +93,8 @@ public sealed class MainForm : Form
         _engine.DevicesChanged += () =>
         {
             if (IsDisposed) return;
+            _availableDevicesDirty = true;
+            _pendingFullStatePush = true;
             if (InvokeRequired)
             {
                 BeginInvoke(() => _deviceRefreshTimer.Start());
@@ -92,6 +107,7 @@ public sealed class MainForm : Form
         _engine.StateChanged += () =>
         {
             if (IsDisposed) return;
+            _pendingFullStatePush = true;
             if (InvokeRequired)
             {
                 BeginInvoke(() => { _ = PushStateToUiAsync(); });
@@ -101,9 +117,11 @@ public sealed class MainForm : Form
                 _ = PushStateToUiAsync();
             }
         };
-        _metricsPushTimer.Tick += async (_, _) =>
+        _metricsPushTimer.Tick += (_, _) =>
         {
-            await PushStateToUiAsync();
+            // Fire-and-forget; serialize off the UI thread isn't safe (touches engine state),
+            // but the work is tiny in hot mode (no device enum) so it's fine on UI thread.
+            _ = PushStateToUiAsync();
         };
         _metricsPushTimer.Start();
 
@@ -240,6 +258,7 @@ public sealed class MainForm : Form
         _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
         _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
         _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+        _webViewReady = true;
 
         _webView.CoreWebView2.NavigationStarting += (s, e) =>
         {
@@ -307,6 +326,7 @@ public sealed class MainForm : Form
             loadedConfig.ApplyToEngine(_engine);
             _locked = loadedConfig.Locked;
             _uiPreferencesJson = loadedConfig.UiPreferencesJson ?? "";
+            _startupAtBoot = loadedConfig.StartupAtBoot;
 
             if (loadedConfig.Window.Width > 0 && loadedConfig.Window.Height > 0)
             {
@@ -318,6 +338,7 @@ public sealed class MainForm : Form
             }
 
             _startMinimizedFromConfig = loadedConfig.Window.StartMinimized;
+            _startupAtBoot = ApplyStartupAtBoot(_startupAtBoot) ? _startupAtBoot : false;
 
             SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
 
@@ -344,21 +365,22 @@ public sealed class MainForm : Form
 
     private void SyncDevicesWithSystem(bool addAllAvailableIfEmpty = false)
     {
+        _availableDevicesDirty = true;
         _engine.RefreshDevices();
 
+        // Note: capture endpoints are exposed to the UI via
+        // GetAvailableInputDevices(includeCapture, includeLoopback) — they are NOT
+        // auto-added as active inputs here. Auto-adding every endpoint would spin up
+        // a WasapiCapture per device on Start(), which pegs CPU and hangs the engine.
         var captureDevices = _engine.GetAvailableDevices(DataFlow.Capture);
         var renderDevices = _engine.GetAvailableDevices(DataFlow.Render);
 
-        // Always include real capture endpoints in addition to loopback endpoints.
-        foreach (var capture in captureDevices)
+        if (addAllAvailableIfEmpty && _engine.InputDevices.Count == 0)
         {
-            _engine.AddInputDevice(capture.Id);
-        }
-
-        foreach (var render in renderDevices)
-        {
-            // Always expose render endpoints as loopback capture sources.
-            _engine.AddInputDevice($"loop:{render.Id}");
+            foreach (var device in captureDevices)
+            {
+                _engine.AddInputDevice(device.Id);
+            }
         }
 
         if (addAllAvailableIfEmpty && _engine.OutputDevices.Count == 0)
@@ -379,7 +401,7 @@ public sealed class MainForm : Form
         }
 
         var startMinimized = WindowState == FormWindowState.Minimized || !Visible || !ShowInTaskbar;
-        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _uiPreferencesJson);
+        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _startupAtBoot, _uiPreferencesJson);
         config.Save();
     }
 
@@ -436,12 +458,14 @@ public sealed class MainForm : Form
             switch (request.Method)
             {
                 case "getState":
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "refreshDevices":
+                    _availableDevicesDirty = true;
+                    _pendingFullStatePush = true;
                     SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "addInputDevice":
@@ -450,7 +474,7 @@ public sealed class MainForm : Form
                         _engine.AddInputDevice(addInputId.GetString() ?? string.Empty);
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "addOutputDevice":
@@ -459,7 +483,7 @@ public sealed class MainForm : Form
                         _engine.AddOutputDevice(addOutputId.GetString() ?? string.Empty);
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "removeInputDevice":
@@ -468,7 +492,7 @@ public sealed class MainForm : Form
                         _engine.RemoveInputDevice(removeInputId.GetString() ?? string.Empty);
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "removeOutputDevice":
@@ -477,23 +501,23 @@ public sealed class MainForm : Form
                         _engine.RemoveOutputDevice(removeOutputId.GetString() ?? string.Empty);
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "startEngine":
                     _engine.Start();
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "stopEngine":
                     _engine.Stop();
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "setLocked":
                     _locked = request.Params.TryGetProperty("locked", out var lockValue) && lockValue.GetBoolean();
                     ScheduleSave();
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "getUiPreferences":
@@ -514,7 +538,7 @@ public sealed class MainForm : Form
                         _engine.ClearCrosspoints();
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "setCrosspoint":
@@ -540,7 +564,7 @@ public sealed class MainForm : Form
                         ScheduleSave();
                     }
 
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
                 }
 
@@ -548,23 +572,75 @@ public sealed class MainForm : Form
                 {
                     if (!_locked && request.Params.TryGetProperty("routes", out var routesElem) && routesElem.ValueKind == JsonValueKind.Array)
                     {
-                        var updates = new List<(int InCh, int OutCh, bool Active, float GainDb)>();
+                        // Two payload shapes are accepted:
+                        //  (a) legacy: { inCh, outCh, active, gainDb } — pre-resolved global channel indices.
+                        //  (b) deviceId form: { inDeviceId, inChannel, outDeviceId, outChannel, active, gainDb }.
+                        // Form (b) auto-adds the referenced devices to the engine if they aren't already
+                        // active, then resolves the global channel index. This is how user-selected
+                        // devices end up in the engine — there is no separate "addInputDevice" step.
+                        bool devicesChanged = false;
+                        var pending = new List<(string? InId, int InCh, string? OutId, int OutCh, bool Active, float GainDb, int LegacyIn, int LegacyOut)>();
                         foreach (var route in routesElem.EnumerateArray())
                         {
-                            int inCh = route.TryGetProperty("inCh", out var inElem) ? inElem.GetInt32() : -1;
-                            int outCh = route.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
+                            string? inDeviceId = route.TryGetProperty("inDeviceId", out var inIdElem) ? inIdElem.GetString() : null;
+                            string? outDeviceId = route.TryGetProperty("outDeviceId", out var outIdElem) ? outIdElem.GetString() : null;
+                            int inChannel = route.TryGetProperty("inChannel", out var inChElem) ? inChElem.GetInt32() : 0;
+                            int outChannel = route.TryGetProperty("outChannel", out var outChElem) ? outChElem.GetInt32() : 0;
+                            int legacyIn = route.TryGetProperty("inCh", out var inElem) ? inElem.GetInt32() : -1;
+                            int legacyOut = route.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
                             bool active = route.TryGetProperty("active", out var activeElem) && activeElem.GetBoolean();
                             float gainDb = route.TryGetProperty("gainDb", out var gainElem) ? gainElem.GetSingle() : 0f;
-                            updates.Add((inCh, outCh, active, gainDb));
+
+                            if (!string.IsNullOrEmpty(inDeviceId) && active)
+                            {
+                                if (_engine.AddInputDevice(inDeviceId)) devicesChanged = true;
+                            }
+                            if (!string.IsNullOrEmpty(outDeviceId) && active)
+                            {
+                                if (_engine.AddOutputDevice(outDeviceId)) devicesChanged = true;
+                            }
+
+                            pending.Add((inDeviceId, inChannel, outDeviceId, outChannel, active, gainDb, legacyIn, legacyOut));
+                        }
+
+                        var updates = new List<(int InCh, int OutCh, bool Active, float GainDb)>();
+                        foreach (var p in pending)
+                        {
+                            int inGlobal = p.LegacyIn;
+                            int outGlobal = p.LegacyOut;
+                            if (!string.IsNullOrEmpty(p.InId))
+                            {
+                                var inDev = _engine.InputDevices.FirstOrDefault(d => d.Info.Id == p.InId);
+                                if (inDev != null && p.InCh >= 0 && p.InCh < inDev.Info.Channels)
+                                    inGlobal = inDev.GlobalChannelOffset + p.InCh;
+                                else if (!p.Active)
+                                    continue;
+                            }
+                            if (!string.IsNullOrEmpty(p.OutId))
+                            {
+                                var outDev = _engine.OutputDevices.FirstOrDefault(d => d.Info.Id == p.OutId);
+                                if (outDev != null && p.OutCh >= 0 && p.OutCh < outDev.Info.Channels)
+                                    outGlobal = outDev.GlobalChannelOffset + p.OutCh;
+                                else if (!p.Active)
+                                    continue;
+                            }
+                            if (inGlobal < 0 || outGlobal < 0) continue;
+                            updates.Add((inGlobal, outGlobal, p.Active, p.GainDb));
                         }
 
                         int changed = _engine.SetCrosspoints(updates);
-                        if (changed > 0)
+                        if (changed > 0 || devicesChanged)
                         {
                             if (_engine.RoutingMatrix.HasAnyCrosspoints())
                             {
                                 if (!_engine.IsRunning)
                                 {
+                                    _engine.Start();
+                                }
+                                else if (devicesChanged)
+                                {
+                                    // Restart so newly added devices are captured.
+                                    _engine.Stop();
                                     _engine.Start();
                                 }
                             }
@@ -577,7 +653,7 @@ public sealed class MainForm : Form
                         }
                     }
 
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
                 }
 
@@ -587,7 +663,7 @@ public sealed class MainForm : Form
                         _engine.SetInputMasterDevice(inputMasterId.GetString() ?? string.Empty);
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "setOutputMasterDevice":
@@ -596,7 +672,7 @@ public sealed class MainForm : Form
                         _engine.SetOutputMasterDevice(outputMasterId.GetString() ?? string.Empty);
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "setOutputDelayMs":
@@ -606,7 +682,7 @@ public sealed class MainForm : Form
                         _engine.SetOutputDelayMs(outputDelayDeviceId.GetString() ?? string.Empty, outputDelayMs.GetInt32());
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "setCaptureBufferMs":
@@ -615,7 +691,7 @@ public sealed class MainForm : Form
                         _engine.SetCaptureBufferMs(captureBufferMs.GetInt32());
                         ScheduleSave();
                     }
-                    await SendResultAsync(request.Id, BuildUiState());
+                    await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
                 case "getStartupAtBoot":
@@ -626,7 +702,7 @@ public sealed class MainForm : Form
                 {
                     var enabled = request.Params.TryGetProperty("enabled", out var startupEnabled) && startupEnabled.GetBoolean();
                     var applied = SetStartupAtBoot(enabled);
-                    await SendResultAsync(request.Id, applied && IsStartupAtBootEnabled());
+                    await SendResultAsync(request.Id, applied && _startupAtBoot);
                     return;
                 }
 
@@ -651,7 +727,22 @@ public sealed class MainForm : Form
         }
     }
 
-    private UiState BuildUiState()
+    private void EnsureAvailableDevicesCached()
+    {
+        if (!_availableDevicesDirty) return;
+        try
+        {
+            _cachedAvailableInputs = _engine.GetAvailableInputDevices(includeCapture: true, includeLoopback: false);
+            _cachedAvailableOutputs = _engine.GetAvailableDevices(DataFlow.Render);
+        }
+        catch
+        {
+            // Fall back to whatever is currently cached.
+        }
+        _availableDevicesDirty = false;
+    }
+
+    private UiState BuildUiState(bool includeAvailableDevices)
     {
         var routes = new List<RouteState>();
         var matrix = _engine.RoutingMatrix;
@@ -682,15 +773,12 @@ public sealed class MainForm : Form
             }
         }
 
-        return new UiState
+        List<DeviceState>? availableInputs = null;
+        List<DeviceState>? availableOutputs = null;
+        if (includeAvailableDevices)
         {
-            Running = _engine.IsRunning,
-            Locked = _locked,
-            StartupAtBoot = IsStartupAtBootEnabled(),
-            CaptureBufferMs = _engine.CaptureBufferMs,
-            TotalLatencyMs = maxWorkingLatencyMs,
-            AvailableInputs = _engine.GetAvailableInputDevices(includeCapture: true, includeLoopback: true)
-                .Select(d => new DeviceState
+            EnsureAvailableDevicesCached();
+            availableInputs = _cachedAvailableInputs.Select(d => new DeviceState
             {
                 DeviceId = d.Id,
                 Label = d.Name,
@@ -698,9 +786,9 @@ public sealed class MainForm : Form
                 Offset = 0,
                 IsMaster = false,
                 DelayMs = 0,
-                IsLoopback = d.Id.StartsWith("loop:", StringComparison.Ordinal)
-            }).ToList(),
-            AvailableOutputs = _engine.GetAvailableDevices(DataFlow.Render).Select(d => new DeviceState
+                IsLoopback = false
+            }).ToList();
+            availableOutputs = _cachedAvailableOutputs.Select(d => new DeviceState
             {
                 DeviceId = d.Id,
                 Label = d.Name,
@@ -708,7 +796,19 @@ public sealed class MainForm : Form
                 Offset = 0,
                 IsMaster = false,
                 DelayMs = 0
-            }).ToList(),
+            }).ToList();
+        }
+
+        return new UiState
+        {
+            Running = _engine.IsRunning,
+            Locked = _locked,
+            StartupAtBoot = _startupAtBoot,
+            CaptureBufferMs = _engine.CaptureBufferMs,
+            TotalLatencyMs = maxWorkingLatencyMs,
+            HasFullDeviceLists = includeAvailableDevices,
+            AvailableInputs = availableInputs,
+            AvailableOutputs = availableOutputs,
             Inputs = _engine.InputDevices.Select(d => new DeviceState
             {
                 DeviceId = d.Info.Id,
@@ -722,7 +822,7 @@ public sealed class MainForm : Form
                 Overflows = Interlocked.Read(ref d.InputOverflowCount),
                 DroppedFrames = d.RingBuffer?.TotalFramesDropped ?? 0,
                 IsLoopback = d.IsLoopback,
-                PeakLevels = SnapshotPeaks(d.PeakLevels)
+                PeakLevels = SampleAndResetPeaks(d.PeakLevels)
             }).ToList(),
             Outputs = _engine.OutputDevices.Select(d => new DeviceState
             {
@@ -735,56 +835,57 @@ public sealed class MainForm : Form
                 SampleRate = d.Info.SampleRate,
                 DriverLatencyMs = d.RenderLatencyMs,
                 Underruns = d.MixProvider?.UnderrunCount ?? 0,
-                PeakLevels = d.MixProvider?.PeekPeakLevels() ?? Array.Empty<float>()
+                PeakLevels = d.MixProvider?.SamplePeakLevels() ?? Array.Empty<float>()
             }).ToList(),
             Routes = routes
         };
     }
 
-    private static float[] SnapshotPeaks(float[]? peaks)
+    private static float[] SampleAndResetPeaks(float[]? peaks)
     {
         if (peaks == null || peaks.Length == 0) return Array.Empty<float>();
         var snapshot = new float[peaks.Length];
         for (int i = 0; i < peaks.Length; i++)
         {
             snapshot[i] = peaks[i];
+            peaks[i] = 0f;
         }
         return snapshot;
     }
 
     private bool IsStartupAtBootEnabled()
     {
-        try
-        {
-            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", false);
-            var value = key?.GetValue(StartupRunEntryName) as string;
-            if (string.IsNullOrWhiteSpace(value)) return false;
-
-            var exePath = Path.GetFullPath(Application.ExecutablePath).Trim().Trim('"');
-            return value.Contains(exePath, StringComparison.OrdinalIgnoreCase);
-        }
-        catch
-        {
-            return false;
-        }
+        return _startupAtBoot;
     }
 
     private bool SetStartupAtBoot(bool enabled)
     {
+        if (!ApplyStartupAtBoot(enabled)) return false;
+        _startupAtBoot = enabled;
+        ScheduleSave();
+        return true;
+    }
+
+    private static string GetStartupScriptPath()
+    {
+        var startupDir = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
+        return Path.Combine(startupDir, StartupScriptName);
+    }
+
+    private static bool ApplyStartupAtBoot(bool enabled)
+    {
         try
         {
-            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true)
-                ?? Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
-
-            if (key == null) return false;
-
+            var scriptPath = GetStartupScriptPath();
             if (enabled)
             {
-                key.SetValue(StartupRunEntryName, $"\"{Application.ExecutablePath}\" --startup");
+                var content = "@echo off\r\n" +
+                              "start \"\" \"" + Application.ExecutablePath + "\" --startup\r\n";
+                File.WriteAllText(scriptPath, content);
             }
-            else
+            else if (File.Exists(scriptPath))
             {
-                key.DeleteValue(StartupRunEntryName, false);
+                File.Delete(scriptPath);
             }
 
             return true;
@@ -795,13 +896,25 @@ public sealed class MainForm : Form
         }
     }
 
-    private async Task PushStateToUiAsync()
+    private Task PushStateToUiAsync()
     {
-        if (_webView.CoreWebView2 == null) return;
+        if (!_webViewReady || _webView.CoreWebView2 == null) return Task.CompletedTask;
 
-        var stateJson = JsonSerializer.Serialize(BuildUiState(), JsonOptions);
-        var script = $"window.dispatchEvent(new CustomEvent('native-state', {{ detail: {stateJson} }}));";
-        await _webView.CoreWebView2.ExecuteScriptAsync(script);
+        bool full = _pendingFullStatePush;
+        _pendingFullStatePush = false;
+
+        try
+        {
+            var stateJson = JsonSerializer.Serialize(BuildUiState(full), JsonOptions);
+            // PostWebMessageAsJson is fire-and-forget and ~10x cheaper than ExecuteScriptAsync
+            // (no script compile, no V8 promise round-trip back to .NET).
+            _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"native-state\",\"state\":" + stateJson + "}");
+        }
+        catch
+        {
+            // WebView may have torn down between checks.
+        }
+        return Task.CompletedTask;
     }
 
     private async Task SendResultAsync(string requestId, object result)
@@ -863,8 +976,9 @@ public sealed class MainForm : Form
         public bool StartupAtBoot { get; set; }
         public int CaptureBufferMs { get; set; }
         public double? TotalLatencyMs { get; set; }
-        public List<DeviceState> AvailableInputs { get; set; } = [];
-        public List<DeviceState> AvailableOutputs { get; set; } = [];
+        public bool HasFullDeviceLists { get; set; }
+        public List<DeviceState>? AvailableInputs { get; set; }
+        public List<DeviceState>? AvailableOutputs { get; set; }
         public List<DeviceState> Inputs { get; set; } = [];
         public List<DeviceState> Outputs { get; set; } = [];
         public List<RouteState> Routes { get; set; } = [];

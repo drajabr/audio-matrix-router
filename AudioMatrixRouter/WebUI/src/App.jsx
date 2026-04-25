@@ -99,6 +99,32 @@ function ensureNativeBridge() {
     });
   };
 
+  // Receive fire-and-forget pushes from native (e.g. periodic state snapshots).
+  // Uses PostWebMessageAsJson on the C# side, which delivers a parsed object here.
+  if (!window.__nativeBridgePushBound) {
+    window.__nativeBridgePushBound = true;
+    window.chrome.webview.addEventListener("message", (event) => {
+      const data = event?.data;
+      if (!data || typeof data !== "object") return;
+      if (data.kind === "native-state" && data.state) {
+        // Merge cached available-device lists when this push omitted them (hot tick).
+        if (!data.state.hasFullDeviceLists) {
+          const cached = window.__lastNativeState;
+          if (cached) {
+            if (!data.state.availableInputs && cached.availableInputs) {
+              data.state.availableInputs = cached.availableInputs;
+            }
+            if (!data.state.availableOutputs && cached.availableOutputs) {
+              data.state.availableOutputs = cached.availableOutputs;
+            }
+          }
+        }
+        window.__lastNativeState = data.state;
+        window.dispatchEvent(new CustomEvent("native-state", { detail: data.state }));
+      }
+    });
+  }
+
   return true;
 }
 
@@ -338,6 +364,70 @@ function collectConfiguredDeviceIds(matrixByView) {
   return { configuredInputIds, configuredOutputIds };
 }
 
+function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channelRows, channelCols) {
+  const next = {
+    device: createMatrix(deviceRows, deviceCols, {}),
+    channel: createMatrix(channelRows, channelCols, {}),
+  };
+
+  const nativeInputs = Array.isArray(state?.inputs) ? state.inputs : [];
+  const nativeOutputs = Array.isArray(state?.outputs) ? state.outputs : [];
+  const nativeRoutes = Array.isArray(state?.routes) ? state.routes : [];
+
+  const resolveDeviceChannel = (devices, globalChannel) => {
+    if (!Number.isFinite(globalChannel)) return null;
+    for (const d of devices) {
+      const offset = Number.isFinite(d?.offset) ? d.offset : 0;
+      const channels = Math.max(1, Number.isFinite(d?.channels) ? Math.floor(d.channels) : 1);
+      if (globalChannel >= offset && globalChannel < offset + channels) {
+        return {
+          deviceId: d.deviceId,
+          localChannel: globalChannel - offset,
+        };
+      }
+    }
+    return null;
+  };
+
+  const deviceAggregates = new Map();
+
+  nativeRoutes.forEach((route) => {
+    const inRef = resolveDeviceChannel(nativeInputs, route?.inCh);
+    const outRef = resolveDeviceChannel(nativeOutputs, route?.outCh);
+    if (!inRef || !outRef || !inRef.deviceId || !outRef.deviceId) return;
+
+    const gainDb = Number.isFinite(route?.gainDb) ? route.gainDb : 0;
+
+    const channelKey = getCellKey(`ch:${inRef.deviceId}:${inRef.localChannel}`, `ch:${outRef.deviceId}:${outRef.localChannel}`);
+    if (channelKey in next.channel) {
+      next.channel[channelKey] = {
+        ...makeDefaultConnection(),
+        on: true,
+        muted: false,
+        gainDb: clamp(gainDb, DB_MIN, DB_MAX),
+      };
+    }
+
+    const deviceKey = getCellKey(`dev:${inRef.deviceId}`, `dev:${outRef.deviceId}`);
+    const aggregate = deviceAggregates.get(deviceKey) || { count: 0, gainDbSum: 0 };
+    aggregate.count += 1;
+    aggregate.gainDbSum += gainDb;
+    deviceAggregates.set(deviceKey, aggregate);
+  });
+
+  deviceAggregates.forEach((aggregate, deviceKey) => {
+    if (!(deviceKey in next.device)) return;
+    next.device[deviceKey] = {
+      ...makeDefaultConnection(),
+      on: aggregate.count > 0,
+      muted: false,
+      gainDb: aggregate.count > 0 ? clamp(aggregate.gainDbSum / aggregate.count, DB_MIN, DB_MAX) : 0,
+    };
+  });
+
+  return next;
+}
+
 class AudioMatrixManager {
   constructor() {
     this.context = null;
@@ -481,6 +571,7 @@ class AudioMatrixManager {
 
     for (const input of inputs) {
       try {
+        const inputChannelCount = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             deviceId: input.deviceId ? { exact: input.deviceId } : undefined,
@@ -492,7 +583,7 @@ class AudioMatrixManager {
         });
 
         const source = ctx.createMediaStreamSource(stream);
-        const splitter = ctx.createChannelSplitter(2);
+  const splitter = ctx.createChannelSplitter(inputChannelCount);
         source.connect(splitter);
 
         const deviceAnalyzer = ctx.createAnalyser();
@@ -500,7 +591,7 @@ class AudioMatrixManager {
         source.connect(deviceAnalyzer);
         this.inputMeterAnalyzers.set(`dev:${input.deviceId}`, deviceAnalyzer);
 
-        for (let ch = 0; ch < 2; ch += 1) {
+        for (let ch = 0; ch < inputChannelCount; ch += 1) {
           const analyzer = ctx.createAnalyser();
           analyzer.fftSize = 512;
           splitter.connect(analyzer, ch);
@@ -515,6 +606,7 @@ class AudioMatrixManager {
     }
 
     for (const output of outputs) {
+      const outputChannelCount = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
       const destination = ctx.createMediaStreamDestination();
       const monitorAnalyzer = ctx.createAnalyser();
       monitorAnalyzer.fftSize = 512;
@@ -524,7 +616,7 @@ class AudioMatrixManager {
 
       let node;
       if (viewMode === "channel") {
-        node = ctx.createChannelMerger(2);
+        node = ctx.createChannelMerger(outputChannelCount);
       } else {
         node = ctx.createGain();
       }
@@ -557,20 +649,19 @@ class AudioMatrixManager {
       this.outputMeterAnalyzers.set(`dev:${output.deviceId}`, monitorAnalyzer);
 
       if (viewMode === "channel") {
-        const outSplitter = ctx.createChannelSplitter(2);
+        const outSplitter = ctx.createChannelSplitter(outputChannelCount);
         postGain.connect(outSplitter);
-        const ana0 = ctx.createAnalyser();
-        ana0.fftSize = 512;
-        const ana1 = ctx.createAnalyser();
-        ana1.fftSize = 512;
-        outSplitter.connect(ana0, 0);
-        outSplitter.connect(ana1, 1);
-        this.outputMeterAnalyzers.set(`ch:${output.deviceId}:0`, ana0);
-        this.outputMeterAnalyzers.set(`ch:${output.deviceId}:1`, ana1);
+        for (let ch = 0; ch < outputChannelCount; ch += 1) {
+          const analyzer = ctx.createAnalyser();
+          analyzer.fftSize = 512;
+          outSplitter.connect(analyzer, ch);
+          this.outputMeterAnalyzers.set(`ch:${output.deviceId}:${ch}`, analyzer);
+        }
         this.outputMeterSplitters.set(output.deviceId, outSplitter);
       } else {
-        this.outputMeterAnalyzers.set(`ch:${output.deviceId}:0`, monitorAnalyzer);
-        this.outputMeterAnalyzers.set(`ch:${output.deviceId}:1`, monitorAnalyzer);
+        for (let ch = 0; ch < outputChannelCount; ch += 1) {
+          this.outputMeterAnalyzers.set(`ch:${output.deviceId}:${ch}`, monitorAnalyzer);
+        }
       }
     }
 
@@ -596,12 +687,16 @@ class AudioMatrixManager {
         const inputNode = this.inputNodes.get(input.deviceId);
         if (!inputNode) continue;
 
-        for (let inCh = 0; inCh < 2; inCh += 1) {
+        const inputChannelCount = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
+
+        for (let inCh = 0; inCh < inputChannelCount; inCh += 1) {
           for (const output of outputs) {
             const outputNode = this.outputNodes.get(output.deviceId);
             if (!outputNode) continue;
 
-            for (let outCh = 0; outCh < 2; outCh += 1) {
+            const outputChannelCount = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
+
+            for (let outCh = 0; outCh < outputChannelCount; outCh += 1) {
               const gain = ctx.createGain();
               gain.gain.value = 0;
 
@@ -706,6 +801,8 @@ export default function App({ runtime = "web" }) {
   const dragScrollRef = useRef({ tracking: false, dragging: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0, pointerId: 0, blockNextClick: false });
   const latencyLastRef = useRef(null);
   const latencyJitterRef = useRef(0);
+  const nativeInputPeakTargetsRef = useRef({});
+  const nativeOutputPeakTargetsRef = useRef({});
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -879,6 +976,10 @@ export default function App({ runtime = "web" }) {
       const inMeta = {};
       (Array.isArray(state?.inputs) ? state.inputs : []).forEach((d) => {
         if (!d?.deviceId) return;
+        const peakLevels = Array.isArray(d?.peakLevels)
+          ? d.peakLevels.map((v) => clamp(Number(v) || 0, 0, 1))
+          : [];
+        nativeInputPeakTargetsRef.current[d.deviceId] = peakLevels;
         inMeta[d.deviceId] = {
           offset: Number.isFinite(d?.offset) ? d.offset : 0,
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
@@ -886,25 +987,52 @@ export default function App({ runtime = "web" }) {
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
           overflows: Number.isFinite(d?.overflows) ? d.overflows : 0,
           droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
-          isLoopback: !!d?.isLoopback,
-          peakLevels: Array.isArray(d?.peakLevels) ? d.peakLevels.map((v) => Number(v) || 0) : [],
+          peakLevels,
         };
       });
-      setNativeInputChannelMeta(inMeta);
+      nativeInputPeakTargetsRef.current = Object.fromEntries(
+        Object.entries(nativeInputPeakTargetsRef.current).filter(([deviceId]) => !!inMeta[deviceId]),
+      );
+      setNativeInputChannelMeta((prev) => {
+        const next = {};
+        Object.keys(inMeta).forEach((deviceId) => {
+          next[deviceId] = {
+            ...inMeta[deviceId],
+            peakLevels: prev[deviceId]?.peakLevels ?? inMeta[deviceId].peakLevels,
+          };
+        });
+        return next;
+      });
 
       const outMeta = {};
       (Array.isArray(state?.outputs) ? state.outputs : []).forEach((d) => {
         if (!d?.deviceId) return;
+        const peakLevels = Array.isArray(d?.peakLevels)
+          ? d.peakLevels.map((v) => clamp(Number(v) || 0, 0, 1))
+          : [];
+        nativeOutputPeakTargetsRef.current[d.deviceId] = peakLevels;
         outMeta[d.deviceId] = {
           offset: Number.isFinite(d?.offset) ? d.offset : 0,
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
           underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
-          peakLevels: Array.isArray(d?.peakLevels) ? d.peakLevels.map((v) => Number(v) || 0) : [],
+          peakLevels,
         };
       });
-      setNativeOutputChannelMeta(outMeta);
+      nativeOutputPeakTargetsRef.current = Object.fromEntries(
+        Object.entries(nativeOutputPeakTargetsRef.current).filter(([deviceId]) => !!outMeta[deviceId]),
+      );
+      setNativeOutputChannelMeta((prev) => {
+        const next = {};
+        Object.keys(outMeta).forEach((deviceId) => {
+          next[deviceId] = {
+            ...outMeta[deviceId],
+            peakLevels: prev[deviceId]?.peakLevels ?? outMeta[deviceId].peakLevels,
+          };
+        });
+        return next;
+      });
 
       if (total != null) {
         if (latencyLastRef.current != null) {
@@ -1006,11 +1134,61 @@ export default function App({ runtime = "web" }) {
     };
   }, [hasNativeBridge]);
 
+  useEffect(() => {
+    if (!hasNativeBridge) return;
+
+    let rafId = 0;
+
+    const smoothPeaks = (prevMeta, targetsRef) => {
+      const keys = Object.keys(prevMeta);
+      let changed = false;
+      const nextMeta = {};
+
+      keys.forEach((deviceId) => {
+        const entry = prevMeta[deviceId] || {};
+        const currentPeaks = Array.isArray(entry.peakLevels) ? entry.peakLevels : [];
+        const targetPeaks = Array.isArray(targetsRef.current[deviceId]) ? targetsRef.current[deviceId] : [];
+        const peakCount = Math.max(currentPeaks.length, targetPeaks.length);
+        const smoothedPeaks = new Array(peakCount);
+
+        for (let i = 0; i < peakCount; i += 1) {
+          const current = clamp(Number(currentPeaks[i]) || 0, 0, 1);
+          const target = clamp(Number(targetPeaks[i]) || 0, 0, 1);
+          const blend = target > current ? 0.38 : 0.16;
+          let next = current + (target - current) * blend;
+          if (Math.abs(target - next) < 0.002) next = target;
+          if (next < 0.0005) next = 0;
+          smoothedPeaks[i] = next;
+          if (!changed && Math.abs(next - current) > 0.0005) changed = true;
+        }
+
+        nextMeta[deviceId] = {
+          ...entry,
+          peakLevels: smoothedPeaks,
+        };
+      });
+
+      return changed ? nextMeta : prevMeta;
+    };
+
+    const tick = () => {
+      setNativeInputChannelMeta((prev) => smoothPeaks(prev, nativeInputPeakTargetsRef));
+      setNativeOutputChannelMeta((prev) => smoothPeaks(prev, nativeOutputPeakTargetsRef));
+      rafId = requestAnimationFrame(tick);
+    };
+
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      cancelAnimationFrame(rafId);
+    };
+  }, [hasNativeBridge]);
+
   const rows = useMemo(() => {
     if (viewMode === "device") {
       return visibleInputs.map((input) => {
         const rawLabel = inputLabels[input.deviceId] || input.label;
         const parts = getDeviceLabelParts(rawLabel);
+        const channelCount = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
         return {
           id: `dev:${input.deviceId}`,
           label: parts.primary,
@@ -1018,7 +1196,7 @@ export default function App({ runtime = "web" }) {
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           deviceId: input.deviceId,
-          isLoopback: !!input.isLoopback,
+          channelCount,
           isMaster: input.deviceId === inputMasterId,
         };
       });
@@ -1027,32 +1205,28 @@ export default function App({ runtime = "web" }) {
     return visibleInputs.flatMap((input) => {
       const rawLabel = inputLabels[input.deviceId] || input.label;
       const parts = getDeviceLabelParts(rawLabel);
-      return [
-        {
-          id: `ch:${input.deviceId}:0`,
-          pairedId: `ch:${input.deviceId}:1`,
+      const channelCount = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
+      return Array.from({ length: channelCount }, (_, ch) => {
+        const pairedIds = [];
+        for (let p = 0; p < channelCount; p += 1) {
+          if (p !== ch) pairedIds.push(`ch:${input.deviceId}:${p}`);
+        }
+        return {
+          id: `ch:${input.deviceId}:${ch}`,
+          pairedId: pairedIds[0] || `ch:${input.deviceId}:${ch}`,
+          pairedIds,
           label: parts.primary,
           hardwareLabel: parts.hardware,
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           deviceId: input.deviceId,
-          isLoopback: !!input.isLoopback,
-          isChannelStart: true,
+          isChannelStart: ch === 0,
+          isChannelEnd: ch === channelCount - 1,
+          channelIndex: ch,
+          channelCount,
           isMaster: input.deviceId === inputMasterId,
-        },
-        {
-          id: `ch:${input.deviceId}:1`,
-          pairedId: `ch:${input.deviceId}:0`,
-          label: parts.primary,
-          hardwareLabel: parts.hardware,
-          deviceRefLabel: parts.deviceRef,
-          fullLabel: rawLabel,
-          deviceId: input.deviceId,
-          isLoopback: !!input.isLoopback,
-          isChannelEnd: true,
-          isMaster: input.deviceId === inputMasterId,
-        },
-      ];
+        };
+      });
     });
   }, [visibleInputs, inputLabels, viewMode, inputMasterId]);
 
@@ -1061,6 +1235,7 @@ export default function App({ runtime = "web" }) {
       return visibleOutputs.map((output) => {
         const rawLabel = outputLabels[output.deviceId] || output.label;
         const parts = getDeviceLabelParts(rawLabel);
+        const channelCount = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
         return {
           id: `dev:${output.deviceId}`,
           label: parts.primary,
@@ -1069,6 +1244,7 @@ export default function App({ runtime = "web" }) {
           fullLabel: rawLabel,
           outputDeviceId: output.deviceId,
           delayMs: Number.isFinite(output.delayMs) ? output.delayMs : 0,
+          channelCount,
           isMaster: output.deviceId === outputMasterId,
         };
       });
@@ -1077,32 +1253,29 @@ export default function App({ runtime = "web" }) {
     return visibleOutputs.flatMap((output) => {
       const rawLabel = outputLabels[output.deviceId] || output.label;
       const parts = getDeviceLabelParts(rawLabel);
-      return [
-        {
-          id: `ch:${output.deviceId}:0`,
-          pairedId: `ch:${output.deviceId}:1`,
+      const channelCount = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
+      return Array.from({ length: channelCount }, (_, ch) => {
+        const pairedIds = [];
+        for (let p = 0; p < channelCount; p += 1) {
+          if (p !== ch) pairedIds.push(`ch:${output.deviceId}:${p}`);
+        }
+        return {
+          id: `ch:${output.deviceId}:${ch}`,
+          pairedId: pairedIds[0] || `ch:${output.deviceId}:${ch}`,
+          pairedIds,
           label: parts.primary,
           hardwareLabel: parts.hardware,
           deviceRefLabel: parts.deviceRef,
           fullLabel: rawLabel,
           outputDeviceId: output.deviceId,
           delayMs: Number.isFinite(output.delayMs) ? output.delayMs : 0,
-          isChannelStart: true,
+          isChannelStart: ch === 0,
+          isChannelEnd: ch === channelCount - 1,
+          channelIndex: ch,
+          channelCount,
           isMaster: output.deviceId === outputMasterId,
-        },
-        {
-          id: `ch:${output.deviceId}:1`,
-          pairedId: `ch:${output.deviceId}:0`,
-          label: parts.primary,
-          hardwareLabel: parts.hardware,
-          deviceRefLabel: parts.deviceRef,
-          fullLabel: rawLabel,
-          outputDeviceId: output.deviceId,
-          delayMs: Number.isFinite(output.delayMs) ? output.delayMs : 0,
-          isChannelEnd: true,
-          isMaster: output.deviceId === outputMasterId,
-        },
-      ];
+        };
+      });
     });
   }, [visibleOutputs, outputLabels, viewMode, outputMasterId]);
 
@@ -1131,9 +1304,20 @@ export default function App({ runtime = "web" }) {
   const syncConnectionToNative = async (mode, rowId, colId, connection) => {
     if (!hasNativeBridge) return;
 
+    // Pull device metadata from BOTH active engine inputs/outputs and the available pool,
+    // so newly-selected devices that aren't in the engine yet still resolve. The native
+    // side will add them on demand when it sees the inDeviceId/outDeviceId fields.
     const state = await window.__nativeBridgeInvoke("getState", {});
-    const nativeInputs = Array.isArray(state?.inputs) ? state.inputs : [];
-    const nativeOutputs = Array.isArray(state?.outputs) ? state.outputs : [];
+    const allInputs = [
+      ...(Array.isArray(state?.inputs) ? state.inputs : []),
+      ...(Array.isArray(state?.availableInputs) ? state.availableInputs : []),
+    ];
+    const allOutputs = [
+      ...(Array.isArray(state?.outputs) ? state.outputs : []),
+      ...(Array.isArray(state?.availableOutputs) ? state.availableOutputs : []),
+    ];
+    const findInput = (id) => allInputs.find((d) => d?.deviceId === id);
+    const findOutput = (id) => allOutputs.find((d) => d?.deviceId === id);
 
     const active = !!connection?.on && !connection?.muted;
     const baseGainDb = Number.isFinite(connection?.gainDb) ? connection.gainDb : 0;
@@ -1145,16 +1329,17 @@ export default function App({ runtime = "web" }) {
       const colParsed = parseChannelId(colId);
       if (!rowParsed || !colParsed) return;
 
-      const inputDevice = nativeInputs.find((d) => d.deviceId === rowParsed.deviceId);
-      const outputDevice = nativeOutputs.find((d) => d.deviceId === colParsed.deviceId);
+      const inputDevice = findInput(rowParsed.deviceId);
+      const outputDevice = findOutput(colParsed.deviceId);
       if (!inputDevice || !outputDevice) return;
 
-      const inCh = (inputDevice.offset || 0) + rowParsed.channelIndex;
-      const outCh = (outputDevice.offset || 0) + colParsed.channelIndex;
-
       routesPayload.push({
-        inCh,
-        outCh,
+        inDeviceId: rowParsed.deviceId,
+        inChannel: rowParsed.channelIndex,
+        outDeviceId: colParsed.deviceId,
+        outChannel: colParsed.channelIndex,
+        inCh: (Number.isFinite(inputDevice?.offset) ? inputDevice.offset : 0) + rowParsed.channelIndex,
+        outCh: (Number.isFinite(outputDevice?.offset) ? outputDevice.offset : 0) + colParsed.channelIndex,
         active,
         gainDb: baseGainDb,
       });
@@ -1163,8 +1348,8 @@ export default function App({ runtime = "web" }) {
       const outputDeviceId = colId?.startsWith("dev:") ? colId.slice(4) : "";
       if (!inputDeviceId || !outputDeviceId) return;
 
-      const inputDevice = nativeInputs.find((d) => d.deviceId === inputDeviceId);
-      const outputDevice = nativeOutputs.find((d) => d.deviceId === outputDeviceId);
+      const inputDevice = findInput(inputDeviceId);
+      const outputDevice = findOutput(outputDeviceId);
       if (!inputDevice || !outputDevice) return;
 
       const inChannels = Array.from({ length: inputDevice.channels || 0 }, (_, i) => i);
@@ -1173,8 +1358,12 @@ export default function App({ runtime = "web" }) {
 
       routes.forEach((route) => {
         routesPayload.push({
-          inCh: (inputDevice.offset || 0) + route.inChannel,
-          outCh: (outputDevice.offset || 0) + route.outChannel,
+          inDeviceId: inputDeviceId,
+          inChannel: route.inChannel,
+          outDeviceId: outputDeviceId,
+          outChannel: route.outChannel,
+          inCh: (Number.isFinite(inputDevice?.offset) ? inputDevice.offset : 0) + route.inChannel,
+          outCh: (Number.isFinite(outputDevice?.offset) ? outputDevice.offset : 0) + route.outChannel,
           active,
           gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
         });
@@ -1185,8 +1374,16 @@ export default function App({ runtime = "web" }) {
       try {
         await window.__nativeBridgeInvoke("setCrosspoints", { routes: routesPayload });
       } catch (_) {
-        // Backward-compatible fallback for older host builds.
-        await Promise.all(routesPayload.map((route) => window.__nativeBridgeInvoke("setCrosspoint", route)));
+        // Backward-compatible fallback for hosts that only expose setCrosspoint.
+        await Promise.all(routesPayload.map((route) => {
+          const legacy = {
+            inCh: Number.isFinite(route.inCh) ? route.inCh : (Number.isFinite(route.inChannel) ? route.inChannel : 0),
+            outCh: Number.isFinite(route.outCh) ? route.outCh : (Number.isFinite(route.outChannel) ? route.outChannel : 0),
+            active: !!route.active,
+            gainDb: Number.isFinite(route.gainDb) ? route.gainDb : 0,
+          };
+          return window.__nativeBridgeInvoke("setCrosspoint", legacy);
+        }));
       }
     }
   };
@@ -1331,7 +1528,7 @@ export default function App({ runtime = "web" }) {
     }
   };
 
-  const discoverDevices = async () => {
+  const discoverDevices = async (forceRefreshNative = false) => {
     try {
       setIsReloadingDevices(true);
       setError("");
@@ -1365,9 +1562,19 @@ export default function App({ runtime = "web" }) {
 
       let discoveredInputs = [];
       let discoveredOutputs = [];
+      let nativeState = null;
 
       if (hasNativeBridge) {
+        if (forceRefreshNative) {
+          try {
+            await window.__nativeBridgeInvoke("refreshDevices", {});
+          } catch (_) {
+            // Ignore refresh failures; we'll still query the latest state snapshot.
+          }
+        }
+
         const state = await window.__nativeBridgeInvoke("getState", {});
+        nativeState = state;
         if (Number.isFinite(state?.captureBufferMs)) {
           setCaptureBufferMs(state.captureBufferMs);
         }
@@ -1385,10 +1592,12 @@ export default function App({ runtime = "web" }) {
           const map = new Map();
           list.forEach((d, i) => {
             if (!d?.deviceId || map.has(d.deviceId)) return;
+            const ch = Number.isFinite(d?.channels) && d.channels > 0 ? Math.floor(d.channels) : 2;
             map.set(d.deviceId, {
               deviceId: d.deviceId,
               label: d.label || `Device ${i + 1}`,
               delayMs: Number.isFinite(d?.delayMs) ? d.delayMs : 0,
+              channels: ch,
               isLoopback: !!d?.isLoopback || String(d.deviceId).startsWith("loop:"),
             });
           });
@@ -1398,12 +1607,14 @@ export default function App({ runtime = "web" }) {
         discoveredInputs = uniqByDeviceId(nativeInputs).map((d) => ({
           deviceId: d.deviceId,
           label: d.label,
-          isLoopback: d.isLoopback,
+          channels: d.channels,
+          isLoopback: !!d.isLoopback,
         }));
         discoveredOutputs = uniqByDeviceId(nativeOutputs).map((d) => ({
           deviceId: d.deviceId,
           label: d.label,
           delayMs: d.delayMs,
+          channels: d.channels,
         }));
       } else {
         await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -1413,7 +1624,7 @@ export default function App({ runtime = "web" }) {
           .map((d, i) => ({
             deviceId: d.deviceId,
             label: d.label || `Input ${i + 1}`,
-            isLoopback: false,
+            channels: 2,
           }));
 
         discoveredOutputs = devices
@@ -1422,6 +1633,7 @@ export default function App({ runtime = "web" }) {
             deviceId: d.deviceId,
             label: d.label || `Output ${i + 1}`,
             delayMs: 0,
+            channels: 2,
           }));
       }
 
@@ -1458,15 +1670,15 @@ export default function App({ runtime = "web" }) {
       const deviceRows = orderedInputs.map((i) => ({ id: `dev:${i.deviceId}` }));
       const deviceCols = orderedOutputs.map((o) => ({ id: `dev:${o.deviceId}` }));
 
-      const channelRows = orderedInputs.flatMap((i) => [
-        { id: `ch:${i.deviceId}:0` },
-        { id: `ch:${i.deviceId}:1` },
-      ]);
+      const channelRows = orderedInputs.flatMap((i) => {
+        const ch = Math.max(1, Number.isFinite(i?.channels) ? Math.floor(i.channels) : 2);
+        return Array.from({ length: ch }, (_, idx) => ({ id: `ch:${i.deviceId}:${idx}` }));
+      });
 
-      const channelCols = orderedOutputs.flatMap((o) => [
-        { id: `ch:${o.deviceId}:0` },
-        { id: `ch:${o.deviceId}:1` },
-      ]);
+      const channelCols = orderedOutputs.flatMap((o) => {
+        const ch = Math.max(1, Number.isFinite(o?.channels) ? Math.floor(o.channels) : 2);
+        return Array.from({ length: ch }, (_, idx) => ({ id: `ch:${o.deviceId}:${idx}` }));
+      });
 
       const sourceDeviceMatrix = Object.keys(currentMatrixByView.device || {}).length > 0
         ? currentMatrixByView.device
@@ -1475,7 +1687,11 @@ export default function App({ runtime = "web" }) {
         ? currentMatrixByView.channel
         : saved?.matrixByView?.channel || {};
 
-      const nextMatrixByView = {
+      const nativeMatrixByView = hasNativeBridge
+        ? buildMatrixByViewFromNativeState(nativeState, deviceRows, deviceCols, channelRows, channelCols)
+        : null;
+
+      const nextMatrixByView = nativeMatrixByView || {
         device: createMatrix(deviceRows, deviceCols, sourceDeviceMatrix),
         channel: createMatrix(channelRows, channelCols, sourceChannelMatrix),
       };
@@ -1585,7 +1801,7 @@ export default function App({ runtime = "web" }) {
 
     managerRef.current = new AudioMatrixManager();
     setContextState("suspended");
-    await discoverDevices();
+    await discoverDevices(true);
   };
 
   const handleResetMatrix = async (event) => {
@@ -1593,14 +1809,14 @@ export default function App({ runtime = "web" }) {
 
     const deviceRows = inputs.map((input) => ({ id: `dev:${input.deviceId}` }));
     const deviceCols = outputs.map((output) => ({ id: `dev:${output.deviceId}` }));
-    const channelRows = inputs.flatMap((input) => [
-      { id: `ch:${input.deviceId}:0` },
-      { id: `ch:${input.deviceId}:1` },
-    ]);
-    const channelCols = outputs.flatMap((output) => [
-      { id: `ch:${output.deviceId}:0` },
-      { id: `ch:${output.deviceId}:1` },
-    ]);
+    const channelRows = inputs.flatMap((input) => {
+      const count = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
+      return Array.from({ length: count }, (_, idx) => ({ id: `ch:${input.deviceId}:${idx}` }));
+    });
+    const channelCols = outputs.flatMap((output) => {
+      const count = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
+      return Array.from({ length: count }, (_, idx) => ({ id: `ch:${output.deviceId}:${idx}` }));
+    });
 
     const nextMatrixByView = {
       device: createMatrix(deviceRows, deviceCols, {}),
@@ -1693,10 +1909,11 @@ export default function App({ runtime = "web" }) {
 
       if (modeRef.current === "device") {
         inputs.forEach((input) => {
-          const leftId = `ch:${input.deviceId}:0`;
-          const rightId = `ch:${input.deviceId}:1`;
-          nextInput[leftId] = managerRef.current.getInputLevel(leftId);
-          nextInput[rightId] = managerRef.current.getInputLevel(rightId);
+          const channelCount = Math.max(1, Number.isFinite(input?.channels) ? Math.floor(input.channels) : 2);
+          for (let ch = 0; ch < channelCount; ch += 1) {
+            const id = `ch:${input.deviceId}:${ch}`;
+            nextInput[id] = managerRef.current.getInputLevel(id);
+          }
         });
       }
 
@@ -1707,10 +1924,11 @@ export default function App({ runtime = "web" }) {
 
       if (modeRef.current === "device") {
         outputs.forEach((output) => {
-          const leftId = `ch:${output.deviceId}:0`;
-          const rightId = `ch:${output.deviceId}:1`;
-          nextOutput[leftId] = managerRef.current.getOutputLevel(leftId);
-          nextOutput[rightId] = managerRef.current.getOutputLevel(rightId);
+          const channelCount = Math.max(1, Number.isFinite(output?.channels) ? Math.floor(output.channels) : 2);
+          for (let ch = 0; ch < channelCount; ch += 1) {
+            const id = `ch:${output.deviceId}:${ch}`;
+            nextOutput[id] = managerRef.current.getOutputLevel(id);
+          }
         });
       }
 
@@ -1806,23 +2024,32 @@ export default function App({ runtime = "web" }) {
       };
 
       if (viewMode === "channel") {
-        const rowParts = String(rowId).split(":");
-        const colParts = String(colId).split(":");
-        const inDev = rowParts[0] === "ch" ? rowParts[1] : "";
-        const outDev = colParts[0] === "ch" ? colParts[1] : "";
+        const rowParsed = parseChannelId(rowId);
+        const colParsed = parseChannelId(colId);
+        const inDev = rowParsed?.deviceId || "";
+        const outDev = colParsed?.deviceId || "";
 
         if (inDev && outDev) {
-          const channelKeys = [
-            getCellKey(`ch:${inDev}:0`, `ch:${outDev}:0`),
-            getCellKey(`ch:${inDev}:0`, `ch:${outDev}:1`),
-            getCellKey(`ch:${inDev}:1`, `ch:${outDev}:0`),
-            getCellKey(`ch:${inDev}:1`, `ch:${outDev}:1`),
-          ];
+          const inChannels = Math.max(1, Number.isFinite(inputs.find((d) => d.deviceId === inDev)?.channels)
+            ? Math.floor(inputs.find((d) => d.deviceId === inDev).channels)
+            : 2);
+          const outChannels = Math.max(1, Number.isFinite(outputs.find((d) => d.deviceId === outDev)?.channels)
+            ? Math.floor(outputs.find((d) => d.deviceId === outDev).channels)
+            : 2);
+
+          const channelKeys = [];
+          for (let inCh = 0; inCh < inChannels; inCh += 1) {
+            for (let outCh = 0; outCh < outChannels; outCh += 1) {
+              channelKeys.push(getCellKey(`ch:${inDev}:${inCh}`, `ch:${outDev}:${outCh}`));
+            }
+          }
 
           const connections = channelKeys.map((k) => nextModeMatrix[k] || makeDefaultConnection());
           const anyOn = connections.some((c) => c.on);
           const allMuted = anyOn ? connections.every((c) => c.muted || !c.on) : false;
-          const avgGainDb = connections.reduce((acc, c) => acc + (Number.isFinite(c.gainDb) ? c.gainDb : 0), 0) / connections.length;
+          const avgGainDb = connections.length > 0
+            ? connections.reduce((acc, c) => acc + (Number.isFinite(c.gainDb) ? c.gainDb : 0), 0) / connections.length
+            : 0;
 
           next.device = {
             ...(prev.device || {}),
@@ -2232,37 +2459,90 @@ export default function App({ runtime = "web" }) {
   const getRowSplitLevels = (row) => {
     if (!row) return [0, 0];
     const devId = row.deviceId || (row.id.startsWith("dev:") ? row.id.slice(4) : row.id.split(":")[1]);
+    const ch = Math.max(1, Number.isFinite(row?.channelCount) ? Math.floor(row.channelCount) : 2);
     if (hasNativeBridge) {
       const peaks = nativeInputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        return [peaks[0] ?? 0, peaks[1] ?? peaks[0] ?? 0];
+        const first = peaks[0] ?? 0;
+        const second = ch > 1 ? (peaks[1] ?? 0) : first;
+        return [first, second];
       }
       return [0, 0];
     }
     const leftId = `ch:${devId}:0`;
-    const rightId = `ch:${devId}:1`;
+    const rightId = `ch:${devId}:${Math.min(1, ch - 1)}`;
+    const left = inputLevels[leftId] ?? managerRef.current.getInputLevel(leftId) ?? 0;
+    const right = inputLevels[rightId] ?? managerRef.current.getInputLevel(rightId) ?? 0;
     return [
-      inputLevels[leftId] ?? managerRef.current.getInputLevel(leftId) ?? 0,
-      inputLevels[rightId] ?? managerRef.current.getInputLevel(rightId) ?? 0,
+      left,
+      ch > 1 ? right : left,
     ];
   };
 
   const getColSplitLevels = (col) => {
     if (!col) return [0, 0];
     const devId = col.outputDeviceId || outputDeviceFromColId(col.id);
+    const ch = Math.max(1, Number.isFinite(col?.channelCount) ? Math.floor(col.channelCount) : 2);
     if (hasNativeBridge) {
       const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
       if (Array.isArray(peaks) && peaks.length) {
-        return [peaks[0] ?? 0, peaks[1] ?? peaks[0] ?? 0];
+        const first = peaks[0] ?? 0;
+        const second = ch > 1 ? (peaks[1] ?? 0) : first;
+        return [first, second];
       }
       return [0, 0];
     }
     const leftId = `ch:${devId}:0`;
-    const rightId = `ch:${devId}:1`;
+    const rightId = `ch:${devId}:${Math.min(1, ch - 1)}`;
+    const left = outputLevels[leftId] ?? managerRef.current.getOutputLevel(leftId) ?? 0;
+    const right = outputLevels[rightId] ?? managerRef.current.getOutputLevel(rightId) ?? 0;
     return [
-      outputLevels[leftId] ?? managerRef.current.getOutputLevel(leftId) ?? 0,
-      outputLevels[rightId] ?? managerRef.current.getOutputLevel(rightId) ?? 0,
+      left,
+      ch > 1 ? right : left,
     ];
+  };
+
+  // Per-channel level arrays sized to the device's actual channel count.
+  const getRowChannelLevels = (row) => {
+    if (!row) return [0];
+    const ch = Math.max(1, row.channelCount || 2);
+    const devId = row.deviceId || (row.id.startsWith("dev:") ? row.id.slice(4) : row.id.split(":")[1]);
+    if (hasNativeBridge) {
+      const peaks = nativeInputChannelMeta[devId]?.peakLevels;
+      const out = new Array(ch).fill(0);
+      if (Array.isArray(peaks)) {
+        for (let i = 0; i < ch; i += 1) out[i] = peaks[i] ?? 0;
+      }
+      return out;
+    }
+    return Array.from({ length: ch }, (_, i) => {
+      const id = `ch:${devId}:${i}`;
+      return inputLevels[id] ?? managerRef.current.getInputLevel(id) ?? 0;
+    });
+  };
+
+  const getColChannelLevels = (col) => {
+    if (!col) return [0];
+    const ch = Math.max(1, col.channelCount || 2);
+    const devId = col.outputDeviceId || outputDeviceFromColId(col.id);
+    if (hasNativeBridge) {
+      const peaks = nativeOutputChannelMeta[devId]?.peakLevels;
+      const out = new Array(ch).fill(0);
+      if (Array.isArray(peaks)) {
+        for (let i = 0; i < ch; i += 1) out[i] = peaks[i] ?? 0;
+      }
+      return out;
+    }
+    return Array.from({ length: ch }, (_, i) => {
+      const id = `ch:${devId}:${i}`;
+      return outputLevels[id] ?? managerRef.current.getOutputLevel(id) ?? 0;
+    });
+  };
+
+  const getChannelAxisLabel = (channelCount, channelIndex) => {
+    if (channelCount <= 1) return "M";
+    if (channelCount === 2) return channelIndex === 0 ? "L" : "R";
+    return String(channelIndex + 1);
   };
 
   const selectedSourceRawSplit = selectedSource ? getRowSplitLevels(selectedSource) : [0, 0];
@@ -2423,11 +2703,6 @@ export default function App({ runtime = "web" }) {
   const handleTransientMuteAllToggle = () => {
     if (!hasAnyActiveRoute) return;
     setTransientMuteAll((prev) => !prev);
-  };
-
-  const normalizePhysicalDeviceId = (deviceId) => {
-    if (!deviceId) return "";
-    return deviceId.startsWith("loop:") ? deviceId.slice(5) : deviceId;
   };
 
   const handleRootClick = (event) => {
@@ -2708,13 +2983,16 @@ export default function App({ runtime = "web" }) {
             />
 
             {cols.map((col) => {
-              if (col.isChannelEnd) return null;
+              if (viewMode === "channel" && !col.isChannelStart) return null;
 
-              const isActive = activeRoutes.has(col.id) || (col.pairedId && activeRoutes.has(col.pairedId));
-              const span = col.isChannelStart ? 2 : 1;
-              const [colLevelL, colLevelR] = getColSplitLevels(col);
+              const channelCount = viewMode === "device"
+                ? Math.max(2, col.channelCount || 1)
+                : Math.max(1, col.channelCount || 1);
+              const isActive = activeRoutes.has(col.id) || (col.pairedIds || []).some((pid) => activeRoutes.has(pid));
+              const span = viewMode === "channel" ? channelCount : 1;
+              const colChannelLevels = viewMode === "channel" ? getColChannelLevels(col) : getColSplitLevels(col);
 
-              const isColSelected = selectedCell?.colId === col.id || (col.pairedId && selectedCell?.colId === col.pairedId);
+              const isColSelected = selectedCell?.colId === col.id || (col.pairedIds || []).some((pid) => selectedCell?.colId === pid);
               return (
                 <div
                   key={col.id}
@@ -2739,9 +3017,14 @@ export default function App({ runtime = "web" }) {
                     onDoubleClick={() => handleOutputLabelDoubleClick(col.id)}
                   >
                     {col.isMaster ? <span className="master-badge master-badge-col">MASTER</span> : null}
-                    <div className="card-meter-bg card-meter-bg-col-split" aria-hidden="true">
-                      <span className="meter-bar meter-bar-l" style={{ height: `${Math.round(colLevelL * 100)}%` }} />
-                      <span className="meter-bar meter-bar-r" style={{ height: `${Math.round(colLevelR * 100)}%` }} />
+                    <div className="card-meter-bg card-meter-bg-col-split" aria-hidden="true" style={{ gridTemplateColumns: `repeat(${channelCount}, 1fr)` }}>
+                      {colChannelLevels.map((lvl, i) => (
+                        <span
+                          key={i}
+                          className={`meter-bar meter-bar-${i === 0 ? "l" : i === 1 ? "r" : `${i}`}`}
+                          style={{ height: `${Math.round((lvl || 0) * 100)}%` }}
+                        />
+                      ))}
                     </div>
                     {col.label ? (
                       <div className="v-label">
@@ -2752,19 +3035,25 @@ export default function App({ runtime = "web" }) {
                       <div className="v-label-spacer" />
                     )}
                   </div>
-                  <span className="col-channels-box" aria-hidden="true">
-                    <span className="axis-split-label axis-split-cell axis-label-l">L</span>
-                    <span className="axis-split-label axis-split-cell axis-label-r">R</span>
+                  <span className="col-channels-box" aria-hidden="true" style={{ gridTemplateColumns: `repeat(${channelCount}, 1fr)` }}>
+                    {Array.from({ length: channelCount }, (_, i) => (
+                      <span key={i} className="axis-split-label axis-split-cell">
+                        {getChannelAxisLabel(channelCount, i)}
+                      </span>
+                    ))}
                   </span>
                 </div>
               );
             })}
 
             {rows.map((row, rowIndex) => {
-              const isRowActive = activeRoutes.has(row.id) || (row.pairedId && activeRoutes.has(row.pairedId));
-              const isRowAxisActive = selectedCell?.rowId === row.id || (row.pairedId && selectedCell?.rowId === row.pairedId);
-              const skipHead = row.isChannelEnd;
-              const [rowLevelL, rowLevelR] = getRowSplitLevels(row);
+              const channelCount = viewMode === "device"
+                ? Math.max(2, row.channelCount || 1)
+                : Math.max(1, row.channelCount || 1);
+              const isRowActive = activeRoutes.has(row.id) || (row.pairedIds || []).some((pid) => activeRoutes.has(pid));
+              const isRowAxisActive = selectedCell?.rowId === row.id || (row.pairedIds || []).some((pid) => selectedCell?.rowId === pid);
+              const skipHead = viewMode === "channel" && !row.isChannelStart;
+              const rowChannelLevels = viewMode === "channel" ? getRowChannelLevels(row) : getRowSplitLevels(row);
               return (
               <React.Fragment key={row.id}>
                 {!skipHead && (
@@ -2778,7 +3067,7 @@ export default function App({ runtime = "web" }) {
 
                   ].filter(Boolean).join(" ")}
                   title={`${row.fullLabel || row.label}\nDouble-click to set input master`}
-                  style={row.isChannelStart ? { gridRow: "span 2" } : undefined}
+                  style={viewMode === "channel" && channelCount > 1 ? { gridRow: `span ${channelCount}` } : undefined}
                   draggable={!locked}
                   onDragStart={beginSortDrag("source", row.deviceId)}
                   onDragEnd={endSortDrag("source")}
@@ -2790,9 +3079,14 @@ export default function App({ runtime = "web" }) {
                     onDoubleClick={() => handleInputLabelDoubleClick(row.id)}
                   >
                     {row.isMaster ? <span className="master-badge master-badge-row">MASTER</span> : null}
-                    <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true">
-                      <span className="meter-bar meter-bar-l" style={{ width: `${Math.round(rowLevelL * 100)}%` }} />
-                      <span className="meter-bar meter-bar-r" style={{ width: `${Math.round(rowLevelR * 100)}%` }} />
+                    <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${channelCount}, 1fr)` }}>
+                      {rowChannelLevels.map((lvl, i) => (
+                        <span
+                          key={i}
+                          className={`meter-bar meter-bar-${i === 0 ? "l" : i === 1 ? "r" : `${i}`}`}
+                          style={{ width: `${Math.round((lvl || 0) * 100)}%` }}
+                        />
+                      ))}
                     </div>
                     {row.label ? (
                       <div className="row-label-btn">
@@ -2803,9 +3097,12 @@ export default function App({ runtime = "web" }) {
                       <div className="row-label-spacer" />
                     )}
                   </div>
-                  <span className="row-channels-box" aria-hidden="true">
-                    <span className="axis-split-label axis-split-cell axis-label-l">L</span>
-                    <span className="axis-split-label axis-split-cell axis-label-r">R</span>
+                  <span className="row-channels-box" aria-hidden="true" style={{ gridTemplateRows: `repeat(${channelCount}, 1fr)` }}>
+                    {Array.from({ length: channelCount }, (_, i) => (
+                      <span key={i} className="axis-split-label axis-split-cell">
+                        {getChannelAxisLabel(channelCount, i)}
+                      </span>
+                    ))}
                   </span>
                 </div>
                 )}
@@ -2813,10 +3110,6 @@ export default function App({ runtime = "web" }) {
                 {cols.map((col) => {
                   const key = getCellKey(row.id, col.id);
                   const state = activeMatrix[key] || makeDefaultConnection();
-                  const rowDeviceId = row.deviceId || parseChannelId(row.id)?.deviceId || "";
-                  const colDeviceId = col.outputDeviceId || outputDeviceFromColId(col.id);
-                  const loopBlocked = !!row.isLoopback
-                    && normalizePhysicalDeviceId(rowDeviceId) === normalizePhysicalDeviceId(colDeviceId);
                   const selected = selectedCell?.rowId === row.id && selectedCell?.colId === col.id;
                   const isMenuOpen = tileMenuCell?.rowId === row.id && tileMenuCell?.colId === col.id;
                   const isMenuDropUp = !!tileMenuCell?.dropUp;
@@ -2830,7 +3123,6 @@ export default function App({ runtime = "web" }) {
                           state.on ? "on" : "off",
                           selected && "selected",
                           state.on && state.muted && "muted",
-                          loopBlocked && "loop-blocked",
                           state.phaseInverted && "phase-inverted",
                           selectedCell && row.id === selectedCell.rowId && "active-row",
                           selectedCell && col.id === selectedCell.colId && "active-col",
@@ -2847,7 +3139,6 @@ export default function App({ runtime = "web" }) {
                             dragScrollRef.current.blockNextClick = false;
                             return;
                           }
-                          if (loopBlocked) return;
                           updateConnection(row.id, col.id, {
                             ...state,
                             on: !state.on,
@@ -2867,7 +3158,7 @@ export default function App({ runtime = "web" }) {
                           openTileMenuForCell(event, row.id, col.id);
                         }}
                         title={`${row.label} -> ${col.label}`}
-                        disabled={locked || loopBlocked}
+                        disabled={locked}
                       >
                         {Math.abs(state.gainDb || 0) >= 0.5 ? (
                           <span className="tile-gain-readout">{`${state.gainDb > 0 ? "+" : ""}${Math.round(state.gainDb)}dB`}</span>
@@ -2988,8 +3279,8 @@ export default function App({ runtime = "web" }) {
               <span className="metric-value">{sourceLatencyLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Timing</span>
-              <span className="metric-value">{`Jit ${jitterLabel}`}</span>
+              <span className="metric-title">Jitter</span>
+              <span className="metric-value">{jitterLabel}</span>
             </div>
           </div>
         </div>
@@ -3030,8 +3321,8 @@ export default function App({ runtime = "web" }) {
               <span className="metric-value">{destinationLatencyLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Timing</span>
-              <span className="metric-value">{`Jit ${jitterLabel}`}</span>
+              <span className="metric-title">Jitter</span>
+              <span className="metric-value">{jitterLabel}</span>
             </div>
           </div>
         </div>
