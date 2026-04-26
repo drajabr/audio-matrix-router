@@ -759,6 +759,11 @@ textarea {
     inset 0 -5px 14px rgba(0, 0, 0, 0.85),
     0 0 12px color-mix(in srgb, var(--accent) 24%, transparent);
   touch-action: none;
+  cursor: ns-resize;
+}
+
+.corner-buffer-wheel:disabled {
+  cursor: default;
 }
 
 .corner-buffer-wheel:hover,

@@ -1028,6 +1028,9 @@ public sealed class MainForm : Form
                 SampleRate = d.Info.SampleRate,
                 DriverLatencyMs = d.RenderLatencyMs,
                 Underruns = d.MixProvider?.UnderrunCount ?? 0,
+                DroppedFrames = d.MixProvider?.DroppedFrames ?? 0,
+                MovingAverageMs = d.MixProvider != null ? d.MixProvider.OutputMovingAverageMs : null,
+                VariationRangeMs = d.MixProvider != null ? d.MixProvider.OutputVariationRangeMs : null,
                 JitterMs = d.MixProvider != null ? d.MixProvider.OutputJitterMs : null,
                 SyncCorrections = d.MixProvider?.SyncCorrectionCount ?? 0,
                 PeakLevels = d.MixProvider?.SamplePeakLevels() ?? Array.Empty<float>()
@@ -1150,6 +1153,8 @@ public sealed class MainForm : Form
         public int SampleRate { get; set; }
         public int DriverLatencyMs { get; set; }
         public long Underruns { get; set; }
+        public double? MovingAverageMs { get; set; }
+        public double? VariationRangeMs { get; set; }
         public double? JitterMs { get; set; }
         public long SyncCorrections { get; set; }
         public long Overflows { get; set; }

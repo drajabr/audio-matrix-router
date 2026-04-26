@@ -13,10 +13,12 @@ public class RingBuffer
     private readonly int _channels;
     private readonly object _cursorLock = new();
     private readonly Dictionary<string, int> _consumerReadPos = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _consumerDroppedFrames = new(StringComparer.Ordinal);
     private string _preferredConsumerId = string.Empty;
     private long _totalFramesDropped;
 
     public long TotalFramesDropped => Interlocked.Read(ref _totalFramesDropped);
+    public int CapacityFrames => _channels > 0 ? _capacity / _channels : 0;
 
     public RingBuffer(int frameCount, int channels)
     {
@@ -57,6 +59,7 @@ public class RingBuffer
             {
                 rp = wp;
                 _consumerReadPos[consumerId] = rp;
+                _consumerDroppedFrames[consumerId] = 0;
             }
         }
 
@@ -69,6 +72,17 @@ public class RingBuffer
         lock (_cursorLock)
         {
             _consumerReadPos.Remove(consumerId);
+            _consumerDroppedFrames.Remove(consumerId);
+        }
+    }
+
+    public long GetDroppedFramesForConsumer(string consumerId)
+    {
+        lock (_cursorLock)
+        {
+            return _consumerDroppedFrames.TryGetValue(consumerId, out var dropped)
+                ? dropped
+                : 0;
         }
     }
 
@@ -122,7 +136,11 @@ public class RingBuffer
                     _consumerReadPos[key] = (rp + advance) % _capacity;
                     if (_channels > 0)
                     {
-                        Interlocked.Add(ref _totalFramesDropped, advance / _channels);
+                        int droppedFrames = advance / _channels;
+                        Interlocked.Add(ref _totalFramesDropped, droppedFrames);
+                        _consumerDroppedFrames[key] = _consumerDroppedFrames.TryGetValue(key, out var currentDropped)
+                            ? currentDropped + droppedFrames
+                            : droppedFrames;
                     }
                 }
             }
@@ -148,6 +166,7 @@ public class RingBuffer
             {
                 rp = wp;
                 _consumerReadPos[consumerId] = rp;
+                _consumerDroppedFrames[consumerId] = 0;
             }
         }
 
@@ -181,6 +200,7 @@ public class RingBuffer
             {
                 rp = wp;
                 _consumerReadPos[consumerId] = rp;
+                _consumerDroppedFrames[consumerId] = 0;
             }
         }
 

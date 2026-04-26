@@ -1250,8 +1250,11 @@ export default function App({ runtime = "web" }) {
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          movingAverageMs: Number.isFinite(d?.movingAverageMs) ? Math.round(Number(d.movingAverageMs) * 10) / 10 : null,
+          variationRangeMs: Number.isFinite(d?.variationRangeMs) ? Math.round(Number(d.variationRangeMs) * 10) / 10 : null,
           jitterMs: Number.isFinite(d?.jitterMs) ? Math.round(Number(d.jitterMs) * 10) / 10 : null,
           underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
+          droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
           syncCorrections: Number.isFinite(d?.syncCorrections) ? d.syncCorrections : 0,
           peakLevels,
         };
@@ -3662,14 +3665,6 @@ export default function App({ runtime = "web" }) {
         ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
         : null)
   ;
-  const sourceLatencyEffectiveMs = sourceLatencyDisplayMs ?? sourceDeviceDriverLatencyMs;
-  const destinationLatencyEffectiveMs = destinationLatencyResolvedMs ?? (
-    destinationDeviceDriverLatencyMs != null || selectedDestinationDelayMs > 0
-      ? Math.round(((destinationDeviceDriverLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
-      : null
-  );
-  const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
-  const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
   const formatCounter = (value) => {
     if (!Number.isFinite(value) || value < 0) return "n/a";
     const rounded = Math.round(value);
@@ -3681,14 +3676,30 @@ export default function App({ runtime = "web" }) {
   const outputSideDeviceId = selectedDestinationDeviceId || outputMasterId;
   const inputSideMeta = inputSideDeviceId ? nativeInputChannelMeta[inputSideDeviceId] : null;
   const outputSideMeta = outputSideDeviceId ? nativeOutputChannelMeta[outputSideDeviceId] : null;
-  const inputLatencyVarLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
-  const outputJitterLabel = hasNativeBridge
-    ? (Number.isFinite(outputSideMeta?.jitterMs) ? `${outputSideMeta.jitterMs}ms` : "n/a")
+  const inputSyncAverageMs = hasNativeBridge
+    ? (Number.isFinite(inputSideMeta?.driverLatencyMs) ? inputSideMeta.driverLatencyMs : null)
+    : null;
+  const sourceLatencyEffectiveMs = inputSyncAverageMs ?? (sourceLatencyDisplayMs ?? sourceDeviceDriverLatencyMs);
+  const outputSyncAverageMs = hasNativeBridge
+    ? (Number.isFinite(outputSideMeta?.movingAverageMs) ? outputSideMeta.movingAverageMs : null)
+    : null;
+  const destinationLatencyEffectiveMs = outputSyncAverageMs ?? (destinationLatencyResolvedMs ?? (
+    destinationDeviceDriverLatencyMs != null || selectedDestinationDelayMs > 0
+      ? Math.round(((destinationDeviceDriverLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
+      : null
+  ));
+  const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
+  const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
+  const inputSpreadLabel = hasNativeBridge
+    ? "n/a"
+    : (inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a"));
+  const outputSpreadLabel = hasNativeBridge
+    ? (Number.isFinite(outputSideMeta?.variationRangeMs) ? `${outputSideMeta.variationRangeMs}ms` : "n/a")
     : (outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a"));
   const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "n/a";
   const inputDroppedFramesLabel = hasNativeBridge ? formatCounter(inputSideMeta?.droppedFrames) : "n/a";
   const outputUnderrunsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.underruns) : "n/a";
-  const outputSyncCorrectionsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.syncCorrections) : "n/a";
+  const outputDroppedFramesLabel = hasNativeBridge ? formatCounter(outputSideMeta?.droppedFrames) : "n/a";
 
   const selectedSourceChannelLabels = Array.from(
     { length: Math.max(1, Number.isFinite(selectedSource?.channelCount) ? selectedSource.channelCount : 1) },
@@ -4006,6 +4017,8 @@ export default function App({ runtime = "web" }) {
                   }}
                   onPointerMove={(event) => {
                     if (!inputBufferDragRef.current || locked) return;
+                    const dragPx = event.clientY - inputBufferDragRef.current.startY;
+                    setInputBufferWheelOffsetPx(inputBufferDragRef.current.startOffsetPx + dragPx);
                     const deltaSteps = Math.trunc((inputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
                     const next = clamp(inputBufferDragRef.current.startMs + deltaSteps * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
                     if (next !== captureBufferMs) {
@@ -4062,6 +4075,8 @@ export default function App({ runtime = "web" }) {
                   }}
                   onPointerMove={(event) => {
                     if (!outputBufferDragRef.current || locked) return;
+                    const dragPx = event.clientY - outputBufferDragRef.current.startY;
+                    setOutputBufferWheelOffsetPx(outputBufferDragRef.current.startOffsetPx + dragPx);
                     const deltaSteps = Math.trunc((outputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
                     const next = clamp(outputBufferDragRef.current.startMs + deltaSteps * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
                     if (next !== outputBufferMs) {
@@ -4453,8 +4468,8 @@ export default function App({ runtime = "web" }) {
               <span className="metric-value">{sourceLatencyLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Var</span>
-              <span className="metric-value">{inputLatencyVarLabel}</span>
+              <span className="metric-title">Spread</span>
+              <span className="metric-value">{inputSpreadLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Underruns</span>
@@ -4531,8 +4546,8 @@ export default function App({ runtime = "web" }) {
               <span className="metric-value">{destinationLatencyLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Jitter</span>
-              <span className="metric-value">{outputJitterLabel}</span>
+              <span className="metric-title">Spread</span>
+              <span className="metric-value">{outputSpreadLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Underruns</span>
@@ -4540,7 +4555,7 @@ export default function App({ runtime = "web" }) {
             </div>
             <div className="metric-tile">
               <span className="metric-title">Drops</span>
-              <span className="metric-value">{outputSyncCorrectionsLabel}</span>
+              <span className="metric-value">{outputDroppedFramesLabel}</span>
             </div>
           </div>
         </div>

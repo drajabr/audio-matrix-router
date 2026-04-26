@@ -29,6 +29,7 @@ public class OutputLatencyConfig
 {
     public string DeviceId { get; set; } = "";
     public int DelayMs { get; set; }
+    public double BaseLatencyMs { get; set; }
 }
 
 public class AppConfig
@@ -122,8 +123,9 @@ public class AppConfig
             config.InputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
         foreach (var d in engine.OutputDevices)
         {
+            var baseLatencyMs = d.MixProvider?.OutputBaseLatencyMs ?? d.BaseLatencyMs;
             config.OutputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
-            config.OutputLatencies.Add(new OutputLatencyConfig { DeviceId = d.Info.Id, DelayMs = d.OutputDelayMs });
+            config.OutputLatencies.Add(new OutputLatencyConfig { DeviceId = d.Info.Id, DelayMs = d.OutputDelayMs, BaseLatencyMs = baseLatencyMs });
         }
 
         var mat = engine.RoutingMatrix;
@@ -182,7 +184,10 @@ public class AppConfig
         foreach (var d in keptOutputs) { newOutputOffsets[d.Id] = outAcc; outAcc += d.Channels; }
 
         foreach (var outputLatency in OutputLatencies)
+        {
             engine.SetOutputDelayMs(outputLatency.DeviceId, outputLatency.DelayMs);
+            engine.SetOutputBaseLatencyMs(outputLatency.DeviceId, outputLatency.BaseLatencyMs);
+        }
 
         if (!string.IsNullOrWhiteSpace(InputMasterDeviceId))
             engine.SetInputMasterDevice(InputMasterDeviceId);

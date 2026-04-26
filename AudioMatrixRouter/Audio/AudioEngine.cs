@@ -19,6 +19,7 @@ public class ActiveDevice
     public int CaptureLatencyMs { get; set; }
     public int RenderLatencyMs { get; set; }
     public bool IsLoopback { get; set; }
+    public double BaseLatencyMs { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
     public float[]? PeakLevels;
 }
@@ -176,6 +177,7 @@ public class AudioEngine : IDisposable
         }
 
         _syncCoordinator?.SetMasterConsumer(deviceId);
+        ApplyPersistedOutputBaseLatenciesToRunningSync();
         ApplyPreferredMasterConsumerToInputs();
 
         if (changed)
@@ -372,7 +374,6 @@ public class AudioEngine : IDisposable
         try
         {
             var masterOutput = GetOutputMasterDevice() ?? _outputDevices.First();
-            _syncCoordinator = new OutputSyncCoordinator(masterOutput.Info.Id);
 
             // Setup captures
             foreach (var dev in _inputDevices)
@@ -426,6 +427,9 @@ public class AudioEngine : IDisposable
                 dev.CaptureLatencyMs = _inputBufferMs;
             }
 
+            var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
+            _syncCoordinator = new OutputSyncCoordinator(masterOutput.Info.Id, baseMasterTargetFrames, maxMasterTargetFrames);
+
             var sources = _inputDevices
                 .Where(d => d.RingBuffer != null)
                 .Select(d => new MixingSampleProvider.CaptureSource(d.RingBuffer!, d.GlobalChannelOffset, d.Info.Channels))
@@ -446,6 +450,7 @@ public class AudioEngine : IDisposable
                     dev.Info.SampleRate,
                     dev.OutputDelayMs,
                     _outputBufferMs,
+                    dev.Info.Id == masterOutput.Info.Id ? 0 : dev.BaseLatencyMs,
                     dev.ConsumerId,
                     _syncCoordinator);
 
@@ -480,6 +485,20 @@ public class AudioEngine : IDisposable
         device.OutputDelayMs = clampedDelayMs;
         device.MixProvider?.SetDeviceDelayMs(clampedDelayMs);
         StateChanged?.Invoke();
+        return true;
+    }
+
+    public bool SetOutputBaseLatencyMs(string deviceId, double baseLatencyMs)
+    {
+        var device = _outputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
+        if (device == null)
+        {
+            return false;
+        }
+
+        var clampedBaseLatencyMs = Math.Clamp(baseLatencyMs, -250.0, 250.0);
+        device.BaseLatencyMs = clampedBaseLatencyMs;
+        device.MixProvider?.SetOutputBaseLatencyMs(clampedBaseLatencyMs);
         return true;
     }
 
@@ -519,6 +538,8 @@ public class AudioEngine : IDisposable
             dev.MixProvider?.SetOutputBufferMs(clamped);
         }
 
+        UpdateSyncBufferTargets();
+
         StateChanged?.Invoke();
         return true;
     }
@@ -538,6 +559,7 @@ public class AudioEngine : IDisposable
             try { dev.Render?.Stop(); } catch { }
             try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
+            dev.BaseLatencyMs = dev.MixProvider?.OutputBaseLatencyMs ?? dev.BaseLatencyMs;
             try { dev.MixProvider?.DetachConsumer(); } catch { }
             dev.MixProvider = null;
             dev.ConsumerId = string.Empty;
@@ -582,6 +604,50 @@ public class AudioEngine : IDisposable
         {
             input.RingBuffer?.SetPreferredConsumer(preferredConsumerId);
         }
+    }
+
+    private void ApplyPersistedOutputBaseLatenciesToRunningSync()
+    {
+        var masterOutput = GetOutputMasterDevice();
+        foreach (var device in _outputDevices)
+        {
+            double baseLatencyMs = (masterOutput != null && device.Info.Id == masterOutput.Info.Id)
+                ? 0
+                : device.BaseLatencyMs;
+            device.MixProvider?.SetOutputBaseLatencyMs(baseLatencyMs);
+        }
+    }
+
+    private void UpdateSyncBufferTargets()
+    {
+        if (_syncCoordinator == null) return;
+
+        var masterOutput = GetOutputMasterDevice() ?? _outputDevices.FirstOrDefault();
+        if (masterOutput == null) return;
+
+        var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
+        _syncCoordinator.SetMasterBufferTarget(baseMasterTargetFrames, maxMasterTargetFrames);
+    }
+
+    private (int BaseMasterTargetFrames, int MaxMasterTargetFrames) CalculateSyncTargetFrames(ActiveDevice? masterOutput)
+    {
+        int sampleRate = masterOutput?.Info.SampleRate
+            ?? _inputDevices.FirstOrDefault()?.Info.SampleRate
+            ?? 48000;
+
+        int desiredByOutputBufferFrames = Math.Max(sampleRate * _outputBufferMs / 1000, sampleRate / 200);
+
+        int minRingCapacityFrames = _inputDevices
+            .Where(d => d.RingBuffer != null)
+            .Select(d => d.RingBuffer!.CapacityFrames)
+            .DefaultIfEmpty(desiredByOutputBufferFrames * 2)
+            .Min();
+
+        int maxSafeTargetFrames = Math.Max(64, Math.Min(minRingCapacityFrames - 16, (minRingCapacityFrames * 3) / 4));
+        int baseTargetFrames = Math.Max(64, Math.Min(desiredByOutputBufferFrames, minRingCapacityFrames / 2));
+        baseTargetFrames = Math.Min(baseTargetFrames, maxSafeTargetFrames);
+
+        return (baseTargetFrames, Math.Max(baseTargetFrames, maxSafeTargetFrames));
     }
 
     public void RefreshDevices()
