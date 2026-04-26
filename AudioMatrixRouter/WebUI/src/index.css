@@ -1472,6 +1472,7 @@ textarea {
 
 .dock-col {
   min-width: 0;
+  padding-bottom: 6px;
 }
 
 .dock-side {
