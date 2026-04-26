@@ -240,9 +240,8 @@ textarea {
 }
 
 .ui-controls-wrap {
-  display: flex;
+  display: grid;
   align-items: center;
-  justify-content: center;
   position: relative;
   flex-shrink: 0;
   margin-left: auto;
@@ -255,7 +254,15 @@ textarea {
 .ui-controls-toggle {
   position: absolute;
   top: 50%;
-  right: 2px;
+  right: 3px;
+  width: 38px;
+  min-width: 38px;
+  height: 38px;
+  padding: 0;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   transform: translateY(-50%);
   z-index: 2601;
   transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease, filter 120ms ease;
@@ -264,6 +271,7 @@ textarea {
 .ui-controls-toggle:hover {
   transform: translateY(-50%);
   filter: brightness(1.08) saturate(1.05);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 36%, transparent), 0 8px 14px rgba(0, 0, 0, 0.32);
 }
 
 .ui-controls-toggle.active {
@@ -271,6 +279,20 @@ textarea {
   background: transparent;
   transform: translateY(-50%);
   filter: brightness(1.04);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent), 0 6px 12px rgba(0, 0, 0, 0.28);
+}
+
+.ui-controls-toggle-icon {
+  width: 1em;
+  height: 1em;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  font-size: 1.04em;
+  /* Optical centering for symbol glyph metrics (gear tends to sit lower-left). */
+  transform: translate(0.04em, -0.05em);
+  font-family: "Segoe UI Symbol", "Segoe UI", sans-serif;
 }
 
 .ui-quick-controls {
@@ -285,8 +307,9 @@ textarea {
   background: linear-gradient(180deg, var(--surface-raised), var(--panel-deep));
   transition: opacity 140ms ease, transform 140ms ease, width 140ms ease, padding 140ms ease, border-color 140ms ease;
   position: absolute;
-  top: 0;
+  top: 50%;
   right: 0;
+  transform: translateY(-50%);
   z-index: 2500;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
 }
@@ -298,8 +321,9 @@ textarea {
   min-width: 44px;
   height: 44px;
   min-height: 44px;
-  top: 0;
+  top: 50%;
   right: 0;
+  transform: translateY(-50%);
   padding: 0 44px 0 0;
   border-color: transparent;
   overflow: hidden;

@@ -3672,7 +3672,7 @@ export default function App({ runtime = "web" }) {
               if (!controlsCollapsed) setActiveQuickPicker("");
             }}
           >
-            {controlsCollapsed ? "⚙" : "✕"}
+            <span className="ui-controls-toggle-icon" aria-hidden="true">{controlsCollapsed ? "⚙" : "×"}</span>
           </button>
         </div>
 
