@@ -8,6 +8,7 @@ public sealed class OutputSyncCoordinator
     private const int DriftThresholdFrames = 96;
     private const int CorrectionCooldownFrames = 4096;
     private const int WarmupFrames = 48000;
+    private const double DriftSmoothingAlpha = 0.12;
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
@@ -19,6 +20,8 @@ public sealed class OutputSyncCoordinator
         public double Ratio = 1.0;
         public int PendingFrameSlip;
         public long NextCorrectionAt;
+        public long CorrectionCount;
+        public double SmoothedAbsDriftFrames;
     }
 
     public OutputSyncCoordinator(string masterConsumerId)
@@ -35,6 +38,7 @@ public sealed class OutputSyncCoordinator
             {
                 state.PendingFrameSlip = 0;
                 state.NextCorrectionAt = 0;
+                state.SmoothedAbsDriftFrames = 0;
             }
         }
     }
@@ -69,25 +73,42 @@ public sealed class OutputSyncCoordinator
             state.FramesRendered += frames;
             state.Ratio = 1.0;
 
-            if (consumerId == _masterConsumerId) return;
-            if (state.PendingFrameSlip != 0) return;
-
             if (!_states.TryGetValue(_masterConsumerId, out var masterState)) return;
-            if (state.FramesRendered < WarmupFrames || masterState.FramesRendered < WarmupFrames) return;
-            if (state.FramesRendered < state.NextCorrectionAt) return;
+
+            if (consumerId == _masterConsumerId)
+            {
+                state.SmoothedAbsDriftFrames = 0;
+                return;
+            }
+
+            if (state.FramesRendered < WarmupFrames || masterState.FramesRendered < WarmupFrames)
+            {
+                state.SmoothedAbsDriftFrames = 0;
+                return;
+            }
 
             long errorFrames = masterState.FramesRendered - state.FramesRendered;
+            double absErrorFrames = Math.Abs(errorFrames);
+            state.SmoothedAbsDriftFrames = state.SmoothedAbsDriftFrames <= 0
+                ? absErrorFrames
+                : (state.SmoothedAbsDriftFrames * (1.0 - DriftSmoothingAlpha)) + (absErrorFrames * DriftSmoothingAlpha);
+
+            if (state.PendingFrameSlip != 0) return;
+            if (state.FramesRendered < state.NextCorrectionAt) return;
+
             if (errorFrames >= DriftThresholdFrames)
             {
                 // Follower is behind master: consume one extra source frame this callback.
                 state.PendingFrameSlip = 1;
                 state.NextCorrectionAt = state.FramesRendered + CorrectionCooldownFrames;
+                state.CorrectionCount += 1;
             }
             else if (errorFrames <= -DriftThresholdFrames)
             {
                 // Follower is ahead of master: consume one fewer source frame this callback.
                 state.PendingFrameSlip = -1;
                 state.NextCorrectionAt = state.FramesRendered + CorrectionCooldownFrames;
+                state.CorrectionCount += 1;
             }
         }
     }
@@ -106,6 +127,26 @@ public sealed class OutputSyncCoordinator
             int slip = state.PendingFrameSlip;
             state.PendingFrameSlip = 0;
             return slip;
+        }
+    }
+
+    public long GetCorrectionCount(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            return _states.TryGetValue(consumerId, out var state)
+                ? state.CorrectionCount
+                : 0;
+        }
+    }
+
+    public double GetSmoothedAbsDriftFrames(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            return _states.TryGetValue(consumerId, out var state)
+                ? state.SmoothedAbsDriftFrames
+                : 0;
         }
     }
 }
@@ -129,6 +170,8 @@ public class MixingSampleProvider : ISampleProvider
     private float[] _mixBuffer = [];
     private float[] _delayBuffer = [];
     private int _delayWriteIndex;
+    private int _deviceDelayMs;
+    private int _outputBufferMs;
     private long _underrunCount;
     private readonly float[] _peakLevels;
 
@@ -141,6 +184,7 @@ public class MixingSampleProvider : ISampleProvider
         int outputChannels,
         int sampleRate,
         int outputDelayMs,
+        int outputBufferMs,
         string consumerId,
         OutputSyncCoordinator syncCoordinator)
     {
@@ -154,11 +198,17 @@ public class MixingSampleProvider : ISampleProvider
         _waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, outputChannels);
         _peakLevels = new float[outputChannels];
         _syncCoordinator.RegisterConsumer(_consumerId);
-        SetOutputDelayMs(outputDelayMs);
+        _deviceDelayMs = Math.Clamp(outputDelayMs, 0, 5000);
+        _outputBufferMs = Math.Clamp(outputBufferMs, 5, 200);
+        RebuildDelayBuffer();
     }
 
     public WaveFormat WaveFormat => _waveFormat;
     public long UnderrunCount => Interlocked.Read(ref _underrunCount);
+    public long SyncCorrectionCount => _syncCoordinator.GetCorrectionCount(_consumerId);
+    public double OutputJitterMs => _sampleRate > 0
+        ? Math.Round((_syncCoordinator.GetSmoothedAbsDriftFrames(_consumerId) * 1000.0) / _sampleRate, 1)
+        : 0;
 
     /// <summary>
     /// Returns a snapshot of per-output-channel peak levels (0..1) without resetting.
@@ -187,9 +237,22 @@ public class MixingSampleProvider : ISampleProvider
         return snapshot;
     }
 
-    public void SetOutputDelayMs(int delayMs)
+    public void SetDeviceDelayMs(int delayMs)
     {
-        var delayFrames = Math.Clamp((int)Math.Round(_sampleRate * (delayMs / 1000.0)), 0, _sampleRate * 5);
+        _deviceDelayMs = Math.Clamp(delayMs, 0, 5000);
+        RebuildDelayBuffer();
+    }
+
+    public void SetOutputBufferMs(int bufferMs)
+    {
+        _outputBufferMs = Math.Clamp(bufferMs, 5, 200);
+        RebuildDelayBuffer();
+    }
+
+    private void RebuildDelayBuffer()
+    {
+        var totalDelayMs = _deviceDelayMs + _outputBufferMs;
+        var delayFrames = Math.Clamp((int)Math.Round(_sampleRate * (totalDelayMs / 1000.0)), 0, _sampleRate * 5);
         var delaySamples = delayFrames * _outputChannels;
 
         lock (_delayLock)

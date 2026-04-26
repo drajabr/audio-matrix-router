@@ -841,10 +841,19 @@ public sealed class MainForm : Form
                     await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
-                case "setCaptureBufferMs":
-                    if (request.Params.TryGetProperty("bufferMs", out var captureBufferMs))
+                case "setInputBufferMs":
+                    if (request.Params.TryGetProperty("bufferMs", out var inputBufferMs))
                     {
-                        _engine.SetCaptureBufferMs(captureBufferMs.GetInt32());
+                        _engine.SetInputBufferMs(inputBufferMs.GetInt32());
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setOutputBufferMs":
+                    if (request.Params.TryGetProperty("bufferMs", out var outputBufferMs))
+                    {
+                        _engine.SetOutputBufferMs(outputBufferMs.GetInt32());
                         ScheduleSave();
                     }
                     await SendResultAsync(request.Id, BuildUiState(true));
@@ -972,14 +981,24 @@ public sealed class MainForm : Form
             }).ToList();
         }
 
+        var inputPathLatencyMs = _engine.TryGetInputPathLatencyMs(out var measuredInputPathLatency)
+            ? Math.Round(measuredInputPathLatency, 1)
+            : (double?)null;
+        var outputPathLatencyMs = _engine.TryGetOutputPathLatencyMs(out var measuredOutputPathLatency)
+            ? Math.Round(measuredOutputPathLatency, 1)
+            : (double?)null;
+
         return new UiState
         {
             Running = _engine.IsRunning,
             Locked = _locked,
             StartupAtBoot = _startupAtBoot,
-            CaptureBufferMs = _engine.CaptureBufferMs,
+            InputBufferMs = _engine.InputBufferMs,
+            OutputBufferMs = _engine.OutputBufferMs,
             InputDeviceMode = _inputDeviceMode,
             TotalLatencyMs = maxWorkingLatencyMs,
+            InputLatencyMs = inputPathLatencyMs,
+            OutputLatencyMs = outputPathLatencyMs,
             HasFullDeviceLists = includeAvailableDevices,
             AvailableInputs = availableInputs,
             AvailableOutputs = availableOutputs,
@@ -1009,6 +1028,8 @@ public sealed class MainForm : Form
                 SampleRate = d.Info.SampleRate,
                 DriverLatencyMs = d.RenderLatencyMs,
                 Underruns = d.MixProvider?.UnderrunCount ?? 0,
+                JitterMs = d.MixProvider != null ? d.MixProvider.OutputJitterMs : null,
+                SyncCorrections = d.MixProvider?.SyncCorrectionCount ?? 0,
                 PeakLevels = d.MixProvider?.SamplePeakLevels() ?? Array.Empty<float>()
             }).ToList(),
             Routes = routes
@@ -1129,6 +1150,8 @@ public sealed class MainForm : Form
         public int SampleRate { get; set; }
         public int DriverLatencyMs { get; set; }
         public long Underruns { get; set; }
+        public double? JitterMs { get; set; }
+        public long SyncCorrections { get; set; }
         public long Overflows { get; set; }
         public long DroppedFrames { get; set; }
         public bool IsLoopback { get; set; }
@@ -1148,9 +1171,12 @@ public sealed class MainForm : Form
         public bool Running { get; set; }
         public bool Locked { get; set; }
         public bool StartupAtBoot { get; set; }
-        public int CaptureBufferMs { get; set; }
+        public int InputBufferMs { get; set; }
+        public int OutputBufferMs { get; set; }
         public string InputDeviceMode { get; set; } = "both";
         public double? TotalLatencyMs { get; set; }
+        public double? InputLatencyMs { get; set; }
+        public double? OutputLatencyMs { get; set; }
         public bool HasFullDeviceLists { get; set; }
         public List<DeviceState>? AvailableInputs { get; set; }
         public List<DeviceState>? AvailableOutputs { get; set; }

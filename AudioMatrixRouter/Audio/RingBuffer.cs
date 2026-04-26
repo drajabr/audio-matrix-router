@@ -13,6 +13,7 @@ public class RingBuffer
     private readonly int _channels;
     private readonly object _cursorLock = new();
     private readonly Dictionary<string, int> _consumerReadPos = new(StringComparer.Ordinal);
+    private string _preferredConsumerId = string.Empty;
     private long _totalFramesDropped;
 
     public long TotalFramesDropped => Interlocked.Read(ref _totalFramesDropped);
@@ -71,6 +72,14 @@ public class RingBuffer
         }
     }
 
+    public void SetPreferredConsumer(string consumerId)
+    {
+        lock (_cursorLock)
+        {
+            _preferredConsumerId = consumerId ?? string.Empty;
+        }
+    }
+
     public bool Write(float[] data, int offset, int frameCount)
     {
         int samples = frameCount * _channels;
@@ -95,6 +104,14 @@ public class RingBuffer
                 // so producer never stalls all outputs.
                 int allowedUnread = _capacity - 1 - samples;
                 var keys = new List<string>(_consumerReadPos.Keys);
+
+                // Followers are trimmed first. Keep the preferred consumer as the last one
+                // to be advanced so master timing remains as stable as possible.
+                if (!string.IsNullOrWhiteSpace(_preferredConsumerId) && keys.Remove(_preferredConsumerId))
+                {
+                    keys.Add(_preferredConsumerId);
+                }
+
                 foreach (var key in keys)
                 {
                     int rp = _consumerReadPos[key];

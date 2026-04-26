@@ -6,6 +6,7 @@ const DB_MIN = -60;
 const DB_MAX = 12;
 const GLOBAL_MUTE_GAIN_DB = -90;
 const GLOBAL_GAIN_DRAG_PX_PER_STEP = 24;
+const BUFFER_WHEEL_DRAG_PX_PER_STEP = 10;
 const DEVICE_CELL_SIZE = 112;
 const GRID_GAP_SIZE = 4;
 const CHANNEL_CELL_SIZE = (DEVICE_CELL_SIZE - GRID_GAP_SIZE) / 2;
@@ -27,6 +28,10 @@ const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
 const CAPTURE_BUFFER_MIN = 10;
 const CAPTURE_BUFFER_MAX = 200;
 const CAPTURE_BUFFER_DEFAULT = 40;
+const OUTPUT_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
+const OUTPUT_BUFFER_MIN = 10;
+const OUTPUT_BUFFER_MAX = 200;
+const OUTPUT_BUFFER_DEFAULT = 40;
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -843,6 +848,8 @@ export default function App({ runtime = "web" }) {
   const [outputLatencyMs, setOutputLatencyMs] = useState(null);
   const [bufferMs, setBufferMs] = useState(null);
   const [jitterMs, setJitterMs] = useState(null);
+  const [inputJitterMs, setInputJitterMs] = useState(null);
+  const [outputJitterMs, setOutputJitterMs] = useState(null);
   const [clockKhz, setClockKhz] = useState(null);
   const [error, setError] = useState("");
   const [isReloadingDevices, setIsReloadingDevices] = useState(false);
@@ -852,9 +859,13 @@ export default function App({ runtime = "web" }) {
   const [fontSizeIndex, setFontSizeIndex] = useState(() => getStoredIndex(FONT_SIZE_KEY, FONT_SIZE_PRESETS, 4));
   const [uiScaleIndex, setUiScaleIndex] = useState(() => getStoredIndex(UI_SCALE_KEY, UI_SCALE_PRESETS, Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === "md"))));
   const [captureBufferMs, setCaptureBufferMs] = useState(CAPTURE_BUFFER_DEFAULT);
+  const [outputBufferMs, setOutputBufferMs] = useState(OUTPUT_BUFFER_DEFAULT);
   const [masterGainDb, setMasterGainDb] = useState(0);
   const [wheelVisualOffsetPx, setWheelVisualOffsetPx] = useState(0);
+  const [inputBufferWheelOffsetPx, setInputBufferWheelOffsetPx] = useState(0);
+  const [outputBufferWheelOffsetPx, setOutputBufferWheelOffsetPx] = useState(0);
   const [isApplyingCaptureBuffer, setIsApplyingCaptureBuffer] = useState(false);
+  const [isApplyingOutputBuffer, setIsApplyingOutputBuffer] = useState(false);
   const [nativeTotalLatencyMs, setNativeTotalLatencyMs] = useState(null);
   const [nativeRouteLatencyByCh, setNativeRouteLatencyByCh] = useState({});
   const [nativeInputChannelMeta, setNativeInputChannelMeta] = useState({});
@@ -937,12 +948,18 @@ export default function App({ runtime = "web" }) {
   const latencyMissingSinceRef = useRef(0);
   const wheelDragRef = useRef(null);
   const wheelDragSuppressClickRef = useRef(false);
-  const bufferDragRef = useRef(null);
-  const bufferDragSuppressClickRef = useRef(false);
+  const inputBufferDragRef = useRef(null);
+  const inputBufferDragSuppressClickRef = useRef(false);
+  const outputBufferDragRef = useRef(null);
+  const outputBufferDragSuppressClickRef = useRef(false);
   const captureBufferApplyTimerRef = useRef(null);
   const pendingCaptureBufferRef = useRef(null);
+  const outputBufferApplyTimerRef = useRef(null);
+  const pendingOutputBufferRef = useRef(null);
   const masterGainSyncTimerRef = useRef(null);
   const masterGainDbRef = useRef(masterGainDb);
+  const inputLatencyLastRef = useRef(null);
+  const outputLatencyLastRef = useRef(null);
 
   useEffect(() => {
     masterGainDbRef.current = masterGainDb;
@@ -950,6 +967,18 @@ export default function App({ runtime = "web" }) {
       setWheelVisualOffsetPx(Math.round(masterGainDb / 0.5) * GLOBAL_GAIN_DRAG_PX_PER_STEP);
     }
   }, [masterGainDb]);
+
+  useEffect(() => {
+    if (!inputBufferDragRef.current) {
+      setInputBufferWheelOffsetPx(Math.round(captureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+    }
+  }, [captureBufferMs]);
+
+  useEffect(() => {
+    if (!outputBufferDragRef.current) {
+      setOutputBufferWheelOffsetPx(Math.round(outputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+    }
+  }, [outputBufferMs]);
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -1138,19 +1167,50 @@ export default function App({ runtime = "web" }) {
         setInputDeviceMode(state.inputDeviceMode);
       }
 
-      if (Number.isFinite(state?.captureBufferMs)) {
+      if (Number.isFinite(state?.inputBufferMs)) {
         const pendingCaptureBuffer = pendingCaptureBufferRef.current;
         if (!Number.isFinite(pendingCaptureBuffer)) {
-          setCaptureBufferMs(state.captureBufferMs);
-        } else if (Math.abs(state.captureBufferMs - pendingCaptureBuffer) < 0.5) {
+          setCaptureBufferMs(state.inputBufferMs);
+        } else if (Math.abs(state.inputBufferMs - pendingCaptureBuffer) < 0.5) {
           pendingCaptureBufferRef.current = null;
-          setCaptureBufferMs(state.captureBufferMs);
+          setCaptureBufferMs(state.inputBufferMs);
+        }
+      }
+
+      if (Number.isFinite(state?.outputBufferMs)) {
+        const pendingOutputBuffer = pendingOutputBufferRef.current;
+        if (!Number.isFinite(pendingOutputBuffer)) {
+          setOutputBufferMs(state.outputBufferMs);
+        } else if (Math.abs(state.outputBufferMs - pendingOutputBuffer) < 0.5) {
+          pendingOutputBufferRef.current = null;
+          setOutputBufferMs(state.outputBufferMs);
         }
       }
 
       const total = Number.isFinite(state?.totalLatencyMs) ? Number(state.totalLatencyMs) : null;
       setNativeTotalLatencyMs(total != null ? Math.round(total * 10) / 10 : null);
       updateLatencyDisplay(total);
+
+      const nativeInputPathLatency = Number.isFinite(state?.inputLatencyMs) ? Math.round(Number(state.inputLatencyMs) * 10) / 10 : null;
+      const nativeOutputPathLatency = Number.isFinite(state?.outputLatencyMs) ? Math.round(Number(state.outputLatencyMs) * 10) / 10 : null;
+      setInputLatencyMs(nativeInputPathLatency);
+      setOutputLatencyMs(nativeOutputPathLatency);
+      setBufferMs(nativeInputPathLatency);
+
+      if (nativeInputPathLatency != null && inputLatencyLastRef.current != null) {
+        setInputJitterMs(Math.round(Math.abs(nativeInputPathLatency - inputLatencyLastRef.current) * 10) / 10);
+      } else {
+        setInputJitterMs(nativeInputPathLatency != null ? 0 : null);
+      }
+
+      if (nativeOutputPathLatency != null && outputLatencyLastRef.current != null) {
+        setOutputJitterMs(Math.round(Math.abs(nativeOutputPathLatency - outputLatencyLastRef.current) * 10) / 10);
+      } else {
+        setOutputJitterMs(nativeOutputPathLatency != null ? 0 : null);
+      }
+
+      inputLatencyLastRef.current = nativeInputPathLatency;
+      outputLatencyLastRef.current = nativeOutputPathLatency;
 
       const routeLatency = {};
       (Array.isArray(state?.routes) ? state.routes : []).forEach((route) => {
@@ -1190,7 +1250,9 @@ export default function App({ runtime = "web" }) {
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          jitterMs: Number.isFinite(d?.jitterMs) ? Math.round(Number(d.jitterMs) * 10) / 10 : null,
           underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
+          syncCorrections: Number.isFinite(d?.syncCorrections) ? d.syncCorrections : 0,
           peakLevels,
         };
       });
@@ -1254,9 +1316,6 @@ export default function App({ runtime = "web" }) {
         return outSr || inSr || null;
       })();
       setClockKhz(sr ? Math.round((sr / 1000) * 10) / 10 : null);
-      setInputLatencyMs(null);
-      setOutputLatencyMs(null);
-      setBufferMs(null);
     };
 
     const poll = async () => {
@@ -1281,9 +1340,23 @@ export default function App({ runtime = "web" }) {
           const lat = base + out;
 
           updateLatencyDisplay(lat > 0 ? lat : null);
-          setInputLatencyMs(base > 0 ? Math.round(base * 10) / 10 : null);
-          setOutputLatencyMs(out > 0 ? Math.round(out * 10) / 10 : null);
-          setBufferMs(base > 0 ? Math.round(base * 10) / 10 : null);
+          const inLat = base > 0 ? Math.round(base * 10) / 10 : null;
+          const outLat = out > 0 ? Math.round(out * 10) / 10 : null;
+          setInputLatencyMs(inLat);
+          setOutputLatencyMs(outLat);
+          setBufferMs(inLat);
+          if (inLat != null && inputLatencyLastRef.current != null) {
+            setInputJitterMs(Math.round(Math.abs(inLat - inputLatencyLastRef.current) * 10) / 10);
+          } else {
+            setInputJitterMs(inLat != null ? 0 : null);
+          }
+          if (outLat != null && outputLatencyLastRef.current != null) {
+            setOutputJitterMs(Math.round(Math.abs(outLat - outputLatencyLastRef.current) * 10) / 10);
+          } else {
+            setOutputJitterMs(outLat != null ? 0 : null);
+          }
+          inputLatencyLastRef.current = inLat;
+          outputLatencyLastRef.current = outLat;
           setClockKhz(ctx.sampleRate ? Math.round((ctx.sampleRate / 1000) * 10) / 10 : null);
 
           if (latencyLastRef.current != null) {
@@ -1299,6 +1372,10 @@ export default function App({ runtime = "web" }) {
           setInputLatencyMs(null);
           setOutputLatencyMs(null);
           setBufferMs(null);
+          setInputJitterMs(null);
+          setOutputJitterMs(null);
+          inputLatencyLastRef.current = null;
+          outputLatencyLastRef.current = null;
           updateJitterDisplay(null);
           setClockKhz(null);
           setNativeTotalLatencyMs(null);
@@ -1688,7 +1765,8 @@ export default function App({ runtime = "web" }) {
     fontKey: FONT_PRESETS[fontIndex]?.key,
     fontSizeKey: FONT_SIZE_PRESETS[fontSizeIndex]?.key,
     uiScaleKey: UI_SCALE_PRESETS[uiScaleIndex]?.key,
-    captureBufferMs,
+    inputBufferMs: captureBufferMs,
+    outputBufferMs,
     masterGainDb,
     controlsCollapsed,
     showAllDevices,
@@ -1717,7 +1795,8 @@ export default function App({ runtime = "web" }) {
             fontKey: next?.fontKey,
             fontSizeKey: next?.fontSizeKey,
             uiScaleKey: next?.uiScaleKey,
-            captureBufferMs: next?.captureBufferMs,
+            inputBufferMs: next?.inputBufferMs,
+            outputBufferMs: next?.outputBufferMs,
             masterGainDb: next?.masterGainDb,
             controlsCollapsed: next?.controlsCollapsed,
             showAllDevices: next?.showAllDevices,
@@ -1849,7 +1928,8 @@ export default function App({ runtime = "web" }) {
         setInputDeviceMode(saved.inputDeviceMode);
       }
       if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
-      if (Number.isFinite(saved?.captureBufferMs)) setCaptureBufferMs(saved.captureBufferMs);
+      if (Number.isFinite(saved?.inputBufferMs)) setCaptureBufferMs(saved.inputBufferMs);
+      if (Number.isFinite(saved?.outputBufferMs)) setOutputBufferMs(saved.outputBufferMs);
       if (Number.isFinite(saved?.masterGainDb)) {
         const savedGain = clamp(saved.masterGainDb, DB_MIN, DB_MAX);
         setMasterGainDb(savedGain);
@@ -1877,8 +1957,11 @@ export default function App({ runtime = "web" }) {
         } else {
           nativeState = state;
         }
-        if (Number.isFinite(nativeState?.captureBufferMs)) {
-          setCaptureBufferMs(nativeState.captureBufferMs);
+        if (Number.isFinite(nativeState?.inputBufferMs)) {
+          setCaptureBufferMs(nativeState.inputBufferMs);
+        }
+        if (Number.isFinite(nativeState?.outputBufferMs)) {
+          setOutputBufferMs(nativeState.outputBufferMs);
         }
         if (typeof nativeState?.inputDeviceMode === "string" && nativeState.inputDeviceMode) {
           setInputDeviceMode(nativeState.inputDeviceMode);
@@ -2117,7 +2200,8 @@ export default function App({ runtime = "web" }) {
         fontKey: saved?.fontKey || FONT_PRESETS[fontIndex]?.key,
         fontSizeKey: saved?.fontSizeKey || FONT_SIZE_PRESETS[fontSizeIndex]?.key,
         uiScaleKey: saved?.uiScaleKey || UI_SCALE_PRESETS[uiScaleIndex]?.key,
-        captureBufferMs: Number.isFinite(saved?.captureBufferMs) ? saved.captureBufferMs : captureBufferMs,
+        inputBufferMs: Number.isFinite(saved?.inputBufferMs) ? saved.inputBufferMs : captureBufferMs,
+        outputBufferMs: Number.isFinite(saved?.outputBufferMs) ? saved.outputBufferMs : outputBufferMs,
         masterGainDb: Number.isFinite(saved?.masterGainDb) ? clamp(saved.masterGainDb, DB_MIN, DB_MAX) : masterGainDb,
         controlsCollapsed: typeof saved?.controlsCollapsed === "boolean" ? saved.controlsCollapsed : controlsCollapsed,
         showAllDevices: typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : showAllDevices,
@@ -2295,6 +2379,7 @@ export default function App({ runtime = "web" }) {
     fontSizeIndex,
     uiScaleIndex,
     captureBufferMs,
+    outputBufferMs,
     masterGainDb,
     controlsCollapsed,
     showAllDevices,
@@ -2522,6 +2607,9 @@ export default function App({ runtime = "web" }) {
     return () => {
       if (captureBufferApplyTimerRef.current) {
         clearTimeout(captureBufferApplyTimerRef.current);
+      }
+      if (outputBufferApplyTimerRef.current) {
+        clearTimeout(outputBufferApplyTimerRef.current);
       }
       if (masterGainSyncTimerRef.current) {
         clearTimeout(masterGainSyncTimerRef.current);
@@ -2912,6 +3000,7 @@ export default function App({ runtime = "web" }) {
     if (activeQuickPicker === "fontSize") return FONT_SIZE_PRESETS;
     if (activeQuickPicker === "uiScale") return UI_SCALE_PRESETS;
     if (activeQuickPicker === "captureBuffer") return CAPTURE_BUFFER_OPTIONS.map((value) => ({ key: String(value), label: `${value}ms` }));
+    if (activeQuickPicker === "outputBuffer") return OUTPUT_BUFFER_OPTIONS.map((value) => ({ key: String(value), label: `${value}ms` }));
     if (activeQuickPicker === "startup") {
       return [
         { key: "enable", label: "ON" },
@@ -2928,6 +3017,7 @@ export default function App({ runtime = "web" }) {
     if (activeQuickPicker === "fontSize") return FONT_SIZE_PRESETS[fontSizeIndex]?.key;
     if (activeQuickPicker === "uiScale") return UI_SCALE_PRESETS[uiScaleIndex]?.key;
     if (activeQuickPicker === "captureBuffer") return String(captureBufferMs);
+    if (activeQuickPicker === "outputBuffer") return String(outputBufferMs);
     if (activeQuickPicker === "startup") return startupAtBoot ? "enable" : "disable";
     return "";
   })();
@@ -2944,7 +3034,7 @@ export default function App({ runtime = "web" }) {
       if (Number.isFinite(next)) {
         const selected = clamp(Math.round(next / 5) * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
         setCaptureBufferMs(selected);
-        persistState(buildPersistedState({ captureBufferMs: selected }));
+        persistState(buildPersistedState({ inputBufferMs: selected }));
 
         if (hasNativeBridge) {
           pendingCaptureBufferRef.current = selected;
@@ -2955,17 +3045,50 @@ export default function App({ runtime = "web" }) {
             const requested = pendingCaptureBufferRef.current;
             if (!Number.isFinite(requested)) return;
             setIsApplyingCaptureBuffer(true);
-            window.__nativeBridgeInvoke("setCaptureBufferMs", { bufferMs: requested })
+            window.__nativeBridgeInvoke("setInputBufferMs", { bufferMs: requested })
               .then((state) => {
-                const applied = Number.isFinite(state?.captureBufferMs) ? state.captureBufferMs : requested;
+                const applied = Number.isFinite(state?.inputBufferMs) ? state.inputBufferMs : requested;
                 if (pendingCaptureBufferRef.current !== requested) return;
                 pendingCaptureBufferRef.current = null;
                 setCaptureBufferMs(applied);
-                persistState(buildPersistedState({ captureBufferMs: applied }));
+                persistState(buildPersistedState({ inputBufferMs: applied }));
               })
               .catch(() => {})
               .finally(() => {
                 setIsApplyingCaptureBuffer(false);
+              });
+          }, 500);
+        }
+      }
+    }
+    if (type === "outputBuffer") {
+      if (locked) return;
+      const next = Number(key);
+      if (Number.isFinite(next)) {
+        const selected = clamp(Math.round(next / 5) * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+        setOutputBufferMs(selected);
+        persistState(buildPersistedState({ outputBufferMs: selected }));
+
+        if (hasNativeBridge) {
+          pendingOutputBufferRef.current = selected;
+          if (outputBufferApplyTimerRef.current) {
+            clearTimeout(outputBufferApplyTimerRef.current);
+          }
+          outputBufferApplyTimerRef.current = setTimeout(() => {
+            const requested = pendingOutputBufferRef.current;
+            if (!Number.isFinite(requested)) return;
+            setIsApplyingOutputBuffer(true);
+            window.__nativeBridgeInvoke("setOutputBufferMs", { bufferMs: requested })
+              .then((state) => {
+                const applied = Number.isFinite(state?.outputBufferMs) ? state.outputBufferMs : requested;
+                if (pendingOutputBufferRef.current !== requested) return;
+                pendingOutputBufferRef.current = null;
+                setOutputBufferMs(applied);
+                persistState(buildPersistedState({ outputBufferMs: applied }));
+              })
+              .catch(() => {})
+              .finally(() => {
+                setIsApplyingOutputBuffer(false);
               });
           }, 500);
         }
@@ -3004,6 +3127,13 @@ export default function App({ runtime = "web" }) {
     const snapped = clamp(Math.round((captureBufferMs + deltaMs) / 5) * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
     if (snapped === captureBufferMs) return;
     applyQuickSelection("captureBuffer", String(snapped));
+  };
+
+  const applyOutputBufferDelta = (deltaMs) => {
+    if (locked || !Number.isFinite(deltaMs)) return;
+    const snapped = clamp(Math.round((outputBufferMs + deltaMs) / 5) * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+    if (snapped === outputBufferMs) return;
+    applyQuickSelection("outputBuffer", String(snapped));
   };
 
   const buildNativeRoutesPayload = (matrix, options = {}) => {
@@ -3232,11 +3362,6 @@ export default function App({ runtime = "web" }) {
   const matrixRowCount = viewMode === "device"
     ? Math.max(1, rows.reduce((acc, row) => acc + Math.max(1, row.channelCount || 1), 0))
     : Math.max(rows.length, 1);
-
-  const setCaptureBufferFromMenu = (next) => {
-    if (locked) return;
-    applyQuickSelection("captureBuffer", String(next));
-  };
 
   const selectedSource = detailCell ? rows.find((r) => r.id === detailCell.rowId) : null;
   const selectedDestination = detailCell ? cols.find((c) => c.id === detailCell.colId) : null;
@@ -3518,7 +3643,7 @@ export default function App({ runtime = "web" }) {
     ? (nativeTopbarTotalLatencyMs ?? latencyMs)
     : latencyMs;
   const sourceLatencyDisplayMs = hasNativeBridge
-    ? (detailRouteLatencyMs ?? inputLatencyMs)
+    ? inputLatencyMs
     : inputLatencyMs;
   const latencyLabel = runningLatencyDisplayMs != null ? `${runningLatencyDisplayMs}ms` : "n/a";
   const selectedSourceDeviceId = selectedSource?.deviceId || parseChannelId(selectedSource?.id || "")?.deviceId || "";
@@ -3532,9 +3657,7 @@ export default function App({ runtime = "web" }) {
   const selectedDestinationDelayMs = Number.isFinite(selectedDestination?.delayMs) ? selectedDestination.delayMs : 0;
   const destinationLatencyResolvedMs =
     hasNativeBridge
-      ? (detailRouteLatencyMs ?? (outputLatencyMs != null || selectedDestinationDelayMs > 0
-        ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
-        : null))
+      ? outputLatencyMs
       : (outputLatencyMs != null || selectedDestinationDelayMs > 0
         ? Math.round(((outputLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
         : null)
@@ -3547,7 +3670,25 @@ export default function App({ runtime = "web" }) {
   );
   const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
   const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
-  const jitterLabel = jitterMs != null ? `${jitterMs}ms` : "n/a";
+  const formatCounter = (value) => {
+    if (!Number.isFinite(value) || value < 0) return "n/a";
+    const rounded = Math.round(value);
+    if (rounded >= 1000000) return `${(rounded / 1000000).toFixed(1)}M`;
+    if (rounded >= 1000) return `${(rounded / 1000).toFixed(1)}k`;
+    return String(rounded);
+  };
+  const inputSideDeviceId = selectedSourceDeviceId || inputMasterId;
+  const outputSideDeviceId = selectedDestinationDeviceId || outputMasterId;
+  const inputSideMeta = inputSideDeviceId ? nativeInputChannelMeta[inputSideDeviceId] : null;
+  const outputSideMeta = outputSideDeviceId ? nativeOutputChannelMeta[outputSideDeviceId] : null;
+  const inputLatencyVarLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
+  const outputJitterLabel = hasNativeBridge
+    ? (Number.isFinite(outputSideMeta?.jitterMs) ? `${outputSideMeta.jitterMs}ms` : "n/a")
+    : (outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a"));
+  const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "n/a";
+  const inputDroppedFramesLabel = hasNativeBridge ? formatCounter(inputSideMeta?.droppedFrames) : "n/a";
+  const outputUnderrunsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.underruns) : "n/a";
+  const outputSyncCorrectionsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.syncCorrections) : "n/a";
 
   const selectedSourceChannelLabels = Array.from(
     { length: Math.max(1, Number.isFinite(selectedSource?.channelCount) ? selectedSource.channelCount : 1) },
@@ -3582,7 +3723,7 @@ export default function App({ runtime = "web" }) {
 
   const handleRootClick = (event) => {
     if (event.target.closest(".matrix-grid")) return;
-    if (event.target.closest(".route-indicator-btn")) return;
+    if (event.target.closest(".route-indicator-btn, .route-indicator-display")) return;
     setSelectedCell(null);
   };
 
@@ -3841,60 +3982,118 @@ export default function App({ runtime = "web" }) {
                 >
                   <span aria-hidden="true">{locked ? "🔒" : "🔓"}</span>
                 </button>
-                <div className="buffer-control-wrap corner-control-buffer">
-                  <button
-                    type="button"
-                    className={`corner-control-btn corner-control-btn--buffer ${isApplyingCaptureBuffer ? "active" : ""}`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      if (locked) return;
-                      if (bufferDragSuppressClickRef.current) {
-                        bufferDragSuppressClickRef.current = false;
-                        return;
-                      }
-                      setCaptureBufferFromMenu(CAPTURE_BUFFER_DEFAULT);
-                    }}
-                    onPointerDown={(event) => {
-                      if (locked) return;
-                      event.currentTarget.setPointerCapture(event.pointerId);
-                      bufferDragRef.current = {
-                        startY: event.clientY,
-                        startMs: captureBufferMs,
-                      };
-                      bufferDragSuppressClickRef.current = false;
-                    }}
-                    onPointerMove={(event) => {
-                      if (!bufferDragRef.current || locked) return;
-                      const deltaSteps = Math.trunc((bufferDragRef.current.startY - event.clientY) / 10);
-                      const next = clamp(bufferDragRef.current.startMs + deltaSteps * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
-                      if (next !== captureBufferMs) {
-                        applyBufferDelta(next - captureBufferMs);
-                        bufferDragSuppressClickRef.current = true;
-                      }
-                    }}
-                    onPointerUp={() => {
-                      bufferDragRef.current = null;
-                    }}
-                    onPointerCancel={() => {
-                      bufferDragRef.current = null;
-                      bufferDragSuppressClickRef.current = false;
-                    }}
-                    onWheel={(event) => {
-                      if (locked) return;
-                      event.preventDefault();
-                      event.stopPropagation();
-                      applyBufferDelta(event.deltaY < 0 ? 5 : -5);
-                    }}
-                    title={`${isApplyingCaptureBuffer ? "Applying" : "Capture buffer"} ${captureBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
-                    aria-label="Adjust capture buffer"
-                    disabled={locked}
-                  >
-                    <span className="buffer-readout" aria-hidden="true">
-                      <span>{`${captureBufferMs}`}</span>
-                      <span className="buffer-unit">ms</span>
-                    </span>
-                  </button>
-                </div>
+                <button
+                  type="button"
+                  className={`corner-control-btn corner-control-btn--buffer corner-control-buffer-left corner-buffer-wheel ${isApplyingCaptureBuffer ? "active" : ""}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (locked) return;
+                    if (inputBufferDragSuppressClickRef.current) {
+                      inputBufferDragSuppressClickRef.current = false;
+                      return;
+                    }
+                    applyQuickSelection("captureBuffer", String(CAPTURE_BUFFER_DEFAULT));
+                  }}
+                  onPointerDown={(event) => {
+                    if (locked) return;
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    inputBufferDragRef.current = {
+                      startY: event.clientY,
+                      startMs: captureBufferMs,
+                      startOffsetPx: inputBufferWheelOffsetPx,
+                    };
+                    inputBufferDragSuppressClickRef.current = false;
+                  }}
+                  onPointerMove={(event) => {
+                    if (!inputBufferDragRef.current || locked) return;
+                    const deltaSteps = Math.trunc((inputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    const next = clamp(inputBufferDragRef.current.startMs + deltaSteps * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
+                    if (next !== captureBufferMs) {
+                      applyBufferDelta(next - captureBufferMs);
+                      inputBufferDragSuppressClickRef.current = true;
+                    }
+                  }}
+                  onPointerUp={() => {
+                    inputBufferDragRef.current = null;
+                    setInputBufferWheelOffsetPx(Math.round(captureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                  }}
+                  onPointerCancel={() => {
+                    inputBufferDragRef.current = null;
+                    inputBufferDragSuppressClickRef.current = false;
+                    setInputBufferWheelOffsetPx(Math.round(captureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                  }}
+                  onWheel={(event) => {
+                    if (locked) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    applyBufferDelta(event.deltaY < 0 ? 5 : -5);
+                  }}
+                  title={`${isApplyingCaptureBuffer ? "Applying" : "Input buffer"} ${captureBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
+                  aria-label="Adjust input buffer"
+                  disabled={locked}
+                >
+                  <div className="corner-gain-wheel-drum" aria-hidden="true" style={{ backgroundPositionY: `${inputBufferWheelOffsetPx}px` }} />
+                  <span className="buffer-readout buffer-readout--compact" aria-hidden="true">
+                    <span className="buffer-readout-label">IN</span>
+                    <span className="buffer-readout-value">{`${captureBufferMs}ms`}</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  className={`corner-control-btn corner-control-btn--buffer corner-control-buffer-right corner-buffer-wheel ${isApplyingOutputBuffer ? "active" : ""}`}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    if (locked) return;
+                    if (outputBufferDragSuppressClickRef.current) {
+                      outputBufferDragSuppressClickRef.current = false;
+                      return;
+                    }
+                    applyQuickSelection("outputBuffer", String(OUTPUT_BUFFER_DEFAULT));
+                  }}
+                  onPointerDown={(event) => {
+                    if (locked) return;
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                    outputBufferDragRef.current = {
+                      startY: event.clientY,
+                      startMs: outputBufferMs,
+                      startOffsetPx: outputBufferWheelOffsetPx,
+                    };
+                    outputBufferDragSuppressClickRef.current = false;
+                  }}
+                  onPointerMove={(event) => {
+                    if (!outputBufferDragRef.current || locked) return;
+                    const deltaSteps = Math.trunc((outputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    const next = clamp(outputBufferDragRef.current.startMs + deltaSteps * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+                    if (next !== outputBufferMs) {
+                      applyOutputBufferDelta(next - outputBufferMs);
+                      outputBufferDragSuppressClickRef.current = true;
+                    }
+                  }}
+                  onPointerUp={() => {
+                    outputBufferDragRef.current = null;
+                    setOutputBufferWheelOffsetPx(Math.round(outputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                  }}
+                  onPointerCancel={() => {
+                    outputBufferDragRef.current = null;
+                    outputBufferDragSuppressClickRef.current = false;
+                    setOutputBufferWheelOffsetPx(Math.round(outputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                  }}
+                  onWheel={(event) => {
+                    if (locked) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    applyOutputBufferDelta(event.deltaY < 0 ? 5 : -5);
+                  }}
+                  title={`${isApplyingOutputBuffer ? "Applying" : "Output buffer"} ${outputBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
+                  aria-label="Adjust output buffer"
+                  disabled={locked}
+                >
+                  <div className="corner-gain-wheel-drum" aria-hidden="true" style={{ backgroundPositionY: `${outputBufferWheelOffsetPx}px` }} />
+                  <span className="buffer-readout buffer-readout--compact" aria-hidden="true">
+                    <span className="buffer-readout-label">OUT</span>
+                    <span className="buffer-readout-value">{`${outputBufferMs}ms`}</span>
+                  </span>
+                </button>
                 <div
                   className="corner-control-mid corner-gain-wheel"
                   onClick={(e) => {
@@ -4247,6 +4446,27 @@ export default function App({ runtime = "web" }) {
       </main>
 
       <div className="inline-editor docked rack-panel">
+        <div className="dock-col">
+          <div className="card-metrics-box">
+            <div className="metric-tile">
+              <span className="metric-title">Latency</span>
+              <span className="metric-value">{sourceLatencyLabel}</span>
+            </div>
+            <div className="metric-tile">
+              <span className="metric-title">Var</span>
+              <span className="metric-value">{inputLatencyVarLabel}</span>
+            </div>
+            <div className="metric-tile">
+              <span className="metric-title">Underruns</span>
+              <span className="metric-value">{inputOverflowLabel}</span>
+            </div>
+            <div className="metric-tile">
+              <span className="metric-title">Drops</span>
+              <span className="metric-value">{inputDroppedFramesLabel}</span>
+            </div>
+          </div>
+        </div>
+
         <div className="dock-col dock-card">
           <div className="dock-card-main-wrap">
             <div className="card-main-copy card-main-copy-split">
@@ -4267,42 +4487,22 @@ export default function App({ runtime = "web" }) {
               ))}
             </span>
           </div>
-          <div className="card-metrics-box">
-            <div className="metric-tile">
-              <span className="metric-title">Latency</span>
-              <span className="metric-value">{sourceLatencyLabel}</span>
-            </div>
-            <div className="metric-tile">
-              <span className="metric-title">Jitter</span>
-              <span className="metric-value">{jitterLabel}</span>
-            </div>
-          </div>
         </div>
 
         <div className="dock-col dock-center">
           <div className="dock-center-stack">
-            <button
-              type="button"
-              className={`route-indicator-btn ${routeIndicatorActive ? "active" : "inactive"}`}
+            <div
+              className={`route-indicator-display ${routeIndicatorActive ? "active" : "inactive"}`}
               title={routeIndicatorActive ? "Selected route is active" : "Selected route is disabled"}
               aria-label={routeIndicatorActive ? "Selected route active" : "Selected route disabled"}
+              role="img"
             >
               <span aria-hidden="true">{routeIndicatorIcon}</span>
-            </button>
+            </div>
           </div>
         </div>
 
         <div className="dock-col dock-card">
-          <div className="card-metrics-box">
-            <div className="metric-tile">
-              <span className="metric-title">Latency</span>
-              <span className="metric-value">{destinationLatencyLabel}</span>
-            </div>
-            <div className="metric-tile">
-              <span className="metric-title">Jitter</span>
-              <span className="metric-value">{jitterLabel}</span>
-            </div>
-          </div>
           <div className="dock-card-main-wrap">
             <div className="card-main-copy card-main-copy-split">
               <div className="card-meter-bg card-meter-bg-row-split" aria-hidden="true" style={{ gridTemplateRows: `repeat(${selectedDestinationChannelLabels.length}, 1fr)` }}>
@@ -4321,6 +4521,27 @@ export default function App({ runtime = "web" }) {
                 <span key={`dst-${i}`} className="axis-split-label axis-split-cell">{label}</span>
               ))}
             </span>
+          </div>
+        </div>
+
+        <div className="dock-col">
+          <div className="card-metrics-box">
+            <div className="metric-tile">
+              <span className="metric-title">Latency</span>
+              <span className="metric-value">{destinationLatencyLabel}</span>
+            </div>
+            <div className="metric-tile">
+              <span className="metric-title">Jitter</span>
+              <span className="metric-value">{outputJitterLabel}</span>
+            </div>
+            <div className="metric-tile">
+              <span className="metric-title">Underruns</span>
+              <span className="metric-value">{outputUnderrunsLabel}</span>
+            </div>
+            <div className="metric-tile">
+              <span className="metric-title">Drops</span>
+              <span className="metric-value">{outputSyncCorrectionsLabel}</span>
+            </div>
           </div>
         </div>
       </div>

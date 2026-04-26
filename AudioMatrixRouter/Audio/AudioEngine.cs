@@ -25,7 +25,8 @@ public class ActiveDevice
 
 public class AudioEngine : IDisposable
 {
-    private const int DefaultCaptureRingBufferMs = 40;
+    private const int DefaultInputRingBufferMs = 40;
+    private const int DefaultOutputBufferMs = 40;
     private const int RenderPeriodMs = 10;
 
     private readonly DeviceEnumerator _enumerator = new();
@@ -34,7 +35,8 @@ public class AudioEngine : IDisposable
     private readonly RoutingMatrix _routingMatrix = new();
     private bool _running;
     private OutputSyncCoordinator? _syncCoordinator;
-    private int _captureBufferMs = DefaultCaptureRingBufferMs;
+    private int _inputBufferMs = DefaultInputRingBufferMs;
+    private int _outputBufferMs = DefaultOutputBufferMs;
 
     private readonly record struct RoutedCrosspoint(
         string InputDeviceId,
@@ -55,7 +57,8 @@ public class AudioEngine : IDisposable
 
     public int TotalInputChannels { get; private set; }
     public int TotalOutputChannels { get; private set; }
-    public int CaptureBufferMs => _captureBufferMs;
+    public int InputBufferMs => _inputBufferMs;
+    public int OutputBufferMs => _outputBufferMs;
 
     public bool TryGetRouteWorkingLatencyMs(int inCh, int outCh, out double latencyMs)
     {
@@ -76,10 +79,54 @@ public class AudioEngine : IDisposable
             : 0;
 
         // Real driver latencies queried at Start(); fall back to the requested period if unavailable.
-        int captureDriverMs = input.CaptureLatencyMs > 0 ? input.CaptureLatencyMs : _captureBufferMs;
+        int captureDriverMs = input.CaptureLatencyMs > 0 ? input.CaptureLatencyMs : _inputBufferMs;
         int renderDriverMs = output.RenderLatencyMs > 0 ? output.RenderLatencyMs : RenderPeriodMs;
 
-        latencyMs = captureDriverMs + captureQueueMs + renderDriverMs + output.OutputDelayMs;
+        latencyMs = captureDriverMs + captureQueueMs + renderDriverMs + output.OutputDelayMs + _outputBufferMs;
+        return true;
+    }
+
+    public bool TryGetInputPathLatencyMs(out double latencyMs)
+    {
+        latencyMs = 0;
+
+        var inputMaster = GetInputMasterDevice();
+        if (inputMaster == null || inputMaster.RingBuffer == null)
+        {
+            return false;
+        }
+
+        var outputMaster = GetOutputMasterDevice();
+        var consumerId = outputMaster == null
+            ? string.Empty
+            : (string.IsNullOrWhiteSpace(outputMaster.ConsumerId) ? outputMaster.Info.Id : outputMaster.ConsumerId);
+        if (string.IsNullOrWhiteSpace(consumerId))
+        {
+            consumerId = inputMaster.Info.Id;
+        }
+
+        int queuedFrames = inputMaster.RingBuffer.GetAvailableFrames(consumerId);
+        double captureQueueMs = inputMaster.Info.SampleRate > 0
+            ? (queuedFrames * 1000.0) / inputMaster.Info.SampleRate
+            : 0;
+
+        int captureDriverMs = inputMaster.CaptureLatencyMs > 0 ? inputMaster.CaptureLatencyMs : _inputBufferMs;
+        latencyMs = captureDriverMs + captureQueueMs;
+        return true;
+    }
+
+    public bool TryGetOutputPathLatencyMs(out double latencyMs)
+    {
+        latencyMs = 0;
+
+        var outputMaster = GetOutputMasterDevice();
+        if (outputMaster == null)
+        {
+            return false;
+        }
+
+        int renderDriverMs = outputMaster.RenderLatencyMs > 0 ? outputMaster.RenderLatencyMs : RenderPeriodMs;
+        latencyMs = renderDriverMs + outputMaster.OutputDelayMs + _outputBufferMs;
         return true;
     }
 
@@ -129,6 +176,7 @@ public class AudioEngine : IDisposable
         }
 
         _syncCoordinator?.SetMasterConsumer(deviceId);
+        ApplyPreferredMasterConsumerToInputs();
 
         if (changed)
         {
@@ -334,7 +382,7 @@ public class AudioEngine : IDisposable
                     : dev.Info.Id);
                 if (mmDevice == null) continue;
 
-                int ringFrames = Math.Max(dev.Info.SampleRate * _captureBufferMs / 1000, dev.Info.SampleRate / 200);
+                int ringFrames = Math.Max(dev.Info.SampleRate * _inputBufferMs / 1000, dev.Info.SampleRate / 200);
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
                 dev.PeakLevels = new float[dev.Info.Channels];
@@ -345,7 +393,7 @@ public class AudioEngine : IDisposable
                 }
                 else
                 {
-                    dev.Capture = new WasapiCapture(mmDevice, true, _captureBufferMs);
+                    dev.Capture = new WasapiCapture(mmDevice, true, _inputBufferMs);
                 }
                 dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
                 int channels = dev.Info.Channels;
@@ -375,7 +423,7 @@ public class AudioEngine : IDisposable
                     }
                 };
                 dev.Capture.StartRecording();
-                dev.CaptureLatencyMs = _captureBufferMs;
+                dev.CaptureLatencyMs = _inputBufferMs;
             }
 
             var sources = _inputDevices
@@ -397,6 +445,7 @@ public class AudioEngine : IDisposable
                     dev.Info.Channels,
                     dev.Info.SampleRate,
                     dev.OutputDelayMs,
+                    _outputBufferMs,
                     dev.ConsumerId,
                     _syncCoordinator);
 
@@ -405,6 +454,8 @@ public class AudioEngine : IDisposable
                 dev.Render.Play();
                 dev.RenderLatencyMs = RenderPeriodMs;
             }
+
+            ApplyPreferredMasterConsumerToInputs();
 
             _running = true;
             StateChanged?.Invoke();
@@ -427,29 +478,45 @@ public class AudioEngine : IDisposable
 
         var clampedDelayMs = Math.Clamp(delayMs, 0, 5000);
         device.OutputDelayMs = clampedDelayMs;
-        device.MixProvider?.SetOutputDelayMs(clampedDelayMs);
+        device.MixProvider?.SetDeviceDelayMs(clampedDelayMs);
         StateChanged?.Invoke();
         return true;
     }
 
-    public bool SetCaptureBufferMs(int bufferMs)
+    public bool SetInputBufferMs(int bufferMs)
     {
         int clamped = Math.Clamp(bufferMs, 5, 200);
-        if (_captureBufferMs == clamped)
+        if (_inputBufferMs == clamped)
         {
             return true;
         }
 
-        _captureBufferMs = clamped;
+        _inputBufferMs = clamped;
 
-        bool wasRunning = _running;
-        if (wasRunning)
+        // Keep input-buffer changes live like output-buffer updates.
+        // Capture backends are not torn down here; we update latency targets used by
+        // queue-health reporting and future stream initializations.
+        foreach (var dev in _inputDevices)
         {
-            Stop();
-            if (_inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints())
-            {
-                Start();
-            }
+            dev.CaptureLatencyMs = clamped;
+        }
+
+        StateChanged?.Invoke();
+        return true;
+    }
+
+    public bool SetOutputBufferMs(int bufferMs)
+    {
+        int clamped = Math.Clamp(bufferMs, 5, 200);
+        if (_outputBufferMs == clamped)
+        {
+            return true;
+        }
+
+        _outputBufferMs = clamped;
+        foreach (var dev in _outputDevices)
+        {
+            dev.MixProvider?.SetOutputBufferMs(clamped);
         }
 
         StateChanged?.Invoke();
@@ -500,6 +567,21 @@ public class AudioEngine : IDisposable
 
         _routingMatrix.Resize(TotalInputChannels, TotalOutputChannels);
         _routingMatrix.Publish();
+    }
+
+    private void ApplyPreferredMasterConsumerToInputs()
+    {
+        var masterOutput = GetOutputMasterDevice() ?? _outputDevices.FirstOrDefault();
+        if (masterOutput == null) return;
+
+        var preferredConsumerId = string.IsNullOrWhiteSpace(masterOutput.ConsumerId)
+            ? masterOutput.Info.Id
+            : masterOutput.ConsumerId;
+
+        foreach (var input in _inputDevices)
+        {
+            input.RingBuffer?.SetPreferredConsumer(preferredConsumerId);
+        }
     }
 
     public void RefreshDevices()
