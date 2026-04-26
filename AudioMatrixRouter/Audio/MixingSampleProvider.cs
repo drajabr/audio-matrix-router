@@ -25,10 +25,10 @@ public sealed class OutputSyncCoordinator
     private const double VariationRangeDecayAlpha = 0.003;
     // Spike rejection base: ~5 ms at 48 kHz; close enough for 44.1 kHz as well.
     private const int SpikeRejectThresholdFramesBase = 240;
-    private const int SpikeRejectThresholdFramesMax = 960; // ~20 ms, max adaptive threshold
-    private const double SpikeThresholdGrowthAlpha = 0.01; // Slow growth when spikes are frequent
-    private const double SpikeThresholdDecayAlpha = 0.002; // Slow decay when spikes are rare
-    private const int UnderrrunRescueThresholdFrames = 100; // Trigger rescue when underruns occur
+    // When a spike is detected, incorporate it into the EMA at this reduced alpha so the EMA
+    // slowly learns the device's real delivery envelope without jumping and causing morph.
+    private const double SpikeBlendAlpha = 0.005;
+    private const int UnderrrunRescueThresholdFrames = 100; // kept for compile; target bump removed
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
@@ -36,9 +36,6 @@ public sealed class OutputSyncCoordinator
     private int _baseMasterTargetFrames;
     private int _maxMasterTargetFrames;
     private double _adaptiveMasterTargetFrames;
-    private double _adaptiveSpikeRejectThresholdFrames = SpikeRejectThresholdFramesBase;
-    private int _recentSpikeCount = 0;
-    private int _recentNormalCount = 0;
     private long _totalMasterUnderruns = 0;
 
     private sealed class OutputState
@@ -165,38 +162,19 @@ public sealed class OutputSyncCoordinator
 
             state.BufferedFrames = Math.Max(0, bufferedFrames);
 
-            // Spike rejection: once the slow EMA is established, skip samples that deviate
-            // beyond the adaptive threshold so periodic device bursts don't pollute the error signal.
-            // The threshold adapts: grows when spikes are frequent (so the EMA learns the device pattern),
-            // decays when spikes are rare.
+            // Spike rejection: once the slow EMA is established, samples that deviate more than
+            // the threshold are NOT fed into the EMA at full speed — they are blended at a very slow
+            // alpha instead. This means the EMA gradually learns the device's real delivery envelope
+            // (satisfying the user's request to "consider spikes in the moving average") without
+            // causing a sudden error signal jump that would trigger slips and morph the audio.
             bool isSpike = state.SmoothedBufferedFrames >= 0
                 && state.FramesRendered >= WarmupFrames
-                && Math.Abs(state.BufferedFrames - state.SmoothedBufferedFrames) > _adaptiveSpikeRejectThresholdFrames;
+                && Math.Abs(state.BufferedFrames - state.SmoothedBufferedFrames) > SpikeRejectThresholdFramesBase;
 
-            if (!isSpike)
-            {
-                state.SmoothedBufferedFrames = state.SmoothedBufferedFrames < 0
-                    ? state.BufferedFrames
-                    : (state.SmoothedBufferedFrames * (1.0 - BufferedFramesSmoothingAlpha)) + (state.BufferedFrames * BufferedFramesSmoothingAlpha);
-                _recentNormalCount++;
-            }
-            else
-            {
-                _recentSpikeCount++;
-            }
-
-            // Adapt the spike threshold: if spikes are common, raise the threshold so the EMA
-            // gradually learns the actual device delivery rate. If spikes are rare, lower it.
-            if (_recentSpikeCount + _recentNormalCount >= 100)
-            {
-                double spikeRate = _recentSpikeCount / (double)(_recentSpikeCount + _recentNormalCount);
-                double targetThreshold = spikeRate > 0.05 // If >5% of samples are spikes
-                    ? _adaptiveSpikeRejectThresholdFrames * (1.0 + SpikeThresholdGrowthAlpha)
-                    : _adaptiveSpikeRejectThresholdFrames * (1.0 - SpikeThresholdDecayAlpha);
-                _adaptiveSpikeRejectThresholdFrames = Math.Clamp(targetThreshold, SpikeRejectThresholdFramesBase, SpikeRejectThresholdFramesMax);
-                _recentSpikeCount = 0;
-                _recentNormalCount = 0;
-            }
+            double emaAlpha = isSpike ? SpikeBlendAlpha : BufferedFramesSmoothingAlpha;
+            state.SmoothedBufferedFrames = state.SmoothedBufferedFrames < 0
+                ? state.BufferedFrames
+                : (state.SmoothedBufferedFrames * (1.0 - emaAlpha)) + (state.BufferedFrames * emaAlpha);
 
             UpdateVariationBandNoLock(state);
             RecomputeAdaptiveMasterTargetNoLock();
@@ -383,21 +361,10 @@ public sealed class OutputSyncCoordinator
             }
         }
 
-        // Spike absorption: if the master's raw buffer jumps well above the adaptive target,
-        // raise the target quickly to absorb the spike rather than issuing slip corrections.
-        if (_states.TryGetValue(_masterConsumerId, out var masterStateForSpike)
-            && masterStateForSpike.BufferedFrames >= 0
-            && masterStateForSpike.FramesRendered >= WarmupFrames)
-        {
-            int masterExcess = masterStateForSpike.BufferedFrames - (int)_adaptiveMasterTargetFrames;
-            if (masterExcess > _adaptiveSpikeRejectThresholdFrames)
-            {
-                desiredTargetFrames = Math.Clamp(
-                    (int)_adaptiveMasterTargetFrames + masterExcess,
-                    _baseMasterTargetFrames,
-                    _maxMasterTargetFrames);
-            }
-        }
+        // NOTE: We intentionally do NOT lift the target based on raw buffered-frame spikes.
+        // Doing so would disturb _adaptiveMasterTargetFrames, making the master's error signal
+        // go negative, triggering slips, and causing the audible morphing/phasing effect.
+        // Spikes are handled by the EMA's slow-blend path above and absorbed by the large ring buffer.
 
         desiredTargetFrames = Math.Clamp(desiredTargetFrames, _baseMasterTargetFrames, _maxMasterTargetFrames);
         bool rescueMode = desiredTargetFrames > (_adaptiveMasterTargetFrames + StableSettleBandFrames);
@@ -412,17 +379,14 @@ public sealed class OutputSyncCoordinator
     {
         lock (_syncLock)
         {
+            // Count underruns for diagnostics only. We intentionally do NOT adjust
+            // _adaptiveMasterTargetFrames here: per-event target bumps disturb the error
+            // signal which causes slips → morph. The large ring buffer (400 ms) combined
+            // with the user's output-buffer slider setting provides enough headroom to
+            // absorb transient capture gaps without needing reactive target changes.
             if (underrunDelta > 0)
             {
                 _totalMasterUnderruns += underrunDelta;
-                // Underruns indicate buffer starvation; trigger immediate rescue mode.
-                int desiredTargetFrames = Math.Clamp(
-                    (int)_adaptiveMasterTargetFrames + UnderrrunRescueThresholdFrames,
-                    _baseMasterTargetFrames,
-                    _maxMasterTargetFrames);
-                // Fast move to the higher target using rescue alpha.
-                _adaptiveMasterTargetFrames = (_adaptiveMasterTargetFrames * (1.0 - TargetSmoothingAlphaRescue)) + (desiredTargetFrames * TargetSmoothingAlphaRescue);
-                _adaptiveMasterTargetFrames = Math.Clamp(_adaptiveMasterTargetFrames, _baseMasterTargetFrames, _maxMasterTargetFrames);
             }
         }
     }

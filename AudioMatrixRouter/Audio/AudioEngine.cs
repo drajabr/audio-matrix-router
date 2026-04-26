@@ -28,6 +28,10 @@ public class AudioEngine : IDisposable
 {
     private const int DefaultInputRingBufferMs = 40;
     private const int DefaultOutputBufferMs = 40;
+    // Ring buffers are always allocated at this ceiling regardless of the input-buffer-ms slider.
+    // The slider controls WASAPI callback period (latency); the ring just needs to be large enough
+    // to absorb spikes and adaptive target growth without overflowing.
+    private const int RingBufferCapacityMs = 400;
     private const int RenderPeriodMs = 10;
 
     private readonly DeviceEnumerator _enumerator = new();
@@ -383,7 +387,10 @@ public class AudioEngine : IDisposable
                     : dev.Info.Id);
                 if (mmDevice == null) continue;
 
-                int ringFrames = Math.Max(dev.Info.SampleRate * _inputBufferMs / 1000, dev.Info.SampleRate / 200);
+                // Always allocate ring buffers at the max capacity (RingBufferCapacityMs).
+                // The _inputBufferMs slider only controls the WASAPI capture callback period,
+                // not the ring size. This prevents drops when the adaptive target grows.
+                int ringFrames = Math.Max(dev.Info.SampleRate * RingBufferCapacityMs / 1000, dev.Info.SampleRate / 200);
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
                 dev.PeakLevels = new float[dev.Info.Channels];
@@ -512,13 +519,14 @@ public class AudioEngine : IDisposable
 
         _inputBufferMs = clamped;
 
-        // Keep input-buffer changes live like output-buffer updates.
-        // Capture backends are not torn down here; we update latency targets used by
-        // queue-health reporting and future stream initializations.
         foreach (var dev in _inputDevices)
         {
             dev.CaptureLatencyMs = clamped;
         }
+
+        // Recalculate sync targets: input buffer change affects how aggressively
+        // the coordinator can chase spikes relative to available ring headroom.
+        UpdateSyncBufferTargets();
 
         StateChanged?.Invoke();
         return true;
@@ -637,15 +645,20 @@ public class AudioEngine : IDisposable
 
         int desiredByOutputBufferFrames = Math.Max(sampleRate * _outputBufferMs / 1000, sampleRate / 200);
 
+        // Use actual ring capacity from live ring buffers, but never lower than what the
+        // configured _inputBufferMs implies — ring buffers are always allocated at RingBufferCapacityMs.
+        int projectedRingCapacityFrames = sampleRate * RingBufferCapacityMs / 1000;
         int minRingCapacityFrames = _inputDevices
             .Where(d => d.RingBuffer != null)
             .Select(d => d.RingBuffer!.CapacityFrames)
-            .DefaultIfEmpty(desiredByOutputBufferFrames * 2)
+            .DefaultIfEmpty(projectedRingCapacityFrames)
             .Min();
+        // Always at least what the user's input buffer slider implies so the limit is user-driven.
+        minRingCapacityFrames = Math.Max(minRingCapacityFrames, sampleRate * _inputBufferMs / 1000);
 
-        int maxSafeTargetFrames = Math.Max(64, Math.Min(minRingCapacityFrames - 16, (minRingCapacityFrames * 3) / 4));
-        int baseTargetFrames = Math.Max(64, Math.Min(desiredByOutputBufferFrames, minRingCapacityFrames / 2));
-        baseTargetFrames = Math.Min(baseTargetFrames, maxSafeTargetFrames);
+        // Reserve some headroom before the ring overflows: allow up to 80% of ring capacity.
+        int maxSafeTargetFrames = Math.Max(64, (minRingCapacityFrames * 4) / 5);
+        int baseTargetFrames = Math.Max(64, Math.Min(desiredByOutputBufferFrames, maxSafeTargetFrames));
 
         return (baseTargetFrames, Math.Max(baseTargetFrames, maxSafeTargetFrames));
     }
