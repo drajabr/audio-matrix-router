@@ -254,20 +254,20 @@ textarea {
 
 .ui-controls-toggle {
   position: absolute;
-  top: 50%;
-  right: 0;
-  transform: translate(0, -50%);
+  top: 3px;
+  right: 3px;
+  transform: translateY(0);
   z-index: 2601;
 }
 
 .ui-controls-toggle:hover {
-  transform: translate(0, calc(-50% - 1px));
+  transform: translateY(-1px);
 }
 
 .ui-controls-toggle.active {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
   background: transparent;
-  box-shadow: none;
+  transform: translateY(0);
 }
 
 .ui-quick-controls {
