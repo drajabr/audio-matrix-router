@@ -1,4 +1,4 @@
-﻿@tailwind base;
+@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
@@ -36,6 +36,11 @@
   --radius-overlay: 6px;
   --radius-tile: 5px;
   --radius-micro: 4px;
+  --fx-elev-1: 0 3px 10px rgba(0, 0, 0, 0.3);
+  --fx-elev-2: 0 8px 20px rgba(0, 0, 0, 0.42);
+  --fx-press: inset 0 2px 6px rgba(0, 0, 0, 0.55), inset 0 -1px 0 rgba(255, 255, 255, 0.05);
+  --fx-edge: inset 0 1px 0 rgba(255, 255, 255, 0.1), inset 0 -1px 0 rgba(0, 0, 0, 0.38);
+  --fx-fast: 120ms cubic-bezier(0.2, 0.85, 0.25, 1);
 }
 
 * {
@@ -189,29 +194,49 @@ textarea {
 }
 
 .channel-toggle {
+  position: relative;
   flex-shrink: 0;
   width: 44px;
   height: 44px;
   border-radius: var(--radius-overlay);
-  border: 1px solid color-mix(in srgb, var(--line) 88%, white 12%);
-  background: color-mix(in srgb, var(--surface) 86%, black 14%);
+  border: 1px solid color-mix(in srgb, var(--line) 78%, white 22%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, white 10%), color-mix(in srgb, var(--surface) 80%, black 20%));
   color: #d6deea;
   font-size: 1.1rem;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
+  transition: border-color var(--fx-fast), transform var(--fx-fast), background var(--fx-fast), box-shadow var(--fx-fast), filter var(--fx-fast);
+}
+
+.channel-toggle::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0));
+  pointer-events: none;
 }
 
 .channel-toggle:hover {
-  border-color: #4b5667;
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--line));
+  transform: translateY(-1px);
+  box-shadow: var(--fx-edge), var(--fx-elev-2);
+  filter: saturate(1.08);
+}
+
+.channel-toggle:active {
+  transform: translateY(1px);
+  box-shadow: var(--fx-press), 0 2px 6px rgba(0, 0, 0, 0.36);
 }
 
 .channel-toggle.active {
   color: #053e37;
   border-color: color-mix(in srgb, var(--accent) 60%, transparent);
   background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), inset 0 -1px 0 rgba(0, 0, 0, 0.3), 0 10px 18px color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
 .ui-controls-wrap {
@@ -288,18 +313,36 @@ textarea {
 }
 
 .icon-btn {
+  position: relative;
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--surface) 88%, black 12%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, white 10%), color-mix(in srgb, var(--surface) 82%, black 18%));
   color: var(--text);
   cursor: pointer;
-  opacity: 0.62;
-  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease;
+  opacity: 0.85;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
+  transition: border-color var(--fx-fast), box-shadow var(--fx-fast), transform var(--fx-fast), opacity var(--fx-fast), filter var(--fx-fast);
+}
+
+.icon-btn::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0));
+  pointer-events: none;
 }
 
 .icon-btn:hover:not(.ui-controls-toggle) {
   opacity: 1;
   border-color: color-mix(in srgb, var(--accent) 60%, transparent);
   transform: translateY(-1px);
+  box-shadow: var(--fx-edge), var(--fx-elev-2);
+  filter: saturate(1.08);
+}
+
+.icon-btn:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: var(--fx-press), 0 2px 6px rgba(0, 0, 0, 0.36);
 }
 
 .icon-btn--square {
@@ -327,6 +370,7 @@ textarea {
   border-color: color-mix(in srgb, var(--accent) 60%, transparent);
   background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
   color: var(--text-on-accent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.36), inset 0 -1px 0 rgba(0, 0, 0, 0.28), 0 9px 16px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 .quick-control-picker {
@@ -355,29 +399,41 @@ textarea {
 }
 
 .quick-picker-option {
+  position: relative;
   height: 44px;
   border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--surface) 88%, black 12%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, white 10%), color-mix(in srgb, var(--surface) 82%, black 18%));
   color: var(--text);
   display: flex;
   flex-direction: row;
   align-items: center;
   gap: 6px;
   cursor: pointer;
-  opacity: 0.62;
-  transition: border-color 120ms ease, box-shadow 120ms ease, opacity 120ms ease;
+  opacity: 0.84;
+  transition: border-color var(--fx-fast), box-shadow var(--fx-fast), opacity var(--fx-fast), transform var(--fx-fast);
   padding: 0 8px;
   text-align: left;
   width: 100%;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
+}
+
+.quick-picker-option::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.1), rgba(255, 255, 255, 0));
+  pointer-events: none;
 }
 
 .quick-picker-option:hover,
 .quick-picker-option.is-active {
   opacity: 1;
   border-color: color-mix(in srgb, var(--accent) 60%, transparent);
-  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent) 28%, var(--surface-raised)), color-mix(in srgb, var(--accent) 14%, var(--panel-deep)));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.26), inset 0 -1px 0 rgba(0, 0, 0, 0.24), 0 10px 18px color-mix(in srgb, var(--accent) 18%, transparent);
+  transform: translateY(-1px);
 }
 
 .qp-swatch {
@@ -516,11 +572,12 @@ textarea {
 }
 
 .corner-control-btn {
+  position: relative;
   width: 100%;
   height: 100%;
   border-radius: var(--radius-tile);
   border: 1px solid color-mix(in srgb, var(--line) 86%, white 14%);
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 88%, white 5%), color-mix(in srgb, var(--panel) 90%, black 10%));
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, white 8%), color-mix(in srgb, var(--panel) 86%, black 14%));
   color: var(--text-strong);
   font-size: var(--font-size-xl);
   font-weight: 700;
@@ -529,7 +586,17 @@ textarea {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  transition: transform 120ms ease, filter 120ms ease, color 120ms ease, opacity 120ms ease, border-color 120ms ease;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
+  transition: transform var(--fx-fast), filter var(--fx-fast), color var(--fx-fast), opacity var(--fx-fast), border-color var(--fx-fast), box-shadow var(--fx-fast), background var(--fx-fast);
+}
+
+.corner-control-btn::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0));
+  pointer-events: none;
 }
 
 .corner-control-btn:hover:not(:disabled) {
@@ -537,18 +604,26 @@ textarea {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
   filter: drop-shadow(0 0 6px rgba(171, 186, 206, 0.25));
   transform: translateY(-1px);
+  box-shadow: var(--fx-edge), var(--fx-elev-2);
+}
+
+.corner-control-btn:active:not(:disabled) {
+  transform: translateY(1px);
+  box-shadow: var(--fx-press), 0 2px 6px rgba(0, 0, 0, 0.36);
 }
 
 .corner-control-btn.active {
   color: var(--text-on-accent);
   border-color: color-mix(in srgb, var(--accent) 60%, transparent);
   background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), inset 0 -1px 0 rgba(0, 0, 0, 0.3), 0 10px 18px color-mix(in srgb, var(--accent) 24%, transparent);
 }
 
 .corner-control-btn.muted {
   color: color-mix(in srgb, var(--danger) 35%, white 65%);
   border-color: color-mix(in srgb, var(--danger-line) 70%, var(--line));
-  background: color-mix(in srgb, var(--danger-soft) 62%, var(--surface) 38%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--danger-soft) 78%, white 6%), color-mix(in srgb, var(--danger-soft) 56%, var(--surface) 44%));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 -1px 0 rgba(0, 0, 0, 0.36), 0 8px 16px rgba(120, 22, 22, 0.24);
 }
 
 .corner-control-btn:disabled {
@@ -783,32 +858,46 @@ textarea {
 
 .row-main {
   position: relative;
+  isolation: isolate;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--surface) 82%, black 18%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 88%, white 6%), color-mix(in srgb, var(--surface) 80%, black 20%));
   border-radius: var(--radius-tile);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+  box-shadow: var(--fx-edge), 0 8px 14px rgba(0, 0, 0, 0.22);
   display: flex;
   align-items: stretch;
   cursor: default;
   padding-left: 18px;
+  transition: border-color var(--fx-fast), box-shadow var(--fx-fast), filter var(--fx-fast), transform var(--fx-fast);
 }
 
 .col-main {
   position: relative;
+  isolation: isolate;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--surface) 82%, black 18%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 88%, white 6%), color-mix(in srgb, var(--surface) 80%, black 20%));
   border-radius: var(--radius-tile);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.03);
+  box-shadow: var(--fx-edge), 0 8px 14px rgba(0, 0, 0, 0.22);
   display: flex;
   align-items: stretch;
   cursor: default;
   padding-bottom: 18px;
+  transition: border-color var(--fx-fast), box-shadow var(--fx-fast), filter var(--fx-fast), transform var(--fx-fast);
+}
+
+.row-main::before,
+.col-main::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0));
 }
 
 .master-badge {
@@ -823,7 +912,7 @@ textarea {
   letter-spacing: 0.12em;
   color: var(--text-on-accent);
   background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 84%, white 16%), color-mix(in srgb, var(--accent) 92%, black 8%));
-  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.18);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.34), inset 0 -1px 0 rgba(0, 0, 0, 0.24), 0 6px 10px color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
 .master-badge-row {
@@ -846,7 +935,7 @@ textarea {
 .master-axis .row-main,
 .master-axis .col-main {
   border-color: color-mix(in srgb, var(--accent) 78%, white 22%);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent), 0 0 0 1px color-mix(in srgb, var(--accent) 22%, transparent), 0 10px 18px color-mix(in srgb, var(--accent) 16%, transparent);
 }
 
 .row-channels-box,
@@ -877,7 +966,8 @@ textarea {
 .axis-split-cell {
   border-radius: var(--radius-micro);
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--surface) 88%, black 12%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, white 6%), color-mix(in srgb, var(--surface) 84%, black 16%));
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06), 0 2px 6px rgba(0, 0, 0, 0.22);
 }
 
 .matrix-corner {
@@ -1094,12 +1184,20 @@ textarea {
   height: 112px;
   border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
-  background: color-mix(in srgb, var(--surface) 88%, black 12%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, white 7%), color-mix(in srgb, var(--surface) 84%, black 16%));
   cursor: pointer;
   opacity: 0.62;
   position: relative;
   overflow: hidden;
-  transition: border-color 120ms ease, box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease;
+  box-shadow: var(--fx-edge), 0 6px 12px rgba(0, 0, 0, 0.22);
+  transition: border-color var(--fx-fast), box-shadow var(--fx-fast), transform var(--fx-fast), opacity var(--fx-fast), filter var(--fx-fast);
+}
+
+.cell:hover:not(:disabled):not(.blocked) {
+  transform: translateY(-2px);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+  box-shadow: var(--fx-edge), 0 12px 20px rgba(0, 0, 0, 0.34);
+  filter: saturate(1.08);
 }
 
 .cell:disabled {
@@ -1135,7 +1233,7 @@ textarea {
 }
 
 .cell.phase-inverted::after {
-  content: "Ø";
+  content: "�";
   position: absolute;
   top: 6px;
   right: 6px;
@@ -1254,7 +1352,7 @@ textarea {
 .cell.on {
   border-color: color-mix(in srgb, var(--accent) 84%, white 16%);
   background: linear-gradient(180deg, color-mix(in srgb, var(--accent-hl) 72%, white 28%), color-mix(in srgb, var(--accent) 86%, black 14%));
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.12), 0 0 10px color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), inset 0 -1px 0 rgba(0, 0, 0, 0.2), 0 0 10px color-mix(in srgb, var(--accent) 45%, transparent), 0 12px 20px color-mix(in srgb, var(--accent) 14%, transparent);
   opacity: 1;
 }
 
@@ -1268,8 +1366,8 @@ textarea {
 }
 
 .cell.selected {
-  transform: scale(1.02);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-hl) 55%, transparent);
+  transform: translateY(-1px) scale(1.02);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-hl) 55%, transparent), 0 14px 24px rgba(0, 0, 0, 0.34);
 }
 
 .inline-editor {
@@ -1627,7 +1725,7 @@ textarea {
 .metric-tile {
   border: 1px solid var(--line-strong);
   border-radius: 6px;
-  background: color-mix(in srgb, var(--surface) 84%, black 16%);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 90%, white 8%), color-mix(in srgb, var(--surface) 82%, black 18%));
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -1635,6 +1733,14 @@ textarea {
   gap: 2px;
   padding: 6px 5px;
   overflow: hidden;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
+  transition: border-color var(--fx-fast), box-shadow var(--fx-fast), transform var(--fx-fast);
+}
+
+.metric-tile:hover {
+  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  box-shadow: var(--fx-edge), var(--fx-elev-2);
 }
 
 .metric-title {

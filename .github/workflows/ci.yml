@@ -36,8 +36,8 @@ jobs:
         shell: bash
         run: |
           current_version="$(tr -d '\r\n' < VERSION)"
-          if [[ ! "$current_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "VERSION must be in v0.1.9 format"
+          if [[ ! "$current_version" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "VERSION must be in v0.1 or v0.1.9 format"
             exit 1
           fi
 
