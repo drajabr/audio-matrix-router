@@ -25,6 +25,7 @@ public sealed class OutputSyncCoordinator
     // ===== Underrun Recovery =====
     private const double MinTargetDuringUnderrunFraction = 0.5; // Drop floor to 50% during underruns
     private const double MinTargetRebuildAlpha = 0.0001;        // Very slow floor rebuild (imperceptible)
+    private const double InputStarvationBoostDecay = 0.995;      // Slow decay for input-starvation relief
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
@@ -36,6 +37,7 @@ public sealed class OutputSyncCoordinator
     private long _recentUnderrunCount = 0;
     private long _recentSampleCount = 0;
     private double _effectiveMinTargetFrames = -1; // -1 means uninitialized
+    private double _inputStarvationBoostFrames = 0;
 
     private sealed class OutputState
     {
@@ -280,6 +282,12 @@ public sealed class OutputSyncCoordinator
             desiredTargetFrames += (int)(_baseMasterTargetFrames * 0.5) - minFollowerFrames;
         }
 
+        if (_inputStarvationBoostFrames > 0)
+        {
+            desiredTargetFrames += (int)Math.Round(_inputStarvationBoostFrames);
+            _inputStarvationBoostFrames *= InputStarvationBoostDecay;
+        }
+
         // Initialize effective minimum if needed
         if (_effectiveMinTargetFrames < 0)
         {
@@ -301,6 +309,27 @@ public sealed class OutputSyncCoordinator
             : (_adaptiveMasterTargetFrames * (1.0 - TargetSmoothingAlpha)) + (desiredTargetFrames * TargetSmoothingAlpha);
         
         _adaptiveMasterTargetFrames = Math.Clamp(_adaptiveMasterTargetFrames, (int)_effectiveMinTargetFrames, _maxMasterTargetFrames);
+    }
+
+    public void ReportInputStarvation(int missingFrames)
+    {
+        lock (_syncLock)
+        {
+            if (missingFrames <= 0)
+            {
+                _inputStarvationBoostFrames *= InputStarvationBoostDecay;
+                return;
+            }
+
+            int maxBoost = Math.Max(0, _maxMasterTargetFrames - _baseMasterTargetFrames);
+            if (maxBoost == 0)
+            {
+                return;
+            }
+
+            double desiredBoost = Math.Clamp(missingFrames, 0, maxBoost);
+            _inputStarvationBoostFrames = Math.Max(_inputStarvationBoostFrames, desiredBoost);
+        }
     }
 
     public void ReportUnderruns(long underrunDelta)
@@ -385,6 +414,8 @@ public sealed class OutputSyncCoordinator
 /// </summary>
 public class MixingSampleProvider : ISampleProvider
 {
+    private const int InputSyncSettleBandFrames = 64;
+
     private readonly RoutingMatrix _matrix;
     private readonly List<CaptureSource> _sources;
     private readonly int _outputChannelOffset;
@@ -394,7 +425,9 @@ public class MixingSampleProvider : ISampleProvider
     private readonly OutputSyncCoordinator _syncCoordinator;
     private readonly object _delayLock = new();
     private readonly WaveFormat _waveFormat;
+    private string _inputMasterDeviceId;
     private float[] _sourceTempBuffer = [];
+    private float[] _discardBuffer = [];
     private float[] _mixBuffer = [];
     private float[] _delayBuffer = [];
     private int _delayWriteIndex;
@@ -403,7 +436,7 @@ public class MixingSampleProvider : ISampleProvider
     private long _underrunCount;
     private readonly float[] _peakLevels;
 
-    public record struct CaptureSource(RingBuffer Buffer, int GlobalChannelOffset, int Channels);
+    public record struct CaptureSource(string DeviceId, RingBuffer Buffer, int GlobalChannelOffset, int Channels, bool IsMasterInput);
 
     public MixingSampleProvider(
         RoutingMatrix matrix,
@@ -426,6 +459,10 @@ public class MixingSampleProvider : ISampleProvider
         _syncCoordinator = syncCoordinator;
         _waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, outputChannels);
         _peakLevels = new float[outputChannels];
+        var initialInputMaster = _sources.FirstOrDefault(s => s.IsMasterInput);
+        _inputMasterDeviceId = !string.IsNullOrWhiteSpace(initialInputMaster.DeviceId)
+            ? initialInputMaster.DeviceId
+            : (_sources.Count > 0 ? _sources[0].DeviceId : string.Empty);
         _syncCoordinator.RegisterConsumer(_consumerId);
         _deviceDelayMs = Math.Clamp(outputDelayMs, 0, 5000);
         _outputBufferMs = Math.Clamp(outputBufferMs, 5, 200);
@@ -482,6 +519,11 @@ public class MixingSampleProvider : ISampleProvider
         RebuildDelayBuffer();
     }
 
+    public void SetInputMasterDevice(string deviceId)
+    {
+        _inputMasterDeviceId = deviceId ?? string.Empty;
+    }
+
     private void RebuildDelayBuffer()
     {
         var totalDelayMs = _deviceDelayMs + _outputBufferMs;
@@ -524,9 +566,42 @@ public class MixingSampleProvider : ISampleProvider
         var front = _matrix.GetFrontBuffer();
         int matOutCh = _matrix.OutputChannels;
         float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
+        int masterBufferedFrames = 0;
+        if (_sources.Count > 0)
+        {
+            var masterSource = _sources.FirstOrDefault(IsMasterInputSource);
+            if (string.IsNullOrWhiteSpace(masterSource.DeviceId))
+            {
+                masterSource = _sources[0];
+            }
+
+            masterBufferedFrames = masterSource.Buffer.GetAvailableFrames(_consumerId);
+        }
+        int maxFollowerDeficitFrames = 0;
 
         foreach (var src in _sources)
         {
+            int sourceBufferedFrames = src.Buffer.GetAvailableFrames(_consumerId);
+            if (!IsMasterInputSource(src))
+            {
+                int aheadFrames = sourceBufferedFrames - masterBufferedFrames;
+                if (aheadFrames > InputSyncSettleBandFrames)
+                {
+                    int discardFrames = Math.Min(aheadFrames - InputSyncSettleBandFrames, sourceFrames * 4);
+                    if (discardFrames > 0)
+                    {
+                        DiscardFramesForConsumer(src, discardFrames);
+                        sourceBufferedFrames = Math.Max(0, sourceBufferedFrames - discardFrames);
+                    }
+                }
+
+                int deficitFrames = masterBufferedFrames - sourceBufferedFrames;
+                if (deficitFrames > maxFollowerDeficitFrames)
+                {
+                    maxFollowerDeficitFrames = deficitFrames;
+                }
+            }
+
             // Ensure temp buffer large enough
             int srcSamples = sourceFrames * src.Channels;
             if (_sourceTempBuffer.Length < srcSamples)
@@ -570,6 +645,8 @@ public class MixingSampleProvider : ISampleProvider
             // Consume the frames we read
             src.Buffer.ReadForConsumer(_consumerId, _sourceTempBuffer, 0, framesRead);
         }
+
+        _syncCoordinator.ReportInputStarvation(maxFollowerDeficitFrames);
 
         FitMixedFramesToOutput(buffer, offset, frames, sourceFrames);
 
@@ -668,6 +745,32 @@ public class MixingSampleProvider : ISampleProvider
         }
 
         return minBufferedFrames == int.MaxValue ? 0 : minBufferedFrames;
+    }
+
+    private bool IsMasterInputSource(CaptureSource source)
+    {
+        if (!string.IsNullOrWhiteSpace(_inputMasterDeviceId))
+        {
+            return string.Equals(source.DeviceId, _inputMasterDeviceId, StringComparison.Ordinal);
+        }
+
+        return source.IsMasterInput;
+    }
+
+    private void DiscardFramesForConsumer(CaptureSource source, int frames)
+    {
+        if (frames <= 0)
+        {
+            return;
+        }
+
+        int samples = frames * source.Channels;
+        if (_discardBuffer.Length < samples)
+        {
+            _discardBuffer = new float[samples];
+        }
+
+        source.Buffer.ReadForConsumer(_consumerId, _discardBuffer, 0, frames);
     }
 
     private long GetDroppedFramesForConsumer()

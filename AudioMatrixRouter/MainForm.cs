@@ -616,6 +616,27 @@ public sealed class MainForm : Form
                     await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
+                case "reloadEngine":
+                {
+                    bool wasRunning = _engine.IsRunning;
+                    if (wasRunning) _engine.Stop();
+                    _availableDevicesDirty = true;
+                    _pendingFullStatePush = true;
+                    SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+                    // Re-start if the engine was running and has active routes.
+                    // SyncDevicesWithSystem calls RefreshDevices() which saw wasRunning=false
+                    // (we stopped above), so it won't auto-restart — we do it explicitly.
+                    if (wasRunning && !_engine.IsRunning
+                        && _engine.InputDevices.Count > 0
+                        && _engine.OutputDevices.Count > 0
+                        && _engine.RoutingMatrix.HasAnyCrosspoints())
+                    {
+                        _engine.Start();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+                }
+
                 case "addInputDevice":
                     if (request.Params.TryGetProperty("deviceId", out var addInputId))
                     {

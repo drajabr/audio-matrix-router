@@ -1947,9 +1947,10 @@ export default function App({ runtime = "web" }) {
       if (hasNativeBridge) {
         if (forceRefreshNative) {
           try {
-            await window.__nativeBridgeInvoke("refreshDevices", {});
+            // reloadEngine does a full stop+restart so counters and device state reset cleanly.
+            await window.__nativeBridgeInvoke("reloadEngine", {});
           } catch (_) {
-            // Ignore refresh failures; we'll still query the latest state snapshot.
+            // Ignore reload failures; we'll still query the latest state snapshot.
           }
         }
 
@@ -4042,7 +4043,13 @@ export default function App({ runtime = "web" }) {
                     if (locked) return;
                     event.preventDefault();
                     event.stopPropagation();
-                    applyBufferDelta(event.deltaY < 0 ? 5 : -5);
+                    // Clear any active drag state
+                    inputBufferDragRef.current = null;
+                    const delta = event.deltaY < 0 ? 5 : -5;
+                    const nextCaptureBufferMs = clamp(captureBufferMs + delta, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
+                    // Snap visual offset immediately to prevent drag appearance
+                    setInputBufferWheelOffsetPx(Math.round(nextCaptureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    applyBufferDelta(delta);
                   }}
                   title={`${isApplyingCaptureBuffer ? "Applying" : "Input buffer"} ${captureBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
                   aria-label="Adjust input buffer"
@@ -4103,7 +4110,13 @@ export default function App({ runtime = "web" }) {
                     if (locked) return;
                     event.preventDefault();
                     event.stopPropagation();
-                    applyOutputBufferDelta(event.deltaY < 0 ? 5 : -5);
+                    // Clear any active drag state
+                    outputBufferDragRef.current = null;
+                    const delta = event.deltaY < 0 ? 5 : -5;
+                    const nextOutputBufferMs = clamp(outputBufferMs + delta, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+                    // Snap visual offset immediately to prevent drag appearance
+                    setOutputBufferWheelOffsetPx(Math.round(nextOutputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    applyOutputBufferDelta(delta);
                   }}
                   title={`${isApplyingOutputBuffer ? "Applying" : "Output buffer"} ${outputBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
                   aria-label="Adjust output buffer"

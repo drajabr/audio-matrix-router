@@ -249,7 +249,7 @@ textarea {
   width: 44px;
   height: 44px;
   min-height: 44px;
-  overflow: hidden;
+  /* No overflow:hidden — the drawer extends leftward beyond this wrapper */
 }
 
 .ui-controls-toggle {
@@ -302,38 +302,27 @@ textarea {
   gap: 6px;
   height: 44px;
   min-height: 44px;
-  padding: 2px 46px 2px 2px;
+  padding: 2px 8px;
   border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: linear-gradient(180deg, var(--surface-raised), var(--panel-deep));
   transition: opacity 140ms ease, border-color 140ms ease;
   position: absolute;
   top: 50%;
-  right: 0;
+  right: 44px;
   transform: translateY(-50%);
   z-index: 2500;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+  white-space: nowrap;
 }
 
 .ui-quick-controls.is-collapsed {
   opacity: 0;
   pointer-events: none;
-  width: 44px;
-  min-width: 44px;
-  height: 44px;
-  min-height: 44px;
-  top: 50%;
-  right: 0;
-  transform: translateY(-50%);
-  padding: 0 44px 0 0;
-  border-color: transparent;
-  overflow: hidden;
-  box-shadow: none;
 }
 
 .ui-controls-wrap.is-open {
   z-index: 2600;
-  width: fit-content;
 }
 
 .quick-control-item {

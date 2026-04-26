@@ -86,7 +86,7 @@ public class AudioEngine : IDisposable
         int captureDriverMs = input.CaptureLatencyMs > 0 ? input.CaptureLatencyMs : _inputBufferMs;
         int renderDriverMs = output.RenderLatencyMs > 0 ? output.RenderLatencyMs : RenderPeriodMs;
 
-        latencyMs = captureDriverMs + captureQueueMs + renderDriverMs + output.OutputDelayMs + _outputBufferMs;
+        latencyMs = captureDriverMs + captureQueueMs + renderDriverMs + output.OutputDelayMs;
         return true;
     }
 
@@ -130,7 +130,7 @@ public class AudioEngine : IDisposable
         }
 
         int renderDriverMs = outputMaster.RenderLatencyMs > 0 ? outputMaster.RenderLatencyMs : RenderPeriodMs;
-        latencyMs = renderDriverMs + outputMaster.OutputDelayMs + _outputBufferMs;
+        latencyMs = renderDriverMs + outputMaster.OutputDelayMs;
         return true;
     }
 
@@ -152,6 +152,14 @@ public class AudioEngine : IDisposable
             {
                 d.IsMasterDevice = next;
                 changed = true;
+            }
+        }
+
+        if (_running)
+        {
+            foreach (var output in _outputDevices)
+            {
+                output.MixProvider?.SetInputMasterDevice(deviceId);
             }
         }
 
@@ -403,7 +411,12 @@ public class AudioEngine : IDisposable
 
             var sources = _inputDevices
                 .Where(d => d.RingBuffer != null)
-                .Select(d => new MixingSampleProvider.CaptureSource(d.RingBuffer!, d.GlobalChannelOffset, d.Info.Channels))
+                .Select(d => new MixingSampleProvider.CaptureSource(
+                    d.Info.Id,
+                    d.RingBuffer!,
+                    d.GlobalChannelOffset,
+                    d.Info.Channels,
+                    d.IsMasterDevice))
                 .ToList();
 
             // Start render
@@ -424,11 +437,16 @@ public class AudioEngine : IDisposable
                     dev.Info.Id == masterOutput.Info.Id ? 0 : dev.BaseLatencyMs,
                     dev.ConsumerId,
                     _syncCoordinator);
+                var inputMaster = GetInputMasterDevice();
+                if (inputMaster != null)
+                {
+                    dev.MixProvider.SetInputMasterDevice(inputMaster.Info.Id);
+                }
 
-                dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, RenderPeriodMs);
+                dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, _outputBufferMs);
                 dev.Render.Init(dev.MixProvider);
                 dev.Render.Play();
-                dev.RenderLatencyMs = RenderPeriodMs;
+                dev.RenderLatencyMs = _outputBufferMs;
             }
 
             ApplyPreferredMasterConsumerToInputs();
@@ -592,10 +610,38 @@ public class AudioEngine : IDisposable
             dev.MixProvider?.SetOutputBufferMs(clamped);
         }
 
+        // If running, restart render clients so the hardware period reflects the new value.
+        // Software max, hardware min: the wheel sets both the software target ceiling
+        // and the WASAPI render period floor so driver-level buffering scales with the setting.
+        if (_running)
+        {
+            RestartRenderClientsForNewPeriod();
+        }
+
         UpdateSyncBufferTargets();
 
         StateChanged?.Invoke();
         return true;
+    }
+
+    private void RestartRenderClientsForNewPeriod()
+    {
+        foreach (var dev in _outputDevices)
+        {
+            try { dev.Render?.Stop(); } catch { }
+            try { dev.Render?.Dispose(); } catch { }
+            dev.Render = null;
+
+            if (dev.MixProvider == null) continue;
+
+            var mmDevice = _enumerator.GetDevice(dev.Info.Id);
+            if (mmDevice == null) continue;
+
+            dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, _outputBufferMs);
+            dev.Render.Init(dev.MixProvider);
+            dev.Render.Play();
+            dev.RenderLatencyMs = _outputBufferMs;
+        }
     }
 
     public void Stop()
