@@ -186,6 +186,19 @@ public sealed class MainForm : Form
         {
             // Keep running if explicit window icon assignment fails.
         }
+
+        EnsureTrayIconVisible();
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_TASKBARCREATED)
+        {
+            // Explorer restart drops notification area icons. Re-register ours.
+            EnsureTrayIconVisible();
+        }
+
+        base.WndProc(ref m);
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -262,6 +275,20 @@ public sealed class MainForm : Form
         _trayIcon.Visible = true;
         _trayIcon.ContextMenuStrip = _trayMenu;
         _trayIcon.DoubleClick += (_, _) => RestoreFromTray();
+    }
+
+    private void EnsureTrayIconVisible()
+    {
+        try
+        {
+            _trayIcon.Icon = _trayAppIcon;
+            _trayIcon.Visible = false;
+            _trayIcon.Visible = true;
+        }
+        catch
+        {
+            // Keep running if Windows rejects a transient tray refresh.
+        }
     }
 
     private void RestoreFromTray()
@@ -1138,8 +1165,12 @@ public sealed class MainForm : Form
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int RegisterWindowMessage(string lpString);
+
     private const int WM_SETICON = 0x0080;
     private const int ICON_SMALL = 0;
     private const int ICON_BIG = 1;
+    private static readonly int WM_TASKBARCREATED = RegisterWindowMessage("TaskbarCreated");
 
 }

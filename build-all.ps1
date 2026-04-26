@@ -8,12 +8,27 @@ $desktopOut = Join-Path $buildRoot 'desktop'
 $webUiPath = Join-Path $PSScriptRoot 'AudioMatrixRouter\WebUI'
 $desktopProject = Join-Path $PSScriptRoot 'AudioMatrixRouter\AudioMatrixRouter.csproj'
 $desktopConfigPath = Join-Path $desktopOut 'config.json'
+$previewPidFile = Join-Path $PSScriptRoot '.preview.pid'
 $preservedConfig = $null
 
 Write-Host 'Stopping running desktop processes...'
 $appPids = @((Get-Process AudioMatrixRouter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id))
 $processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 $descendantPids = @()
+$escapedWebUiPath = [Regex]::Escape($webUiPath)
+
+$trackedPreviewPids = @()
+if (Test-Path $previewPidFile) {
+  try {
+    $trackedPidText = (Get-Content $previewPidFile -Raw).Trim()
+    if ($trackedPidText) {
+      $trackedPreviewPids = @([int]$trackedPidText)
+    }
+  }
+  catch {
+    $trackedPreviewPids = @()
+  }
+}
 
 if ($appPids.Count -gt 0 -and $processSnapshot.Count -gt 0) {
   $queue = New-Object System.Collections.Generic.Queue[int]
@@ -36,9 +51,27 @@ if ($appPids.Count -gt 0 -and $processSnapshot.Count -gt 0) {
 
 $webViewChildPids = @($processSnapshot | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and ($descendantPids -contains [int]$_.ProcessId) } | Select-Object -ExpandProperty ProcessId)
 
-$pidsToStop = @($appPids + $webViewChildPids | Sort-Object -Unique)
+# Kill stale node/cmd preview processes left by previous build runs.
+$stalePreviewPids = @(
+  $processSnapshot | Where-Object {
+    ($_.Name -in @('node.exe', 'cmd.exe')) -and
+    $_.CommandLine -and
+    ($_.CommandLine -match $escapedWebUiPath) -and
+    (
+      ($_.CommandLine -match '--port\s+4173') -or
+      ($_.CommandLine -match 'run\s+preview') -or
+      ($_.CommandLine -match 'vite(\.js)?\s+preview')
+    )
+  } | Select-Object -ExpandProperty ProcessId
+)
+
+$pidsToStop = @($appPids + $webViewChildPids + $trackedPreviewPids + $stalePreviewPids | Sort-Object -Unique)
 if ($pidsToStop.Count -gt 0) {
+  Write-Host ("Stopping stale processes: {0}" -f ($pidsToStop -join ', '))
   Stop-Process -Id $pidsToStop -Force -ErrorAction SilentlyContinue
+}
+if (Test-Path $previewPidFile) {
+  Remove-Item $previewPidFile -Force -ErrorAction SilentlyContinue
 }
 
 if (Test-Path $desktopConfigPath) {
@@ -128,6 +161,7 @@ if (-not $npmCmdPath) {
 $previewCommand = '"' + $npmCmdPath + '" run preview -- --host 127.0.0.1 --port 4173'
 try {
   $previewProcess = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $previewCommand) -WorkingDirectory $webUiPath -WindowStyle Hidden -PassThru
+  Set-Content -Path $previewPidFile -Value $previewProcess.Id -Encoding ASCII
   Write-Host "Preview process started (PID: $($previewProcess.Id))."
 }
 catch {
