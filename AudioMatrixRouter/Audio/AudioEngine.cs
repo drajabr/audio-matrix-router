@@ -28,9 +28,8 @@ public class AudioEngine : IDisposable
 {
     private const int DefaultInputRingBufferMs = 40;
     private const int DefaultOutputBufferMs = 40;
-    // Ring buffers are always allocated at this ceiling regardless of the input-buffer-ms slider.
-    // The slider controls WASAPI callback period (latency); the ring just needs to be large enough
-    // to absorb spikes and adaptive target growth without overflowing.
+    // Keep ring buffers at a stable ceiling to avoid producer/consumer rewire glitches at runtime.
+    // The input buffer slider controls WASAPI capture period, while rings provide spike headroom.
     private const int RingBufferCapacityMs = 400;
     private const int RenderPeriodMs = 10;
 
@@ -387,51 +386,16 @@ public class AudioEngine : IDisposable
                     : dev.Info.Id);
                 if (mmDevice == null) continue;
 
-                // Always allocate ring buffers at the max capacity (RingBufferCapacityMs).
-                // The _inputBufferMs slider only controls the WASAPI capture callback period,
-                // not the ring size. This prevents drops when the adaptive target grows.
-                int ringFrames = Math.Max(dev.Info.SampleRate * RingBufferCapacityMs / 1000, dev.Info.SampleRate / 200);
+                // Allocate a stable ring once per run; avoid runtime ring object swaps.
+                int ringBufferMs = RingBufferCapacityMs;
+                int ringFrames = Math.Max(dev.Info.SampleRate * ringBufferMs / 1000, dev.Info.SampleRate / 200);
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
                 dev.PeakLevels = new float[dev.Info.Channels];
-                if (dev.IsLoopback)
+                if (!CreateAndStartCapture(dev))
                 {
-                    var loop = new WasapiLoopbackCapture(mmDevice);
-                    dev.Capture = loop;
+                    continue;
                 }
-                else
-                {
-                    dev.Capture = new WasapiCapture(mmDevice, true, _inputBufferMs);
-                }
-                dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
-                int channels = dev.Info.Channels;
-                dev.Capture.DataAvailable += (s, e) =>
-                {
-                    int floatCount = e.BytesRecorded / 4;
-                    int frames = floatCount / channels;
-                    var floats = new float[floatCount];
-                    Buffer.BlockCopy(e.Buffer, 0, floats, 0, e.BytesRecorded);
-                    var peaks = dev.PeakLevels;
-                    if (peaks != null)
-                    {
-                        for (int f = 0; f < frames; f++)
-                        {
-                            int baseIdx = f * channels;
-                            for (int c = 0; c < channels; c++)
-                            {
-                                float v = floats[baseIdx + c];
-                                if (v < 0) v = -v;
-                                if (v > peaks[c]) peaks[c] = v;
-                            }
-                        }
-                    }
-                    if (!dev.RingBuffer.Write(floats, 0, frames))
-                    {
-                        Interlocked.Increment(ref dev.InputOverflowCount);
-                    }
-                };
-                dev.Capture.StartRecording();
-                dev.CaptureLatencyMs = _inputBufferMs;
             }
 
             var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
@@ -495,23 +459,9 @@ public class AudioEngine : IDisposable
         return true;
     }
 
-    public bool SetOutputBaseLatencyMs(string deviceId, double baseLatencyMs)
-    {
-        var device = _outputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
-        if (device == null)
-        {
-            return false;
-        }
-
-        var clampedBaseLatencyMs = Math.Clamp(baseLatencyMs, -250.0, 250.0);
-        device.BaseLatencyMs = clampedBaseLatencyMs;
-        device.MixProvider?.SetOutputBaseLatencyMs(clampedBaseLatencyMs);
-        return true;
-    }
-
     public bool SetInputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 5, 200);
+        int clamped = Math.Clamp(bufferMs, 10, 200);
         if (_inputBufferMs == clamped)
         {
             return true;
@@ -524,17 +474,113 @@ public class AudioEngine : IDisposable
             dev.CaptureLatencyMs = clamped;
         }
 
-        // Recalculate sync targets: input buffer change affects how aggressively
-        // the coordinator can chase spikes relative to available ring headroom.
+        // If running, recreate capture clients so the new latency period actually applies.
+        if (_running)
+        {
+            RestartInputCapturesForNewLatency();
+        }
+
+        // Recalculate targets because capture cadence changed.
         UpdateSyncBufferTargets();
 
         StateChanged?.Invoke();
         return true;
     }
 
+    private void RestartInputCapturesForNewLatency()
+    {
+        foreach (var dev in _inputDevices)
+        {
+            try { dev.Capture?.StopRecording(); } catch { }
+            try { dev.Capture?.Dispose(); } catch { }
+            dev.Capture = null;
+        }
+
+        // Keep existing ring instances (consumers reference these objects).
+        // Clear once so the new capture period starts from a clean queue.
+        foreach (var dev in _inputDevices)
+        {
+            dev.RingBuffer?.Clear();
+            dev.InputOverflowCount = 0;
+            CreateAndStartCapture(dev);
+        }
+
+        // Recalculate sync targets with new ring buffer sizes
+        var masterOutput = GetOutputMasterDevice();
+        if (masterOutput != null)
+        {
+            var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
+            _syncCoordinator?.SetMasterBufferTarget(baseMasterTargetFrames, maxMasterTargetFrames);
+        }
+    }
+
+    private bool CreateAndStartCapture(ActiveDevice dev)
+    {
+        if (dev.RingBuffer == null)
+        {
+            return false;
+        }
+
+        var mmDevice = _enumerator.GetDevice(dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
+            ? dev.Info.Id.Substring("loop:".Length)
+            : dev.Info.Id);
+        if (mmDevice == null)
+        {
+            return false;
+        }
+
+        if (dev.IsLoopback)
+        {
+            dev.Capture = new WasapiLoopbackCapture(mmDevice);
+        }
+        else
+        {
+            dev.Capture = new WasapiCapture(mmDevice, true, _inputBufferMs);
+        }
+
+        dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
+        int channels = dev.Info.Channels;
+        dev.Capture.DataAvailable += (s, e) =>
+        {
+            if (dev.RingBuffer == null)
+            {
+                return;
+            }
+
+            int floatCount = e.BytesRecorded / 4;
+            int frames = floatCount / channels;
+            var floats = new float[floatCount];
+            Buffer.BlockCopy(e.Buffer, 0, floats, 0, e.BytesRecorded);
+
+            var peaks = dev.PeakLevels;
+            if (peaks != null)
+            {
+                for (int f = 0; f < frames; f++)
+                {
+                    int baseIdx = f * channels;
+                    for (int c = 0; c < channels; c++)
+                    {
+                        float v = floats[baseIdx + c];
+                        if (v < 0) v = -v;
+                        if (v > peaks[c]) peaks[c] = v;
+                    }
+                }
+            }
+
+            if (!dev.RingBuffer.Write(floats, 0, frames))
+            {
+                Interlocked.Increment(ref dev.InputOverflowCount);
+            }
+        };
+
+        dev.Capture.StartRecording();
+        dev.CaptureLatencyMs = _inputBufferMs;
+        return true;
+    }
+
     public bool SetOutputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 5, 200);
+        int clamped = Math.Clamp(bufferMs, 10, 200);
         if (_outputBufferMs == clamped)
         {
             return true;
@@ -567,7 +613,7 @@ public class AudioEngine : IDisposable
             try { dev.Render?.Stop(); } catch { }
             try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
-            dev.BaseLatencyMs = dev.MixProvider?.OutputBaseLatencyMs ?? dev.BaseLatencyMs;
+            // BaseLatencyMs is now read-only (no learned bias adjustment)
             try { dev.MixProvider?.DetachConsumer(); } catch { }
             dev.MixProvider = null;
             dev.ConsumerId = string.Empty;
@@ -622,7 +668,7 @@ public class AudioEngine : IDisposable
             double baseLatencyMs = (masterOutput != null && device.Info.Id == masterOutput.Info.Id)
                 ? 0
                 : device.BaseLatencyMs;
-            device.MixProvider?.SetOutputBaseLatencyMs(baseLatencyMs);
+            // No longer setting base latency (learned bias removed from sync logic)
         }
     }
 
@@ -645,16 +691,13 @@ public class AudioEngine : IDisposable
 
         int desiredByOutputBufferFrames = Math.Max(sampleRate * _outputBufferMs / 1000, sampleRate / 200);
 
-        // Use actual ring capacity from live ring buffers, but never lower than what the
-        // configured _inputBufferMs implies — ring buffers are always allocated at RingBufferCapacityMs.
+        // Use actual ring capacity from live ring buffers (stable 400ms buffers).
         int projectedRingCapacityFrames = sampleRate * RingBufferCapacityMs / 1000;
         int minRingCapacityFrames = _inputDevices
             .Where(d => d.RingBuffer != null)
             .Select(d => d.RingBuffer!.CapacityFrames)
             .DefaultIfEmpty(projectedRingCapacityFrames)
             .Min();
-        // Always at least what the user's input buffer slider implies so the limit is user-driven.
-        minRingCapacityFrames = Math.Max(minRingCapacityFrames, sampleRate * _inputBufferMs / 1000);
 
         // Reserve some headroom before the ring overflows: allow up to 80% of ring capacity.
         int maxSafeTargetFrames = Math.Max(64, (minRingCapacityFrames * 4) / 5);

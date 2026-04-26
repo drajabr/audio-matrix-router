@@ -3996,14 +3996,17 @@ export default function App({ runtime = "web" }) {
                 <button
                   type="button"
                   className={`corner-control-btn corner-control-btn--buffer corner-control-buffer-left corner-buffer-wheel ${isApplyingCaptureBuffer ? "active" : ""}`}
-                  onClick={(event) => {
+                  onMouseDown={(event) => {
                     event.stopPropagation();
                     if (locked) return;
                     if (inputBufferDragSuppressClickRef.current) {
                       inputBufferDragSuppressClickRef.current = false;
                       return;
                     }
-                    applyQuickSelection("captureBuffer", String(CAPTURE_BUFFER_DEFAULT));
+                    // Reset only on middle-click (button === 1)
+                    if (event.button === 1) {
+                      applyQuickSelection("captureBuffer", String(CAPTURE_BUFFER_DEFAULT));
+                    }
                   }}
                   onPointerDown={(event) => {
                     if (locked) return;
@@ -4054,14 +4057,17 @@ export default function App({ runtime = "web" }) {
                 <button
                   type="button"
                   className={`corner-control-btn corner-control-btn--buffer corner-control-buffer-right corner-buffer-wheel ${isApplyingOutputBuffer ? "active" : ""}`}
-                  onClick={(event) => {
+                  onMouseDown={(event) => {
                     event.stopPropagation();
                     if (locked) return;
                     if (outputBufferDragSuppressClickRef.current) {
                       outputBufferDragSuppressClickRef.current = false;
                       return;
                     }
-                    applyQuickSelection("outputBuffer", String(OUTPUT_BUFFER_DEFAULT));
+                    // Reset only on middle-click (button === 1)
+                    if (event.button === 1) {
+                      applyQuickSelection("outputBuffer", String(OUTPUT_BUFFER_DEFAULT));
+                    }
                   }}
                   onPointerDown={(event) => {
                     if (locked) return;
@@ -4111,14 +4117,17 @@ export default function App({ runtime = "web" }) {
                 </button>
                 <div
                   className="corner-control-mid corner-gain-wheel"
-                  onClick={(e) => {
+                  onMouseDown={(e) => {
                     e.stopPropagation();
                     if (!canEditGlobalGain) return;
                     if (wheelDragSuppressClickRef.current) {
                       wheelDragSuppressClickRef.current = false;
                       return;
                     }
-                    setMasterGainDb(0);
+                    // Reset only on middle-click (button === 1)
+                    if (e.button === 1) {
+                      setMasterGainDb(0);
+                    }
                   }}
                   onPointerDown={(e) => {
                     if (!canEditGlobalGain) return;

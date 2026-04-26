@@ -123,7 +123,7 @@ public class AppConfig
             config.InputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
         foreach (var d in engine.OutputDevices)
         {
-            var baseLatencyMs = d.MixProvider?.OutputBaseLatencyMs ?? d.BaseLatencyMs;
+            var baseLatencyMs = d.BaseLatencyMs;
             config.OutputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
             config.OutputLatencies.Add(new OutputLatencyConfig { DeviceId = d.Info.Id, DelayMs = d.OutputDelayMs, BaseLatencyMs = baseLatencyMs });
         }
@@ -186,7 +186,7 @@ public class AppConfig
         foreach (var outputLatency in OutputLatencies)
         {
             engine.SetOutputDelayMs(outputLatency.DeviceId, outputLatency.DelayMs);
-            engine.SetOutputBaseLatencyMs(outputLatency.DeviceId, outputLatency.BaseLatencyMs);
+            // Base latency no longer adjusted (learned bias removed)
         }
 
         if (!string.IsNullOrWhiteSpace(InputMasterDeviceId))

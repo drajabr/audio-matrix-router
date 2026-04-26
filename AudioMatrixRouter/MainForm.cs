@@ -1031,7 +1031,7 @@ public sealed class MainForm : Form
                 DroppedFrames = d.MixProvider?.DroppedFrames ?? 0,
                 MovingAverageMs = d.MixProvider != null ? d.MixProvider.OutputMovingAverageMs : null,
                 VariationRangeMs = d.MixProvider != null ? d.MixProvider.OutputVariationRangeMs : null,
-                JitterMs = d.MixProvider != null ? d.MixProvider.OutputJitterMs : null,
+                JitterMs = null,
                 SyncCorrections = d.MixProvider?.SyncCorrectionCount ?? 0,
                 PeakLevels = d.MixProvider?.SamplePeakLevels() ?? Array.Empty<float>()
             }).ToList(),

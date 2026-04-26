@@ -242,13 +242,14 @@ textarea {
 .ui-controls-wrap {
   display: grid;
   align-items: center;
+  justify-items: center;
   position: relative;
   flex-shrink: 0;
   margin-left: auto;
   width: 44px;
   height: 44px;
   min-height: 44px;
-  overflow: visible;
+  overflow: hidden;
 }
 
 .ui-controls-toggle {
@@ -305,7 +306,7 @@ textarea {
   border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: linear-gradient(180deg, var(--surface-raised), var(--panel-deep));
-  transition: opacity 140ms ease, transform 140ms ease, width 140ms ease, padding 140ms ease, border-color 140ms ease;
+  transition: opacity 140ms ease, border-color 140ms ease;
   position: absolute;
   top: 50%;
   right: 0;
