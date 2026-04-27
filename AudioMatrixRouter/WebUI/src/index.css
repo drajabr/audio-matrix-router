@@ -254,7 +254,7 @@ textarea {
 
 .ui-controls-toggle {
   position: absolute;
-  top: 50%;
+  top: calc(50% - 3px);
   right: 3px;
   width: 38px;
   min-width: 38px;
@@ -266,21 +266,21 @@ textarea {
   justify-content: center;
   transform: translateY(-50%);
   z-index: 2601;
-  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease, filter 120ms ease;
+  transition: none !important;
 }
 
 .ui-controls-toggle:hover {
   transform: translateY(-50%);
-  filter: brightness(1.08) saturate(1.05);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 36%, transparent), 0 8px 14px rgba(0, 0, 0, 0.32);
+  filter: none;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
 }
 
 .ui-controls-toggle.active {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
   background: transparent;
   transform: translateY(-50%);
-  filter: brightness(1.04);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent), 0 6px 12px rgba(0, 0, 0, 0.28);
+  filter: none;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
 }
 
 .ui-controls-toggle-icon {
@@ -309,11 +309,12 @@ textarea {
   transition: opacity 140ms ease, border-color 140ms ease;
   position: absolute;
   top: 50%;
-  right: 44px;
+  right: 3px;
   transform: translateY(-50%);
   z-index: 2500;
   box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
   white-space: nowrap;
+  padding-right: 46px;
 }
 
 .ui-quick-controls.is-collapsed {
@@ -360,6 +361,15 @@ textarea {
 .icon-btn:active:not(:disabled) {
   transform: translateY(1px);
   box-shadow: var(--fx-press), 0 2px 6px rgba(0, 0, 0, 0.36);
+}
+
+.ui-controls-toggle.icon-btn,
+.ui-controls-toggle.icon-btn:hover,
+.ui-controls-toggle.icon-btn:active:not(:disabled),
+.ui-controls-toggle.icon-btn.active {
+  transform: translateY(-50%);
+  filter: none;
+  box-shadow: var(--fx-edge), var(--fx-elev-1);
 }
 
 .icon-btn--square {
@@ -1454,14 +1464,21 @@ textarea {
 
 .inline-editor.docked {
   margin-top: 10px;
-  height: 112px;
-  min-height: 112px;
-  max-height: 112px;
+  height: 126px;
+  min-height: 126px;
+  max-height: 126px;
   display: grid;
   grid-template-columns: 125px minmax(0, 1fr) 112px minmax(0, 1fr) 125px;
-  align-items: stretch;
+  align-items: center;
+  padding-top: 7px;
+  padding-bottom: 7px;
+  box-sizing: border-box;
   overflow-x: hidden;
   overflow-y: hidden;
+}
+
+.inline-editor.docked > .dock-card {
+  height: 112px;
 }
 
 .inline-editor p {
@@ -1472,7 +1489,9 @@ textarea {
 
 .dock-col {
   min-width: 0;
-  padding-bottom: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .dock-side {

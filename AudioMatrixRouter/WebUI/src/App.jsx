@@ -216,10 +216,10 @@ function createMatrix(rows, cols, saved = {}) {
   return next;
 }
 
-function createLabelMap(devices, saved = {}, prefix) {
+function createLabelMap(devices, prefix) {
   const next = {};
   devices.forEach((device, i) => {
-    next[device.deviceId] = saved[device.deviceId] || device.label || `${prefix} ${i + 1}`;
+    next[device.deviceId] = device.label || `${prefix} ${i + 1}`;
   });
   return next;
 }
@@ -1899,11 +1899,14 @@ export default function App({ runtime = "web" }) {
     }
   };
 
-  const discoverDevices = async (forceRefreshNative = false) => {
+  const discoverDevices = async (forceRefreshNative = false, overrides = {}) => {
     try {
       setIsReloadingDevices(true);
       setError("");
       const saved = await loadPersistedState();
+      const requestedInputDeviceMode = typeof overrides?.inputDeviceMode === "string" && overrides.inputDeviceMode
+        ? overrides.inputDeviceMode
+        : (typeof saved?.inputDeviceMode === "string" ? saved.inputDeviceMode : "");
 
       if (saved?.backgroundKey) {
         const backgroundMatch = BACKGROUND_PRESETS.findIndex((p) => p.key === saved.backgroundKey);
@@ -1927,8 +1930,8 @@ export default function App({ runtime = "web" }) {
       }
       if (typeof saved?.controlsCollapsed === "boolean") setControlsCollapsed(saved.controlsCollapsed);
       setShowAllDevices(typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : true);
-      if (typeof saved?.inputDeviceMode === "string" && saved.inputDeviceMode) {
-        setInputDeviceMode(saved.inputDeviceMode);
+      if (requestedInputDeviceMode) {
+        setInputDeviceMode(requestedInputDeviceMode);
       }
       if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
       if (Number.isFinite(saved?.inputBufferMs)) setCaptureBufferMs(saved.inputBufferMs);
@@ -1955,7 +1958,7 @@ export default function App({ runtime = "web" }) {
         }
 
         const state = await window.__nativeBridgeInvoke("getState", {});
-        const savedMode = (typeof saved?.inputDeviceMode === "string") ? saved.inputDeviceMode : "";
+        const savedMode = requestedInputDeviceMode;
         if (savedMode && (savedMode === "input" || savedMode === "loopback" || savedMode === "both") && state?.inputDeviceMode !== savedMode) {
           nativeState = await window.__nativeBridgeInvoke("setInputDeviceMode", { mode: savedMode });
         } else {
@@ -2086,8 +2089,8 @@ export default function App({ runtime = "web" }) {
       setOutputs(orderedOutputs);
       devicesDiscoveredRef.current = true;
 
-      const nextInputLabels = createLabelMap(discoveredInputs, saved?.inputLabels || {}, "Input");
-      const nextOutputLabels = createLabelMap(discoveredOutputs, saved?.outputLabels || {}, "Output");
+      const nextInputLabels = createLabelMap(discoveredInputs, "Input");
+      const nextOutputLabels = createLabelMap(discoveredOutputs, "Output");
 
       const deviceRows = orderedInputs.map((i) => ({ id: `dev:${i.deviceId}` }));
       const deviceCols = orderedOutputs.map((o) => ({ id: `dev:${o.deviceId}` }));
@@ -2281,8 +2284,9 @@ export default function App({ runtime = "web" }) {
     const currentIndex = modes.indexOf(inputDeviceMode);
     const nextMode = modes[(currentIndex + 1 + modes.length) % modes.length];
     try {
+      setInputDeviceMode(nextMode);
       await window.__nativeBridgeInvoke("setInputDeviceMode", { mode: nextMode });
-      await discoverDevices(false);
+      await discoverDevices(false, { inputDeviceMode: nextMode });
     } catch (_) {
       // no-op
     }
