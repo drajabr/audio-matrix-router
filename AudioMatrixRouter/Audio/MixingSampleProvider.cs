@@ -17,6 +17,7 @@ public sealed class OutputSyncCoordinator
     private const double RatioGainPpmPerFrame = 2.0;            // PPM adjustment per frame of error
     private const double RatioSmoothingAlpha = 0.08;            // EMA for playback speed correction
     private const int StableSettleBandFrames = 64;              // Don't correct tiny errors
+    private const double MaxFollowerRatioPpm = 2400;            // Limit speed correction to +/-2400 ppm
     
     // ===== Spike Rejection =====
     private const int SpikeRejectThresholdFramesBase = 240;     // ~5ms spike threshold
@@ -253,10 +254,31 @@ public sealed class OutputSyncCoordinator
         lock (_syncLock)
         {
             if (!_states.TryGetValue(consumerId, out var state)) return 0;
-            
-            // For followers: always report 0 spread since they're exactly following master.
-            // Master doesn't need to report variation either (return 0 for all).
-            return 0;
+
+            if (!_states.TryGetValue(_masterConsumerId, out var masterState))
+            {
+                return 0;
+            }
+
+            double ResolveBuffered(OutputState s) => s.SmoothedBufferedFrames >= 0 ? s.SmoothedBufferedFrames : Math.Max(0, s.BufferedFrames);
+
+            // For a follower, report current absolute spread to master.
+            if (consumerId != _masterConsumerId)
+            {
+                return Math.Abs(ResolveBuffered(state) - ResolveBuffered(masterState));
+            }
+
+            // For master, report worst follower spread (max absolute delta to master).
+            double masterBuffered = ResolveBuffered(masterState);
+            double worstSpread = 0;
+            foreach (var pair in _states)
+            {
+                if (pair.Key == _masterConsumerId) continue;
+                double followerBuffered = ResolveBuffered(pair.Value);
+                worstSpread = Math.Max(worstSpread, Math.Abs(followerBuffered - masterBuffered));
+            }
+
+            return worstSpread;
         }
     }
 
@@ -377,11 +399,17 @@ public sealed class OutputSyncCoordinator
         // Compute ratio correction (playback speed adjustment)
         state.Ratio = ComputeFollowerRatioNoLock(consumerId, state.SmoothedErrorFrames, state.Ratio);
 
-        // Slip only on large errors: discard 1 frame if error is large (only slip +1, never -1)
+        // Slip on large residual errors after ratio correction.
+        // +1 consumes one extra frame (drains follower queue), -1 consumes one less frame (builds queue).
         int slip = 0;
-        if (state.SmoothedErrorFrames >= 192)  // ~4ms at 48kHz; discard to close large gaps
+        if (state.SmoothedErrorFrames >= 192)  // follower has too much queued vs master
         {
             slip = 1;
+            state.CorrectionCount += 1;
+        }
+        else if (state.SmoothedErrorFrames <= -192) // follower has too little queued vs master
+        {
+            slip = -1;
             state.CorrectionCount += 1;
         }
 
@@ -393,13 +421,14 @@ public sealed class OutputSyncCoordinator
         if (consumerId == _masterConsumerId)
             return 1.0;
 
-        // Followers can only slow down (ratio 0.98-1.0), never speed up.
-        // Within stable band, don't adjust. Otherwise, adjust toward 1.0 or toward slowdown.
+        // Error definition: follower minus master buffered frames.
+        // Positive error means follower has more queued audio (more delayed) and should speed up (>1.0).
+        // Negative error means follower has less queued audio (less delayed) and should slow down (<1.0).
         double targetPpm = Math.Abs(errorFrames) <= StableSettleBandFrames 
             ? 0 
-            : Math.Clamp(errorFrames * RatioGainPpmPerFrame, -2400, 0);  // Clamp to slow-down only
+            : Math.Clamp(errorFrames * RatioGainPpmPerFrame, -MaxFollowerRatioPpm, MaxFollowerRatioPpm);
 
-        double targetRatio = Math.Clamp(1.0 + (targetPpm / 1_000_000.0), 0.98, 1.0);
+        double targetRatio = 1.0 + (targetPpm / 1_000_000.0);
         
         if (currentRatio <= 0)
             return targetRatio;
@@ -526,20 +555,10 @@ public class MixingSampleProvider : ISampleProvider
 
     private void RebuildDelayBuffer()
     {
-        var totalDelayMs = _deviceDelayMs + _outputBufferMs;
-        var delayFrames = Math.Clamp((int)Math.Round(_sampleRate * (totalDelayMs / 1000.0)), 0, _sampleRate * 5);
-        var delaySamples = delayFrames * _outputChannels;
-
         lock (_delayLock)
         {
-            if (delaySamples <= 0)
-            {
-                _delayBuffer = [];
-                _delayWriteIndex = 0;
-                return;
-            }
-
-            _delayBuffer = new float[delaySamples];
+            int delayFrames = Math.Clamp((int)Math.Round(_sampleRate * (_deviceDelayMs / 1000.0)), 0, _sampleRate * 5);
+            _delayBuffer = delayFrames > 0 ? new float[delayFrames * _outputChannels] : [];
             _delayWriteIndex = 0;
         }
     }
@@ -566,39 +585,58 @@ public class MixingSampleProvider : ISampleProvider
         var front = _matrix.GetFrontBuffer();
         int matOutCh = _matrix.OutputChannels;
         float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
-        int masterBufferedFrames = 0;
-        if (_sources.Count > 0)
+
+        // Only sources that currently route into this output should influence input-side sync alignment.
+        bool IsSourceActiveForThisOutput(CaptureSource source)
         {
-            var masterSource = _sources.FirstOrDefault(IsMasterInputSource);
-            if (string.IsNullOrWhiteSpace(masterSource.DeviceId))
+            for (int srcCh = 0; srcCh < source.Channels; srcCh++)
             {
-                masterSource = _sources[0];
+                int globalInCh = source.GlobalChannelOffset + srcCh;
+                for (int dstCh = 0; dstCh < _outputChannels; dstCh++)
+                {
+                    int globalOutCh = _outputChannelOffset + dstCh;
+                    int matIdx = globalInCh * matOutCh + globalOutCh;
+                    if (matIdx < 0 || matIdx >= front.Length) continue;
+                    if (front[matIdx].Active) return true;
+                }
+            }
+            return false;
+        }
+
+        var syncSources = _sources.Where(IsSourceActiveForThisOutput).ToList();
+        if (syncSources.Count == 0)
+        {
+            // If no source is routed to this output, fall back to all sources to keep consumers advancing.
+            syncSources = _sources;
+        }
+
+        int referenceBufferedFrames = 0;
+        if (syncSources.Count > 0)
+        {
+            int minBufferedFrames = int.MaxValue;
+            foreach (var src in syncSources)
+            {
+                int availableFrames = src.Buffer.GetAvailableFrames(_consumerId);
+                if (availableFrames < minBufferedFrames)
+                {
+                    minBufferedFrames = availableFrames;
+                }
             }
 
-            masterBufferedFrames = masterSource.Buffer.GetAvailableFrames(_consumerId);
+            referenceBufferedFrames = minBufferedFrames == int.MaxValue ? 0 : minBufferedFrames;
         }
-        int maxFollowerDeficitFrames = 0;
 
         foreach (var src in _sources)
         {
             int sourceBufferedFrames = src.Buffer.GetAvailableFrames(_consumerId);
-            if (!IsMasterInputSource(src))
+            int aheadFrames = sourceBufferedFrames - referenceBufferedFrames;
+            if (aheadFrames > InputSyncSettleBandFrames)
             {
-                int aheadFrames = sourceBufferedFrames - masterBufferedFrames;
-                if (aheadFrames > InputSyncSettleBandFrames)
+                int discardFrames = Math.Min(aheadFrames - InputSyncSettleBandFrames, sourceFrames * 4);
+                if (discardFrames > 0)
                 {
-                    int discardFrames = Math.Min(aheadFrames - InputSyncSettleBandFrames, sourceFrames * 4);
-                    if (discardFrames > 0)
-                    {
-                        DiscardFramesForConsumer(src, discardFrames);
-                        sourceBufferedFrames = Math.Max(0, sourceBufferedFrames - discardFrames);
-                    }
-                }
-
-                int deficitFrames = masterBufferedFrames - sourceBufferedFrames;
-                if (deficitFrames > maxFollowerDeficitFrames)
-                {
-                    maxFollowerDeficitFrames = deficitFrames;
+                    DiscardFramesForConsumer(src, discardFrames);
+                    sourceBufferedFrames = Math.Max(0, sourceBufferedFrames - discardFrames);
                 }
             }
 
@@ -636,7 +674,8 @@ public class MixingSampleProvider : ISampleProvider
                         ref var cp = ref front[matIdx];
                         if (!cp.Active) continue;
 
-                        float sample = _sourceTempBuffer[f * src.Channels + srcCh] * cp.Gain * muteLinear;
+                        float signedGain = cp.PhaseInverted ? -cp.Gain : cp.Gain;
+                        float sample = _sourceTempBuffer[f * src.Channels + srcCh] * signedGain * muteLinear;
                         _mixBuffer[f * _outputChannels + dstCh] += sample;
                     }
                 }
@@ -646,7 +685,8 @@ public class MixingSampleProvider : ISampleProvider
             src.Buffer.ReadForConsumer(_consumerId, _sourceTempBuffer, 0, framesRead);
         }
 
-        _syncCoordinator.ReportInputStarvation(maxFollowerDeficitFrames);
+        int inputStarvationFrames = Math.Max(0, sourceFrames - referenceBufferedFrames);
+        _syncCoordinator.ReportInputStarvation(inputStarvationFrames);
 
         FitMixedFramesToOutput(buffer, offset, frames, sourceFrames);
 
@@ -770,7 +810,13 @@ public class MixingSampleProvider : ISampleProvider
             _discardBuffer = new float[samples];
         }
 
+        // Track input sync corrections (frames discarded for synchronization)
         source.Buffer.ReadForConsumer(_consumerId, _discardBuffer, 0, frames);
+    }
+
+    public long GetInputSyncCorrectionCount(string deviceId)
+    {
+        return 0;
     }
 
     private long GetDroppedFramesForConsumer()
@@ -797,9 +843,9 @@ public class MixingSampleProvider : ISampleProvider
 
             for (int i = 0; i < count; i++)
             {
-                var delayedSample = _delayBuffer[_delayWriteIndex];
+                float delayed = _delayBuffer[_delayWriteIndex];
                 _delayBuffer[_delayWriteIndex] = buffer[offset + i];
-                buffer[offset + i] = delayedSample;
+                buffer[offset + i] = delayed;
 
                 _delayWriteIndex++;
                 if (_delayWriteIndex >= _delayBuffer.Length)

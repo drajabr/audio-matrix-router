@@ -181,12 +181,12 @@ function makeDefaultConnection() {
 
 function sanitizeConnection(connection) {
   const on = !!connection?.on;
-  const gainDb = Number.isFinite(connection?.gainDb) ? clamp(connection.gainDb, DB_MIN, DB_MAX) : 0;
+  const gainDb = on && Number.isFinite(connection?.gainDb) ? clamp(connection.gainDb, DB_MIN, DB_MAX) : 0;
   return {
     on,
     muted: on ? !!connection?.muted : false,
     gainDb,
-    phaseInverted: !!connection?.phaseInverted,
+    phaseInverted: on ? !!connection?.phaseInverted : false,
   };
 }
 
@@ -1233,6 +1233,7 @@ export default function App({ runtime = "web" }) {
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
           overflows: Number.isFinite(d?.overflows) ? d.overflows : 0,
           droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
+          syncCorrections: Number.isFinite(d?.syncCorrections) ? d.syncCorrections : 0,
           peakLevels,
         };
       });
@@ -1261,6 +1262,34 @@ export default function App({ runtime = "web" }) {
       });
       nativeOutputChannelMetaRef.current = outMeta;
       setNativeOutputChannelMeta(outMeta);
+      setOutputs((prev) => {
+        if (!Array.isArray(prev) || prev.length === 0) return prev;
+        const nativeOutputsById = new Map(
+          (Array.isArray(state?.outputs) ? state.outputs : [])
+            .filter((d) => d?.deviceId)
+            .map((d) => [d.deviceId, d]),
+        );
+
+        let changed = false;
+        const next = prev.map((output) => {
+          const nativeOutput = nativeOutputsById.get(output.deviceId);
+          if (!nativeOutput) return output;
+
+          const nextDelayMs = Number.isFinite(nativeOutput?.delayMs) ? nativeOutput.delayMs : 0;
+
+          if (output.delayMs === nextDelayMs) {
+            return output;
+          }
+
+          changed = true;
+          return {
+            ...output,
+            delayMs: nextDelayMs,
+          };
+        });
+
+        return changed ? next : prev;
+      });
       nativeMeterLastUpdateRef.current = performance.now();
 
       if (hasNativeBridge && inputs.length > 0 && outputs.length > 0) {
@@ -1615,6 +1644,7 @@ export default function App({ runtime = "web" }) {
         ...(getOutputOffset(colParsed.deviceId) != null ? { outCh: getOutputOffset(colParsed.deviceId) + colParsed.channelIndex } : {}),
         active,
         gainDb: baseGainDb,
+        phaseInverted: connection?.phaseInverted ?? false,
       });
     } else {
       const inputDeviceId = rowId?.startsWith("dev:") ? rowId.slice(4) : "";
@@ -1647,6 +1677,7 @@ export default function App({ runtime = "web" }) {
               ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + outChannel } : {}),
               active: false,
               gainDb: 0,
+              phaseInverted: false,
             });
           });
         });
@@ -1662,6 +1693,7 @@ export default function App({ runtime = "web" }) {
             ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + route.outChannel } : {}),
             active: true,
             gainDb: clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+            phaseInverted: connection?.phaseInverted ?? false,
           });
         });
       }
@@ -1684,6 +1716,7 @@ export default function App({ runtime = "web" }) {
             outCh: Number.isFinite(route.outCh) ? route.outCh : (Number.isFinite(route.outChannel) ? route.outChannel : 0),
             active: !!route.active,
             gainDb: Number.isFinite(route.gainDb) ? route.gainDb : 0,
+            phaseInverted: !!route.phaseInverted,
           };
           return window.__nativeBridgeInvoke("setCrosspoint", legacy);
         }));
@@ -3156,7 +3189,7 @@ export default function App({ runtime = "web" }) {
     const getOutputOffset = (id) => Number.isFinite(nativeOutputChannelMetaRef.current[id]?.offset) ? nativeOutputChannelMetaRef.current[id].offset : null;
     const routesPayload = [];
 
-    Object.entries(matrix).forEach(([key, conn]) => {
+    Object.entries(activeMatrix).forEach(([key, conn]) => {
       if (!conn?.on) return;
       const [rowId, colId] = key.split("::");
       const routeGainDb = Number.isFinite(conn?.gainDb) ? conn.gainDb : 0;
@@ -3177,6 +3210,7 @@ export default function App({ runtime = "web" }) {
           ...(getOutputOffset(colParsed.deviceId) != null ? { outCh: getOutputOffset(colParsed.deviceId) + colParsed.channelIndex } : {}),
           active: true,
           gainDb: muteAll ? GLOBAL_MUTE_GAIN_DB : baseGainDb,
+          phaseInverted: conn?.phaseInverted ?? false,
         });
         return;
       }
@@ -3209,6 +3243,7 @@ export default function App({ runtime = "web" }) {
           ...(getOutputOffset(outputDeviceId) != null ? { outCh: getOutputOffset(outputDeviceId) + route.outChannel } : {}),
           active: true,
           gainDb: muteAll ? GLOBAL_MUTE_GAIN_DB : clamp(baseGainDb + route.gainOffsetDb, DB_MIN, DB_MAX),
+          phaseInverted: conn?.phaseInverted ?? false,
         });
       });
     });
@@ -3695,12 +3730,49 @@ export default function App({ runtime = "web" }) {
   ));
   const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
   const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
-  const inputSpreadLabel = hasNativeBridge
-    ? "n/a"
-    : (inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a"));
-  const outputSpreadLabel = hasNativeBridge
-    ? (Number.isFinite(outputSideMeta?.variationRangeMs) ? `${outputSideMeta.variationRangeMs}ms` : "n/a")
-    : (outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a"));
+  const inputBufferLabel = `${captureBufferMs}ms`;
+  const inputJitterLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
+  const outputVarianceLabel = (() => {
+    if (!hasNativeBridge) {
+      return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
+    }
+
+    const routedOutputDeviceIds = new Set();
+    Object.entries(activeMatrix).forEach(([key, conn]) => {
+      if (!conn?.on) return;
+      const [, colId] = key.split("::");
+      if (!colId) return;
+
+      if (viewMode === "channel") {
+        const parsed = parseChannelId(colId);
+        if (parsed?.deviceId) {
+          routedOutputDeviceIds.add(parsed.deviceId);
+        }
+      } else if (colId.startsWith("dev:")) {
+        routedOutputDeviceIds.add(colId.slice(4));
+      }
+    });
+
+    const outputLatencies = outputs
+      .filter((output) => routedOutputDeviceIds.has(output.deviceId))
+      .map((output) => {
+        const meta = nativeOutputChannelMeta[output.deviceId];
+        if (!meta) return null;
+        const baseLatency = Number.isFinite(meta.movingAverageMs)
+          ? meta.movingAverageMs
+          : (Number.isFinite(meta.driverLatencyMs) ? meta.driverLatencyMs : null);
+        if (baseLatency == null) return null;
+        const delayMs = Number.isFinite(output?.delayMs) ? output.delayMs : 0;
+        return Math.round((baseLatency + delayMs) * 10) / 10;
+      })
+      .filter((value) => Number.isFinite(value));
+
+    if (outputLatencies.length < 2) return "n/a";
+
+    const maxLatency = Math.max(...outputLatencies);
+    const minLatency = Math.min(...outputLatencies);
+    return `${Math.round((maxLatency - minLatency) * 10) / 10}ms`;
+  })();
   const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "n/a";
   const inputDroppedFramesLabel = hasNativeBridge ? formatCounter(inputSideMeta?.droppedFrames) : "n/a";
   const outputUnderrunsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.underruns) : "n/a";
@@ -4008,13 +4080,19 @@ export default function App({ runtime = "web" }) {
                       inputBufferDragSuppressClickRef.current = false;
                       return;
                     }
-                    // Reset only on middle-click (button === 1)
+                    // Reset on middle-click (button === 1)
                     if (event.button === 1) {
+                      event.preventDefault();
                       applyQuickSelection("captureBuffer", String(CAPTURE_BUFFER_DEFAULT));
                     }
                   }}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                  }}
                   onPointerDown={(event) => {
                     if (locked) return;
+                    if (event.button !== 0) return;
                     event.currentTarget.setPointerCapture(event.pointerId);
                     inputBufferDragRef.current = {
                       startY: event.clientY,
@@ -4075,13 +4153,19 @@ export default function App({ runtime = "web" }) {
                       outputBufferDragSuppressClickRef.current = false;
                       return;
                     }
-                    // Reset only on middle-click (button === 1)
+                    // Reset on middle-click (button === 1)
                     if (event.button === 1) {
+                      event.preventDefault();
                       applyQuickSelection("outputBuffer", String(OUTPUT_BUFFER_DEFAULT));
                     }
                   }}
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                  }}
                   onPointerDown={(event) => {
                     if (locked) return;
+                    if (event.button !== 0) return;
                     event.currentTarget.setPointerCapture(event.pointerId);
                     outputBufferDragRef.current = {
                       startY: event.clientY,
@@ -4141,13 +4225,19 @@ export default function App({ runtime = "web" }) {
                       wheelDragSuppressClickRef.current = false;
                       return;
                     }
-                    // Reset only on middle-click (button === 1)
+                    // Reset on middle-click (button === 1)
                     if (e.button === 1) {
+                      e.preventDefault();
                       setMasterGainDb(0);
                     }
                   }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}
                   onPointerDown={(e) => {
                     if (!canEditGlobalGain) return;
+                    if (e.button !== 0) return;
                     e.currentTarget.setPointerCapture(e.pointerId);
                     wheelDragRef.current = {
                       startY: e.clientY,
@@ -4315,7 +4405,7 @@ export default function App({ runtime = "web" }) {
                       <div className="v-label-spacer" />
                     )}
                   </div>
-                  <span className="col-channels-box" aria-hidden="true" style={{ gridTemplateColumns: `repeat(${channelCount}, 1fr)` }}>
+                  <span className="col-channels-box" style={{ gridTemplateColumns: `repeat(${channelCount}, 1fr)` }}>
                     {Array.from({ length: channelCount }, (_, i) => (
                       <span key={i} className="axis-split-label axis-split-cell">
                         {getChannelAxisLabel(channelCount, i)}
@@ -4450,6 +4540,18 @@ export default function App({ runtime = "web" }) {
                             on: !state.on,
                           });
                         }}
+                        onMouseDown={(event) => {
+                          if (locked) return;
+                          if (event.button === 1) {
+                            event.preventDefault();
+                            if (state.on) {
+                              updateConnection(row.id, col.id, {
+                                ...state,
+                                gainDb: 0,
+                              });
+                            }
+                          }
+                        }}
                         onWheel={(event) => {
                           if (locked) return;
                           if (!state.on) return;
@@ -4491,11 +4593,11 @@ export default function App({ runtime = "web" }) {
           <div className="card-metrics-box">
             <div className="metric-tile">
               <span className="metric-title">Latency</span>
-              <span className="metric-value">{sourceLatencyLabel}</span>
+              <span className="metric-value">{inputBufferLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Spread</span>
-              <span className="metric-value">{inputSpreadLabel}</span>
+              <span className="metric-title">Jitter</span>
+              <span className="metric-value">{inputJitterLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Underruns</span>
@@ -4572,8 +4674,8 @@ export default function App({ runtime = "web" }) {
               <span className="metric-value">{destinationLatencyLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Spread</span>
-              <span className="metric-value">{outputSpreadLabel}</span>
+              <span className="metric-title">Variance</span>
+              <span className="metric-value">{outputVarianceLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Underruns</span>

@@ -22,6 +22,7 @@ public class ActiveDevice
     public double BaseLatencyMs { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
     public float[]? PeakLevels;
+
 }
 
 public class AudioEngine : IDisposable
@@ -280,7 +281,10 @@ public class AudioEngine : IDisposable
         var found = devices.FirstOrDefault(d => d.Id == deviceId);
         if (found == null) return false;
 
-        var ad = new ActiveDevice { Info = found };
+        var ad = new ActiveDevice
+        {
+            Info = found,
+        };
         _outputDevices.Add(ad);
         RecalcChannelOffsets();
         StateChanged?.Invoke();
@@ -329,9 +333,9 @@ public class AudioEngine : IDisposable
         StateChanged?.Invoke();
     }
 
-    public void SetCrosspoint(int inCh, int outCh, bool active, float gainDb)
+    public void SetCrosspoint(int inCh, int outCh, bool active, float gainDb, bool phaseInverted = false)
     {
-        bool changed = _routingMatrix.SetCrosspoint(inCh, outCh, active, gainDb);
+        bool changed = _routingMatrix.SetCrosspoint(inCh, outCh, active, gainDb, phaseInverted);
         if (!changed)
         {
             return;
@@ -341,7 +345,7 @@ public class AudioEngine : IDisposable
         StateChanged?.Invoke();
     }
 
-    public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb)> updates)
+    public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb, bool PhaseInverted)> updates)
     {
         int changed = _routingMatrix.SetCrosspoints(updates);
         if (changed > 0)

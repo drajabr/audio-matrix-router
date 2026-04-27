@@ -43,7 +43,7 @@ public sealed class MainForm : Form
     private bool _startupAtBoot;
     private string _uiPreferencesJson = "";
     private bool _suppressConfigSave;
-    private const string StartupScriptName = "AudioMatrixRouter-startup.cmd";
+    private const string StartupShortcutName = "AudioMatrixRouter.lnk";
 
     // Cached enumeration of system devices. WASAPI device enumeration + AudioClient.MixFormat
     // queries are slow (COM activation per endpoint); refresh only on hot-plug events,
@@ -724,10 +724,11 @@ public sealed class MainForm : Form
                     int outCh = request.Params.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
                     bool active = request.Params.TryGetProperty("active", out var activeElem) && activeElem.GetBoolean();
                     float gainDb = request.Params.TryGetProperty("gainDb", out var gainElem) ? gainElem.GetSingle() : 0f;
+                    bool phaseInverted = request.Params.TryGetProperty("phaseInverted", out var phaseElem) && phaseElem.GetBoolean();
 
                     if (!_locked)
                     {
-                        _engine.SetCrosspoint(inCh, outCh, active, gainDb);
+                        _engine.SetCrosspoint(inCh, outCh, active, gainDb, phaseInverted);
 
                         if (active && !_engine.IsRunning)
                         {
@@ -756,7 +757,7 @@ public sealed class MainForm : Form
                         // active, then resolves the global channel index. This is how user-selected
                         // devices end up in the engine — there is no separate "addInputDevice" step.
                         bool devicesChanged = false;
-                        var pending = new List<(string? InId, int InCh, string? OutId, int OutCh, bool Active, float GainDb, int LegacyIn, int LegacyOut)>();
+                        var pending = new List<(string? InId, int InCh, string? OutId, int OutCh, bool Active, float GainDb, bool PhaseInverted, int LegacyIn, int LegacyOut)>();
                         foreach (var route in routesElem.EnumerateArray())
                         {
                             string? inDeviceId = route.TryGetProperty("inDeviceId", out var inIdElem) ? inIdElem.GetString() : null;
@@ -767,6 +768,7 @@ public sealed class MainForm : Form
                             int legacyOut = route.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
                             bool active = route.TryGetProperty("active", out var activeElem) && activeElem.GetBoolean();
                             float gainDb = route.TryGetProperty("gainDb", out var gainElem) ? gainElem.GetSingle() : 0f;
+                            bool phaseInverted = route.TryGetProperty("phaseInverted", out var phaseElem) && phaseElem.GetBoolean();
 
                             if (!string.IsNullOrEmpty(inDeviceId) && active)
                             {
@@ -777,10 +779,10 @@ public sealed class MainForm : Form
                                 if (_engine.AddOutputDevice(outDeviceId)) devicesChanged = true;
                             }
 
-                            pending.Add((inDeviceId, inChannel, outDeviceId, outChannel, active, gainDb, legacyIn, legacyOut));
+                            pending.Add((inDeviceId, inChannel, outDeviceId, outChannel, active, gainDb, phaseInverted, legacyIn, legacyOut));
                         }
 
-                        var updates = new List<(int InCh, int OutCh, bool Active, float GainDb)>();
+                        var updates = new List<(int InCh, int OutCh, bool Active, float GainDb, bool PhaseInverted)>();
                         foreach (var p in pending)
                         {
                             int inGlobal = p.LegacyIn;
@@ -802,7 +804,7 @@ public sealed class MainForm : Form
                                     continue;
                             }
                             if (inGlobal < 0 || outGlobal < 0) continue;
-                            updates.Add((inGlobal, outGlobal, p.Active, p.GainDb));
+                            updates.Add((inGlobal, outGlobal, p.Active, p.GainDb, p.PhaseInverted));
                         }
 
                         int changed = _engine.SetCrosspoints(updates);
@@ -971,7 +973,8 @@ public sealed class MainForm : Form
                     InCh = inCh,
                     OutCh = outCh,
                     GainDb = matrix.GetGainDb(inCh, outCh),
-                    WorkingLatencyMs = workingLatencyMs
+                    WorkingLatencyMs = workingLatencyMs,
+                    PhaseInverted = matrix.GetCrosspoint(inCh, outCh).PhaseInverted
                 });
             }
         }
@@ -998,7 +1001,7 @@ public sealed class MainForm : Form
                 Channels = d.Channels,
                 Offset = 0,
                 IsMaster = false,
-                DelayMs = 0
+                DelayMs = 0,
             }).ToList();
         }
 
@@ -1036,6 +1039,7 @@ public sealed class MainForm : Form
                 Overflows = Interlocked.Read(ref d.InputOverflowCount),
                 DroppedFrames = d.RingBuffer?.TotalFramesDropped ?? 0,
                 IsLoopback = d.IsLoopback,
+                SyncCorrections = 0,
                 PeakLevels = SampleAndResetPeaks(d.PeakLevels)
             }).ToList(),
             Outputs = _engine.OutputDevices.Select(d => new DeviceState
@@ -1085,26 +1089,24 @@ public sealed class MainForm : Form
         return true;
     }
 
-    private static string GetStartupScriptPath()
+    private static string GetStartupShortcutPath()
     {
         var startupDir = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
-        return Path.Combine(startupDir, StartupScriptName);
+        return Path.Combine(startupDir, StartupShortcutName);
     }
 
     private static bool ApplyStartupAtBoot(bool enabled)
     {
         try
         {
-            var scriptPath = GetStartupScriptPath();
+            var shortcutPath = GetStartupShortcutPath();
             if (enabled)
             {
-                var content = "@echo off\r\n" +
-                              "start \"\" \"" + Application.ExecutablePath + "\" --startup\r\n";
-                File.WriteAllText(scriptPath, content);
+                CreateStartupShortcut(shortcutPath);
             }
-            else if (File.Exists(scriptPath))
+            else if (File.Exists(shortcutPath))
             {
-                File.Delete(scriptPath);
+                File.Delete(shortcutPath);
             }
 
             return true;
@@ -1113,6 +1115,27 @@ public sealed class MainForm : Form
         {
             return false;
         }
+    }
+
+    private static void CreateStartupShortcut(string shortcutPath)
+    {
+        // Use WScript.Shell COM object to create shortcut
+        var shellType = Type.GetTypeFromProgID("WScript.Shell");
+        if (shellType == null)
+            throw new InvalidOperationException("WScript.Shell COM object not available");
+
+        dynamic shell = Activator.CreateInstance(shellType)!;
+        dynamic shortcut = shell.CreateShortcut(shortcutPath);
+        
+        shortcut.TargetPath = Application.ExecutablePath;
+        shortcut.Arguments = "--startup";
+        shortcut.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+        shortcut.Description = "Audio Matrix Router";
+        
+        shortcut.Save();
+        
+        Marshal.FinalReleaseComObject(shortcut);
+        Marshal.FinalReleaseComObject(shell);
     }
 
     private Task PushStateToUiAsync()
@@ -1190,6 +1213,7 @@ public sealed class MainForm : Form
         public int OutCh { get; set; }
         public float GainDb { get; set; }
         public double? WorkingLatencyMs { get; set; }
+        public bool PhaseInverted { get; set; }
     }
 
     private sealed class UiState

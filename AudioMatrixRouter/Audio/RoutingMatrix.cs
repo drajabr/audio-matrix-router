@@ -4,6 +4,7 @@ public struct Crosspoint
 {
     public bool Active;
     public float Gain; // linear gain, 1.0 = 0dB
+    public bool PhaseInverted;
 }
 
 /// <summary>
@@ -66,7 +67,7 @@ public class RoutingMatrix
         }
     }
 
-    public bool SetCrosspoint(int inCh, int outCh, bool active, float gainDb)
+    public bool SetCrosspoint(int inCh, int outCh, bool active, float gainDb, bool phaseInverted = false)
     {
         lock (_writeLock)
         {
@@ -75,16 +76,17 @@ public class RoutingMatrix
             if (idx < 0 || idx >= back.Length) return false;
 
             float newGain = (!active || gainDb <= -60f) ? 0f : MathF.Pow(10f, gainDb / 20f);
-            bool changed = back[idx].Active != active || MathF.Abs(back[idx].Gain - newGain) > 0.000001f;
+            bool changed = back[idx].Active != active || MathF.Abs(back[idx].Gain - newGain) > 0.000001f || back[idx].PhaseInverted != phaseInverted;
             if (!changed) return false;
 
             back[idx].Active = active;
             back[idx].Gain = newGain;
+            back[idx].PhaseInverted = phaseInverted;
             return true;
         }
     }
 
-    public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb)> updates)
+    public int SetCrosspoints(IEnumerable<(int InCh, int OutCh, bool Active, float GainDb, bool PhaseInverted)> updates)
     {
         int changed = 0;
         lock (_writeLock)
@@ -99,11 +101,12 @@ public class RoutingMatrix
                     ? 0f
                     : MathF.Pow(10f, update.GainDb / 20f);
 
-                bool isChanged = back[idx].Active != update.Active || MathF.Abs(back[idx].Gain - newGain) > 0.000001f;
+                bool isChanged = back[idx].Active != update.Active || MathF.Abs(back[idx].Gain - newGain) > 0.000001f || back[idx].PhaseInverted != update.PhaseInverted;
                 if (!isChanged) continue;
 
                 back[idx].Active = update.Active;
                 back[idx].Gain = newGain;
+                back[idx].PhaseInverted = update.PhaseInverted;
                 changed++;
             }
 

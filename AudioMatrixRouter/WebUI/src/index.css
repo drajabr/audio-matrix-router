@@ -1,4 +1,4 @@
-@tailwind base;
+﻿@tailwind base;
 @tailwind components;
 @tailwind utilities;
 
@@ -249,7 +249,7 @@ textarea {
   width: 44px;
   height: 44px;
   min-height: 44px;
-  /* No overflow:hidden — the drawer extends leftward beyond this wrapper */
+  /* No overflow:hidden â€” the drawer extends leftward beyond this wrapper */
 }
 
 .ui-controls-toggle {
@@ -270,7 +270,7 @@ textarea {
 }
 
 .ui-controls-toggle:hover {
-  transform: translateY(-50%);
+  transform: translateY(-50%) !important;
   filter: none;
   box-shadow: var(--fx-edge), var(--fx-elev-1);
 }
@@ -278,7 +278,7 @@ textarea {
 .ui-controls-toggle.active {
   border-color: color-mix(in srgb, var(--accent) 58%, var(--line));
   background: transparent;
-  transform: translateY(-50%);
+  transform: translateY(-50%) !important;
   filter: none;
   box-shadow: var(--fx-edge), var(--fx-elev-1);
 }
@@ -302,7 +302,7 @@ textarea {
   gap: 6px;
   height: 44px;
   min-height: 44px;
-  padding: 2px 8px;
+  padding: 2px 8px 2px 1px;
   border-radius: var(--radius-tile);
   border: 1px solid var(--line-strong);
   background: linear-gradient(180deg, var(--surface-raised), var(--panel-deep));
@@ -367,9 +367,11 @@ textarea {
 .ui-controls-toggle.icon-btn:hover,
 .ui-controls-toggle.icon-btn:active:not(:disabled),
 .ui-controls-toggle.icon-btn.active {
-  transform: translateY(-50%);
+  transform: translateY(-50%) !important;
   filter: none;
   box-shadow: var(--fx-edge), var(--fx-elev-1);
+  transition: none !important;
+  animation: none !important;
 }
 
 .icon-btn--square {
@@ -1308,26 +1310,6 @@ textarea {
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--phase) 44%, transparent), 0 0 12px color-mix(in srgb, var(--phase) 38%, transparent);
 }
 
-.cell.phase-inverted::after {
-  content: "�";
-  position: absolute;
-  top: 6px;
-  right: 6px;
-  width: 20px;
-  height: 20px;
-  border-radius: 999px;
-  border: 1px solid color-mix(in srgb, var(--phase) 78%, white 22%);
-  background: color-mix(in srgb, var(--surface) 72%, black 28%);
-  color: color-mix(in srgb, var(--phase) 84%, white 16%);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-size: var(--font-size-xs);
-  font-weight: 800;
-  line-height: 1;
-  z-index: 2;
-}
-
 .cell.on.phase-inverted {
   background:
     repeating-linear-gradient(
@@ -1464,20 +1446,20 @@ textarea {
 
 .inline-editor.docked {
   margin-top: 10px;
-  height: 126px;
-  min-height: 126px;
-  max-height: 126px;
+  height: 136px;
+  min-height: 136px;
+  max-height: 136px;
   display: grid;
   grid-template-columns: 125px minmax(0, 1fr) 112px minmax(0, 1fr) 125px;
   align-items: center;
-  padding-top: 7px;
-  padding-bottom: 7px;
+  padding-top: 10px;
+  padding-bottom: 10px;
   box-sizing: border-box;
   overflow-x: hidden;
   overflow-y: hidden;
 }
 
-.inline-editor.docked > .dock-card {
+.inline-editor.docked > .dock-col {
   height: 112px;
 }
 
@@ -1523,6 +1505,8 @@ textarea {
 .dock-center {
   width: 112px;
   max-width: 112px;
+  height: 112px;
+  max-height: 112px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1534,10 +1518,10 @@ textarea {
 
 .dock-center-stack {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  align-items: stretch;
-  height: 100%;
+  width: 112px;
+  height: 112px;
+  align-items: center;
+  justify-content: center;
 }
 
 .dock-meter {
@@ -1548,11 +1532,12 @@ textarea {
 .route-indicator-display {
   border: 2px solid color-mix(in srgb, var(--line) 88%, white 12%);
   border-radius: 8px;
-  height: 100%;
-  width: auto;
-  aspect-ratio: 1 / 1;
-  min-width: 0;
-  min-width: 0;
+  width: 112px;
+  height: 112px;
+  min-width: 112px;
+  max-width: 112px;
+  min-height: 112px;
+  max-height: 112px;
   padding: 0;
   background: transparent;
   color: color-mix(in srgb, var(--accent-hl) 54%, var(--text) 46%);
@@ -1630,6 +1615,7 @@ textarea {
   gap: 10px;
   align-content: stretch;
   min-width: 0;
+  height: 112px;
 }
 
 .card-main-copy {
@@ -1647,6 +1633,7 @@ textarea {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
+  height: 100%;
   display: flex;
   flex-direction: row;
   align-items: stretch;
@@ -1787,6 +1774,14 @@ textarea {
   transform: rotate(180deg);
 }
 
+.inline-editor.docked > .dock-col.dock-card:nth-child(2) .detail-master-badge-vert {
+  transform: translateY(-1px) rotate(180deg);
+}
+
+.inline-editor.docked > .dock-col.dock-card:nth-child(4) .detail-master-badge-vert {
+  transform: translateY(1px) rotate(180deg);
+}
+
 .detail-master-badge-horiz {
   top: auto;
   left: 0;
@@ -1924,3 +1919,4 @@ textarea {
     display: none;
   }
 }
+

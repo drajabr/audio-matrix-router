@@ -86,7 +86,7 @@ Pop-Location
 
 Write-Host 'Publishing desktop app...'
 dotnet clean $desktopProject -c Release
-dotnet publish $desktopProject -c Release -r win-x64 --self-contained false -o $desktopOut -p:UseSharedCompilation=false -t:Rebuild
+dotnet publish $desktopProject -c Release -r win-x64 --self-contained true -o $desktopOut -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false -p:Platform=x64 -p:UseSharedCompilation=false -t:Rebuild
 
 if ($null -ne $preservedConfig -and -not (Test-Path $desktopConfigPath)) {
   try {
