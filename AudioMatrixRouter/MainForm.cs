@@ -612,7 +612,15 @@ public sealed class MainForm : Form
                 case "refreshDevices":
                     _availableDevicesDirty = true;
                     _pendingFullStatePush = true;
-                    SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+                    _suppressConfigSave = true;
+                    try
+                    {
+                        SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+                    }
+                    finally
+                    {
+                        _suppressConfigSave = false;
+                    }
                     await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 

@@ -762,10 +762,20 @@ public class AudioEngine : IDisposable
         var captureDevices = _enumerator.GetDevices(DataFlow.Capture);
         var renderDevices = _enumerator.GetDevices(DataFlow.Render);
 
-        static bool IsInputStillAvailable(ActiveDevice input, List<DeviceInfo> captures) =>
-            captures.Any(c => c.Id == input.Info.Id);
+        static bool IsInputStillAvailable(ActiveDevice input, List<DeviceInfo> captures, List<DeviceInfo> renders)
+        {
+            if (input.IsLoopback || input.Info.Id.StartsWith("loop:", StringComparison.Ordinal))
+            {
+                var renderId = input.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
+                    ? input.Info.Id.Substring("loop:".Length)
+                    : input.Info.Id;
+                return renders.Any(r => r.Id == renderId);
+            }
 
-        bool changed = _inputDevices.Any(d => !IsInputStillAvailable(d, captureDevices))
+            return captures.Any(c => c.Id == input.Info.Id);
+        }
+
+        bool changed = _inputDevices.Any(d => !IsInputStillAvailable(d, captureDevices, renderDevices))
             || _outputDevices.Any(d => !renderDevices.Any(rd => rd.Id == d.Info.Id));
 
         if (!changed)
@@ -782,7 +792,7 @@ public class AudioEngine : IDisposable
 
         for (int i = _inputDevices.Count - 1; i >= 0; i--)
         {
-            if (!IsInputStillAvailable(_inputDevices[i], captureDevices))
+            if (!IsInputStillAvailable(_inputDevices[i], captureDevices, renderDevices))
             {
                 _inputDevices.RemoveAt(i);
             }
