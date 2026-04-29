@@ -16,6 +16,7 @@ public class DeviceConfig
 {
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
+    public int Channels { get; set; }
 }
 
 public class CrosspointConfig
@@ -120,11 +121,11 @@ public class AppConfig
         };
 
         foreach (var d in engine.InputDevices)
-            config.InputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
+            config.InputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name, Channels = d.Info.Channels });
         foreach (var d in engine.OutputDevices)
         {
             var baseLatencyMs = d.BaseLatencyMs;
-            config.OutputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name });
+            config.OutputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name, Channels = d.Info.Channels });
             config.OutputLatencies.Add(new OutputLatencyConfig { DeviceId = d.Info.Id, DelayMs = d.OutputDelayMs, BaseLatencyMs = baseLatencyMs });
         }
 
@@ -153,13 +154,38 @@ public class AppConfig
         foreach (var d in OutputDevices)
             engine.AddOutputDevice(d.Id);
 
-        // Snapshot original (id, channels, offset) in saved order, then clear.
-        var inputSnapshot = engine.InputDevices
-            .Select(d => (Id: d.Info.Id, Channels: d.Info.Channels, OldOffset: d.GlobalChannelOffset))
-            .ToList();
-        var outputSnapshot = engine.OutputDevices
-            .Select(d => (Id: d.Info.Id, Channels: d.Info.Channels, OldOffset: d.GlobalChannelOffset))
-            .ToList();
+        // Snapshot active devices after add attempts.
+        var activeInputById = engine.InputDevices
+            .GroupBy(d => d.Info.Id)
+            .ToDictionary(g => g.Key, g => g.First());
+        var activeOutputById = engine.OutputDevices
+            .GroupBy(d => d.Info.Id)
+            .ToDictionary(g => g.Key, g => g.First());
+
+        // Build saved offset maps using persisted config order and channel counts.
+        // This allows stable remapping from saved global channel indices even when
+        // some devices are currently unavailable or current offsets differ.
+        var savedInputLayout = new List<(string Id, int Channels, int SavedOffset)>();
+        int savedInAcc = 0;
+        foreach (var d in InputDevices)
+        {
+            int channels = d.Channels > 0
+                ? d.Channels
+                : (activeInputById.TryGetValue(d.Id, out var active) ? active.Info.Channels : 0);
+            savedInputLayout.Add((d.Id, channels, savedInAcc));
+            savedInAcc += Math.Max(0, channels);
+        }
+
+        var savedOutputLayout = new List<(string Id, int Channels, int SavedOffset)>();
+        int savedOutAcc = 0;
+        foreach (var d in OutputDevices)
+        {
+            int channels = d.Channels > 0
+                ? d.Channels
+                : (activeOutputById.TryGetValue(d.Id, out var active) ? active.Info.Channels : 0);
+            savedOutputLayout.Add((d.Id, channels, savedOutAcc));
+            savedOutAcc += Math.Max(0, channels);
+        }
 
         // Wipe and rebuild with all available configured devices in original saved order.
         for (int i = engine.InputDevices.Count - 1; i >= 0; i--)
@@ -167,21 +193,35 @@ public class AppConfig
         for (int i = engine.OutputDevices.Count - 1; i >= 0; i--)
             engine.RemoveOutputDevice(i);
 
-        var keptInputs = inputSnapshot.ToList();
-        var keptOutputs = outputSnapshot.ToList();
+        var keptInputs = InputDevices
+            .Where(d => activeInputById.ContainsKey(d.Id))
+            .Select(d => d.Id)
+            .ToList();
+        var keptOutputs = OutputDevices
+            .Where(d => activeOutputById.ContainsKey(d.Id))
+            .Select(d => d.Id)
+            .ToList();
 
-        foreach (var d in keptInputs)
-            engine.AddInputDevice(d.Id);
-        foreach (var d in keptOutputs)
-            engine.AddOutputDevice(d.Id);
+        foreach (var id in keptInputs)
+            engine.AddInputDevice(id);
+        foreach (var id in keptOutputs)
+            engine.AddOutputDevice(id);
 
         // Build new offset tables to remap saved crosspoint channels.
         var newInputOffsets = new Dictionary<string, int>();
         int inAcc = 0;
-        foreach (var d in keptInputs) { newInputOffsets[d.Id] = inAcc; inAcc += d.Channels; }
+        foreach (var d in engine.InputDevices)
+        {
+            newInputOffsets[d.Info.Id] = d.GlobalChannelOffset;
+            inAcc += d.Info.Channels;
+        }
         var newOutputOffsets = new Dictionary<string, int>();
         int outAcc = 0;
-        foreach (var d in keptOutputs) { newOutputOffsets[d.Id] = outAcc; outAcc += d.Channels; }
+        foreach (var d in engine.OutputDevices)
+        {
+            newOutputOffsets[d.Info.Id] = d.GlobalChannelOffset;
+            outAcc += d.Info.Channels;
+        }
 
         foreach (var outputLatency in OutputLatencies)
         {
@@ -197,14 +237,14 @@ public class AppConfig
 
         foreach (var cp in Crosspoints)
         {
-            var inDev = inputSnapshot.FirstOrDefault(d => cp.InCh >= d.OldOffset && cp.InCh < d.OldOffset + d.Channels);
-            var outDev = outputSnapshot.FirstOrDefault(d => cp.OutCh >= d.OldOffset && cp.OutCh < d.OldOffset + d.Channels);
-            if (inDev.Id == null || outDev.Id == null) continue;
+            var inDev = savedInputLayout.FirstOrDefault(d => cp.InCh >= d.SavedOffset && cp.InCh < d.SavedOffset + d.Channels);
+            var outDev = savedOutputLayout.FirstOrDefault(d => cp.OutCh >= d.SavedOffset && cp.OutCh < d.SavedOffset + d.Channels);
+            if (string.IsNullOrWhiteSpace(inDev.Id) || string.IsNullOrWhiteSpace(outDev.Id)) continue;
             if (!newInputOffsets.TryGetValue(inDev.Id, out var newInOffset)) continue;
             if (!newOutputOffsets.TryGetValue(outDev.Id, out var newOutOffset)) continue;
 
-            int newIn = newInOffset + (cp.InCh - inDev.OldOffset);
-            int newOut = newOutOffset + (cp.OutCh - outDev.OldOffset);
+            int newIn = newInOffset + (cp.InCh - inDev.SavedOffset);
+            int newOut = newOutOffset + (cp.OutCh - outDev.SavedOffset);
             engine.SetCrosspoint(newIn, newOut, true, cp.GainDb);
         }
     }
