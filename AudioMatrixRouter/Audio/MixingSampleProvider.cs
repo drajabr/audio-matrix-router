@@ -25,8 +25,8 @@ public sealed class OutputSyncCoordinator
     
     // ===== Underrun Recovery =====
     private const double MinTargetDuringUnderrunFraction = 0.5; // Drop floor to 50% during underruns
-    private const double MinTargetRebuildAlpha = 0.0001;        // Very slow floor rebuild (imperceptible)
-    private const double InputStarvationBoostDecay = 0.995;      // Slow decay for input-starvation relief
+    private const double MinTargetRebuildAlpha = 0.002;         // Faster floor rebuild for quicker post-underrun recovery
+    private const double InputStarvationBoostDecay = 0.985;      // Decay boost faster to avoid long "stuck high" target
 
     private readonly object _syncLock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);

@@ -30,6 +30,7 @@ public sealed class MainForm : Form
     private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 350 };
     private readonly System.Windows.Forms.Timer _deviceRefreshTimer = new() { Interval = 250 };
     private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 100 };
+    private readonly SemaphoreSlim _webMessageGate = new(1, 1);
     private readonly NotifyIcon _trayIcon = new();
     private readonly ContextMenuStrip _trayMenu = new();
     private readonly Icon _trayAppIcon;
@@ -57,6 +58,8 @@ public sealed class MainForm : Form
     private bool _pendingFullStatePush = true;
     private bool _webViewReady;
     private bool _finalizingClose;
+    private bool _pushStateInFlight;
+    private bool _pushStatePending;
 
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -655,6 +658,8 @@ public sealed class MainForm : Form
     {
         if (_webView.CoreWebView2 == null) return;
 
+        await _webMessageGate.WaitAsync();
+
         try
         {
             var payload = e.TryGetWebMessageAsString();
@@ -997,6 +1002,10 @@ public sealed class MainForm : Form
             var safeId = Guid.NewGuid().ToString("N");
             await SendErrorAsync(safeId, ex.Message);
         }
+        finally
+        {
+            _webMessageGate.Release();
+        }
     }
 
     private void EnsureAvailableDevicesCached()
@@ -1080,6 +1089,10 @@ public sealed class MainForm : Form
         var outputPathLatencyMs = _engine.TryGetOutputPathLatencyMs(out var measuredOutputPathLatency)
             ? Math.Round(measuredOutputPathLatency, 1)
             : (double?)null;
+        var masterOutput = _engine.GetOutputMasterDevice();
+        var preferredConsumerId = string.IsNullOrWhiteSpace(masterOutput?.ConsumerId)
+            ? (masterOutput?.Info.Id ?? string.Empty)
+            : masterOutput!.ConsumerId;
 
         return new UiState
         {
@@ -1106,7 +1119,9 @@ public sealed class MainForm : Form
                 SampleRate = d.Info.SampleRate,
                 DriverLatencyMs = d.CaptureLatencyMs,
                 Overflows = Interlocked.Read(ref d.InputOverflowCount),
-                DroppedFrames = d.RingBuffer?.TotalFramesDropped ?? 0,
+                DroppedFrames = !string.IsNullOrWhiteSpace(preferredConsumerId)
+                    ? (d.RingBuffer?.GetDroppedFramesForConsumer(preferredConsumerId) ?? 0)
+                    : (d.RingBuffer?.TotalFramesDropped ?? 0),
                 IsLoopback = d.IsLoopback,
                 SyncCorrections = 0,
                 PeakLevels = SampleAndResetPeaks(d.PeakLevels)
@@ -1211,19 +1226,36 @@ public sealed class MainForm : Form
     {
         if (!_webViewReady || _webView.CoreWebView2 == null) return Task.CompletedTask;
 
-        bool full = _pendingFullStatePush;
-        _pendingFullStatePush = false;
+        if (_pushStateInFlight)
+        {
+            _pushStatePending = true;
+            return Task.CompletedTask;
+        }
+
+        _pushStateInFlight = true;
 
         try
         {
-            var stateJson = JsonSerializer.Serialize(BuildUiState(full), JsonOptions);
-            // PostWebMessageAsJson is fire-and-forget and ~10x cheaper than ExecuteScriptAsync
-            // (no script compile, no V8 promise round-trip back to .NET).
-            _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"native-state\",\"state\":" + stateJson + "}");
+            do
+            {
+                _pushStatePending = false;
+                bool full = _pendingFullStatePush;
+                _pendingFullStatePush = false;
+
+                var stateJson = JsonSerializer.Serialize(BuildUiState(full), JsonOptions);
+                // PostWebMessageAsJson is fire-and-forget and ~10x cheaper than ExecuteScriptAsync
+                // (no script compile, no V8 promise round-trip back to .NET).
+                _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"native-state\",\"state\":" + stateJson + "}");
+            }
+            while (_pushStatePending);
         }
         catch
         {
             // WebView may have torn down between checks.
+        }
+        finally
+        {
+            _pushStateInFlight = false;
         }
         return Task.CompletedTask;
     }
