@@ -1123,7 +1123,7 @@ public sealed class MainForm : Form
                     ? (d.RingBuffer?.GetDroppedFramesForConsumer(preferredConsumerId) ?? 0)
                     : (d.RingBuffer?.TotalFramesDropped ?? 0),
                 IsLoopback = d.IsLoopback,
-                SyncCorrections = 0,
+                SyncCorrections = _engine.OutputDevices.Sum(outDev => outDev.MixProvider?.GetInputSyncCorrectionCount(d.Info.Id) ?? 0),
                 PeakLevels = SampleAndResetPeaks(d.PeakLevels)
             }).ToList(),
             Outputs = _engine.OutputDevices.Select(d => new DeviceState
@@ -1142,6 +1142,10 @@ public sealed class MainForm : Form
                 VariationRangeMs = d.MixProvider != null ? d.MixProvider.OutputVariationRangeMs : null,
                 JitterMs = null,
                 SyncCorrections = d.MixProvider?.SyncCorrectionCount ?? 0,
+                SyncCorrectionRatePerSec = d.MixProvider?.SyncCorrectionRatePerSec ?? 0,
+                FastCatchUpActive = d.MixProvider?.FastCatchUpActive ?? false,
+                FastCatchUpDutyPercent = d.MixProvider?.FastCatchUpDutyPercent ?? 0,
+                PostRecoveryUnderruns = d.MixProvider?.PostRecoveryUnderruns ?? 0,
                 PeakLevels = d.MixProvider?.SamplePeakLevels() ?? Array.Empty<float>()
             }).ToList(),
             Routes = routes
@@ -1302,6 +1306,10 @@ public sealed class MainForm : Form
         public double? VariationRangeMs { get; set; }
         public double? JitterMs { get; set; }
         public long SyncCorrections { get; set; }
+        public double SyncCorrectionRatePerSec { get; set; }
+        public bool FastCatchUpActive { get; set; }
+        public double FastCatchUpDutyPercent { get; set; }
+        public long PostRecoveryUnderruns { get; set; }
         public long Overflows { get; set; }
         public long DroppedFrames { get; set; }
         public bool IsLoopback { get; set; }

@@ -548,44 +548,15 @@ public class AudioEngine : IDisposable
             dev.CaptureLatencyMs = clamped;
         }
 
-        // If running, recreate capture clients so the new latency period actually applies.
         if (_running)
         {
-            RestartInputCapturesForNewLatency();
+            FullRestart();
         }
 
-        // Recalculate targets because capture cadence changed.
         UpdateSyncBufferTargets();
 
         StateChanged?.Invoke();
         return true;
-    }
-
-    private void RestartInputCapturesForNewLatency()
-    {
-        foreach (var dev in _inputDevices)
-        {
-            try { dev.Capture?.StopRecording(); } catch { }
-            try { dev.Capture?.Dispose(); } catch { }
-            dev.Capture = null;
-        }
-
-        // Keep existing ring instances (consumers reference these objects).
-        // Clear once so the new capture period starts from a clean queue.
-        foreach (var dev in _inputDevices)
-        {
-            dev.RingBuffer?.Clear();
-            dev.InputOverflowCount = 0;
-            CreateAndStartCapture(dev);
-        }
-
-        // Recalculate sync targets with new ring buffer sizes
-        var masterOutput = GetOutputMasterDevice();
-        if (masterOutput != null)
-        {
-            var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
-            _syncCoordinator?.SetMasterBufferTarget(baseMasterTargetFrames, maxMasterTargetFrames);
-        }
     }
 
     private bool CreateAndStartCapture(ActiveDevice dev)
@@ -666,12 +637,9 @@ public class AudioEngine : IDisposable
             dev.MixProvider?.SetOutputBufferMs(clamped);
         }
 
-        // If running, restart render clients so the hardware period reflects the new value.
-        // Software max, hardware min: the wheel sets both the software target ceiling
-        // and the WASAPI render period floor so driver-level buffering scales with the setting.
         if (_running)
         {
-            RestartRenderClientsForNewPeriod();
+            FullRestart();
         }
 
         UpdateSyncBufferTargets();
@@ -680,23 +648,29 @@ public class AudioEngine : IDisposable
         return true;
     }
 
-    private void RestartRenderClientsForNewPeriod()
+    private void FullRestart()
+    {
+        Stop();
+        Start();
+    }
+
+    private void StopAllCapturesNoThrow()
+    {
+        foreach (var dev in _inputDevices)
+        {
+            try { dev.Capture?.StopRecording(); } catch { }
+            try { dev.Capture?.Dispose(); } catch { }
+            dev.Capture = null;
+        }
+    }
+
+    private void StopAllRendersNoThrow()
     {
         foreach (var dev in _outputDevices)
         {
             try { dev.Render?.Stop(); } catch { }
             try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
-
-            if (dev.MixProvider == null) continue;
-
-            var mmDevice = _enumerator.GetDevice(dev.Info.Id);
-            if (mmDevice == null) continue;
-
-            dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, _outputBufferMs);
-            dev.Render.Init(dev.MixProvider);
-            dev.Render.Play();
-            dev.RenderLatencyMs = _outputBufferMs;
         }
     }
 

@@ -1257,6 +1257,10 @@ export default function App({ runtime = "web" }) {
           underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
           droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
           syncCorrections: Number.isFinite(d?.syncCorrections) ? d.syncCorrections : 0,
+          syncCorrectionRatePerSec: Number.isFinite(d?.syncCorrectionRatePerSec) ? d.syncCorrectionRatePerSec : 0,
+          fastCatchUpActive: !!d?.fastCatchUpActive,
+          fastCatchUpDutyPercent: Number.isFinite(d?.fastCatchUpDutyPercent) ? d.fastCatchUpDutyPercent : 0,
+          postRecoveryUnderruns: Number.isFinite(d?.postRecoveryUnderruns) ? d.postRecoveryUnderruns : 0,
           peakLevels,
         };
       });
@@ -3734,46 +3738,29 @@ export default function App({ runtime = "web" }) {
       return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
     }
 
-    const routedOutputDeviceIds = new Set();
-    Object.entries(activeMatrix).forEach(([key, conn]) => {
-      if (!conn?.on) return;
-      const [, colId] = key.split("::");
-      if (!colId) return;
+    if (Number.isFinite(outputSideMeta?.variationRangeMs)) {
+      return `${Math.round(Number(outputSideMeta.variationRangeMs) * 10) / 10}ms`;
+    }
 
-      if (viewMode === "channel") {
-        const parsed = parseChannelId(colId);
-        if (parsed?.deviceId) {
-          routedOutputDeviceIds.add(parsed.deviceId);
-        }
-      } else if (colId.startsWith("dev:")) {
-        routedOutputDeviceIds.add(colId.slice(4));
-      }
-    });
-
-    const outputLatencies = outputs
-      .filter((output) => routedOutputDeviceIds.has(output.deviceId))
-      .map((output) => {
-        const meta = nativeOutputChannelMeta[output.deviceId];
-        if (!meta) return null;
-        const baseLatency = Number.isFinite(meta.movingAverageMs)
-          ? meta.movingAverageMs
-          : (Number.isFinite(meta.driverLatencyMs) ? meta.driverLatencyMs : null);
-        if (baseLatency == null) return null;
-        const delayMs = Number.isFinite(output?.delayMs) ? output.delayMs : 0;
-        return Math.round((baseLatency + delayMs) * 10) / 10;
-      })
-      .filter((value) => Number.isFinite(value));
-
-    if (outputLatencies.length < 2) return "n/a";
-
-    const maxLatency = Math.max(...outputLatencies);
-    const minLatency = Math.min(...outputLatencies);
-    return `${Math.round((maxLatency - minLatency) * 10) / 10}ms`;
+    return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
   })();
+
   const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "n/a";
   const inputDroppedFramesLabel = hasNativeBridge ? formatCounter(inputSideMeta?.droppedFrames) : "n/a";
+  const inputDriverLatencyLabel = hasNativeBridge && Number.isFinite(inputSideMeta?.driverLatencyMs)
+    ? `${Math.round(Number(inputSideMeta.driverLatencyMs) * 10) / 10}ms`
+    : "n/a";
+  const inputSyncCorrectionsLabel = hasNativeBridge ? formatCounter(inputSideMeta?.syncCorrections) : "n/a";
   const outputUnderrunsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.underruns) : "n/a";
   const outputDroppedFramesLabel = hasNativeBridge ? formatCounter(outputSideMeta?.droppedFrames) : "n/a";
+  const outputFastCatchUpLabel = hasNativeBridge
+    ? (outputSideMeta?.fastCatchUpActive
+      ? `ON ${Math.round((Number(outputSideMeta?.fastCatchUpDutyPercent) || 0) * 10) / 10}%`
+      : `OFF ${Math.round((Number(outputSideMeta?.fastCatchUpDutyPercent) || 0) * 10) / 10}%`)
+    : "n/a";
+  const outputCorrectionRateLabel = hasNativeBridge && Number.isFinite(outputSideMeta?.syncCorrectionRatePerSec)
+    ? `${Math.round(Number(outputSideMeta.syncCorrectionRatePerSec) * 10) / 10}/s`
+    : "n/a";
 
   const selectedSourceChannelLabels = Array.from(
     { length: Math.max(1, Number.isFinite(selectedSource?.channelCount) ? selectedSource.channelCount : 1) },
