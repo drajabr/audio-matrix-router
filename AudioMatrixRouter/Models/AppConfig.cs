@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Diagnostics;
+using System.Text;
 
 namespace AudioMatrixRouter.Models;
 
@@ -87,12 +88,24 @@ public class AppConfig
 
             var json = JsonSerializer.Serialize(this, _jsonOptions);
             var tempPath = path + ".tmp";
-            File.WriteAllText(tempPath, json);
+            var backupPath = path + ".bak";
+
+            // Write-through temp file minimizes data loss on abrupt shutdown/reboot.
+            using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.WriteThrough))
+            using (var writer = new StreamWriter(fs, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false)))
+            {
+                writer.Write(json);
+                writer.Flush();
+                fs.Flush(flushToDisk: true);
+            }
 
             if (File.Exists(path))
             {
-                File.Copy(tempPath, path, overwrite: true);
-                File.Delete(tempPath);
+                File.Replace(tempPath, path, backupPath, ignoreMetadataErrors: true);
+                if (File.Exists(backupPath))
+                {
+                    File.Delete(backupPath);
+                }
             }
             else
             {

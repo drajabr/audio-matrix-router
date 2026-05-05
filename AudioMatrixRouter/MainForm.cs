@@ -27,7 +27,7 @@ public sealed class MainForm : Form
 
     private readonly AudioEngine _engine = new();
     private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
-    private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 100 };
+    private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 350 };
     private readonly System.Windows.Forms.Timer _deviceRefreshTimer = new() { Interval = 250 };
     private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 100 };
     private readonly NotifyIcon _trayIcon = new();
@@ -56,6 +56,7 @@ public sealed class MainForm : Form
     // pushes (peaks/latency) skip it to keep the JSON small and React work cheap.
     private bool _pendingFullStatePush = true;
     private bool _webViewReady;
+    private bool _finalizingClose;
 
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -211,6 +212,15 @@ public sealed class MainForm : Form
             return;
         }
 
+        if (!_allowRealClose && !_finalizingClose && e.CloseReason != CloseReason.WindowsShutDown)
+        {
+            e.Cancel = true;
+            _finalizingClose = true;
+            _ = FinalizeAndCloseAsync();
+            return;
+        }
+
+        _saveTimer.Stop();
         SaveConfig();
         _engine.Stop();
         _engine.Dispose();
@@ -221,6 +231,57 @@ public sealed class MainForm : Form
         _windowAppIcon.Dispose();
         _trayAppIcon.Dispose();
         base.OnFormClosing(e);
+    }
+
+    private async Task FinalizeAndCloseAsync()
+    {
+        try
+        {
+            await FlushUiPreferencesFromWebViewAsync();
+        }
+        catch
+        {
+            // Non-fatal: best-effort sync before final save.
+        }
+
+        _saveTimer.Stop();
+        SaveConfig();
+        _allowRealClose = true;
+
+        if (!IsDisposed)
+        {
+            BeginInvoke(Close);
+        }
+    }
+
+    private async Task FlushUiPreferencesFromWebViewAsync()
+    {
+        if (!_webViewReady || _webView.CoreWebView2 == null)
+        {
+            return;
+        }
+
+        const string script = "(() => { try { return localStorage.getItem('audio-router-matrix-v3') || ''; } catch { return ''; } })();";
+        var raw = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return;
+        }
+
+        string? persisted = null;
+        try
+        {
+            persisted = JsonSerializer.Deserialize<string>(raw);
+        }
+        catch
+        {
+            // Ignore malformed JS result.
+        }
+
+        if (!string.IsNullOrWhiteSpace(persisted))
+        {
+            _uiPreferencesJson = persisted;
+        }
     }
 
     private static Icon LoadAppIcon()
@@ -556,7 +617,7 @@ public sealed class MainForm : Form
     private void ScheduleSave()
     {
         _saveTimer.Stop();
-        SaveConfig();
+        _saveTimer.Start();
     }
 
     private void ApplyDarkTitleBar()
