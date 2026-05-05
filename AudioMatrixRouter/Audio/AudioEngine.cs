@@ -142,6 +142,34 @@ public class AudioEngine : IDisposable
 
     public bool SetInputMasterDevice(string deviceId)
     {
+        if (string.IsNullOrWhiteSpace(deviceId))
+        {
+            bool cleared = false;
+            foreach (var d in _inputDevices)
+            {
+                if (d.IsMasterDevice)
+                {
+                    d.IsMasterDevice = false;
+                    cleared = true;
+                }
+            }
+
+            if (_running)
+            {
+                foreach (var output in _outputDevices)
+                {
+                    output.MixProvider?.SetInputMasterDevice(string.Empty);
+                }
+            }
+
+            if (cleared)
+            {
+                StateChanged?.Invoke();
+            }
+
+            return true;
+        }
+
         var device = _inputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
         if (device == null) return false;
 
@@ -174,6 +202,30 @@ public class AudioEngine : IDisposable
 
     public bool SetOutputMasterDevice(string deviceId)
     {
+        if (string.IsNullOrWhiteSpace(deviceId))
+        {
+            bool cleared = false;
+            foreach (var d in _outputDevices)
+            {
+                if (d.IsMasterDevice)
+                {
+                    d.IsMasterDevice = false;
+                    cleared = true;
+                }
+            }
+
+            _syncCoordinator?.SetMasterConsumer(string.Empty);
+            ApplyPersistedOutputBaseLatenciesToRunningSync();
+            ApplyPreferredMasterConsumerToInputs();
+
+            if (cleared)
+            {
+                StateChanged?.Invoke();
+            }
+
+            return true;
+        }
+
         var device = _outputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
         if (device == null) return false;
 

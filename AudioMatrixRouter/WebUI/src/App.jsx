@@ -1603,12 +1603,12 @@ export default function App({ runtime = "web" }) {
   };
 
   const pushInputMasterToNative = (deviceId) => {
-    if (!hasNativeBridge || !deviceId) return;
+    if (!hasNativeBridge) return;
     window.__nativeBridgeInvoke("setInputMasterDevice", { deviceId }).catch(() => {});
   };
 
   const pushOutputMasterToNative = (deviceId) => {
-    if (!hasNativeBridge || !deviceId) return;
+    if (!hasNativeBridge) return;
     window.__nativeBridgeInvoke("setOutputMasterDevice", { deviceId }).catch(() => {});
   };
 
@@ -1732,14 +1732,12 @@ export default function App({ runtime = "web" }) {
   };
 
   const setInputMaster = (deviceId, syncNative = true) => {
-    if (!deviceId) return;
-    setInputMasterId(deviceId);
+    setInputMasterId(deviceId || "");
     if (syncNative) pushInputMasterToNative(deviceId);
   };
 
   const setOutputMaster = (deviceId, syncNative = true) => {
-    if (!deviceId) return;
-    setOutputMasterId(deviceId);
+    setOutputMasterId(deviceId || "");
     if (syncNative) pushOutputMasterToNative(deviceId);
   };
 
@@ -1758,27 +1756,14 @@ export default function App({ runtime = "web" }) {
   useEffect(() => {
     const inputIds = new Set(inputs.map((d) => d.deviceId));
     const outputIds = new Set(outputs.map((d) => d.deviceId));
-    let nextIn = inputMasterId;
-    let nextOut = outputMasterId;
-    if (inputMasterId && !inputIds.has(inputMasterId)) nextIn = "";
-    if (outputMasterId && !outputIds.has(outputMasterId)) nextOut = "";
-    // If either master just became empty, try to fill from any active route.
-    if (!nextIn || !nextOut) {
-      const deviceMatrix = matrixRef.current?.device || {};
-      const fallback = findActiveMasterPair(deviceMatrix);
-      if (fallback) {
-        if (!nextIn && fallback.inputDeviceId && inputIds.has(fallback.inputDeviceId)) {
-          nextIn = fallback.inputDeviceId;
-          pushInputMasterToNative(nextIn);
-        }
-        if (!nextOut && fallback.outputDeviceId && outputIds.has(fallback.outputDeviceId)) {
-          nextOut = fallback.outputDeviceId;
-          pushOutputMasterToNative(nextOut);
-        }
-      }
+    const deviceMatrix = matrixRef.current?.device || {};
+    const resolved = resolveActiveMasters(deviceMatrix, inputMasterId, outputMasterId, inputIds, outputIds);
+    if (resolved.inputMasterId !== inputMasterId) {
+      setInputMaster(resolved.inputMasterId, true);
     }
-    if (nextIn !== inputMasterId) setInputMasterId(nextIn);
-    if (nextOut !== outputMasterId) setOutputMasterId(nextOut);
+    if (resolved.outputMasterId !== outputMasterId) {
+      setOutputMaster(resolved.outputMasterId, true);
+    }
   }, [inputs, outputs, inputMasterId, outputMasterId]);
 
   const masterDetailCell = (() => {
@@ -2686,6 +2671,52 @@ export default function App({ runtime = "web" }) {
     return null;
   };
 
+  const resolveActiveMasters = (deviceMatrix, currentInputMasterId, currentOutputMasterId, allowedInputIds = null, allowedOutputIds = null) => {
+    const usedInputIds = new Set();
+    const usedOutputIds = new Set();
+
+    Object.entries(deviceMatrix || {}).forEach(([routeKey, conn]) => {
+      if (!conn?.on) return;
+      const sep = routeKey.indexOf("::");
+      if (sep < 0) return;
+      const rowPart = routeKey.slice(0, sep);
+      const colPart = routeKey.slice(sep + 2);
+      const inId = rowPart.startsWith("dev:") ? rowPart.slice(4) : "";
+      const outId = colPart.startsWith("dev:") ? colPart.slice(4) : "";
+      if (inId && (!allowedInputIds || allowedInputIds.has(inId))) usedInputIds.add(inId);
+      if (outId && (!allowedOutputIds || allowedOutputIds.has(outId))) usedOutputIds.add(outId);
+    });
+
+    const pickNextUsed = (currentId, orderedDeviceIds, usedIds) => {
+      if (!usedIds.size) return "";
+      if (currentId && usedIds.has(currentId)) return currentId;
+
+      const startIndex = orderedDeviceIds.indexOf(currentId);
+      if (startIndex >= 0) {
+        for (let i = startIndex + 1; i < orderedDeviceIds.length; i += 1) {
+          if (usedIds.has(orderedDeviceIds[i])) return orderedDeviceIds[i];
+        }
+        for (let i = 0; i < startIndex; i += 1) {
+          if (usedIds.has(orderedDeviceIds[i])) return orderedDeviceIds[i];
+        }
+      }
+
+      for (const id of orderedDeviceIds) {
+        if (usedIds.has(id)) return id;
+      }
+
+      return "";
+    };
+
+    const orderedInputIds = inputs.map((d) => d.deviceId);
+    const orderedOutputIds = outputs.map((d) => d.deviceId);
+
+    return {
+      inputMasterId: pickNextUsed(currentInputMasterId, orderedInputIds, usedInputIds),
+      outputMasterId: pickNextUsed(currentOutputMasterId, orderedOutputIds, usedOutputIds),
+    };
+  };
+
   const updateConnection = (rowId, colId, updater) => {
     if (locked) return;
 
@@ -2798,52 +2829,18 @@ export default function App({ runtime = "web" }) {
       }
 
       const deviceMatrix = next.device || {};
-      const isInputDeviceUsed = (deviceId) =>
-        Object.entries(deviceMatrix).some(([routeKey, conn]) => conn?.on && routeKey.startsWith(`dev:${deviceId}::`));
-      const isOutputDeviceUsed = (deviceId) =>
-        Object.entries(deviceMatrix).some(([routeKey, conn]) => conn?.on && routeKey.includes(`::dev:${deviceId}`));
+      const resolvedMasters = resolveActiveMasters(deviceMatrix, nextInputMasterId, nextOutputMasterId);
 
-      if (nextConnection.on) {
-        const pair = getDevicePairFromRoute(rowId, colId);
-
-        if (
-          nextInputMasterId &&
-          pair.inputDeviceId &&
-          nextInputMasterId !== pair.inputDeviceId &&
-          !isInputDeviceUsed(nextInputMasterId)
-        ) {
-          setInputMaster(pair.inputDeviceId, true);
-          nextInputMasterId = pair.inputDeviceId;
-          shouldReloadForMasterSwitch = true;
-        }
-
-        if (
-          nextOutputMasterId &&
-          pair.outputDeviceId &&
-          nextOutputMasterId !== pair.outputDeviceId &&
-          !isOutputDeviceUsed(nextOutputMasterId)
-        ) {
-          setOutputMaster(pair.outputDeviceId, true);
-          nextOutputMasterId = pair.outputDeviceId;
-          shouldReloadForMasterSwitch = true;
-        }
+      if (resolvedMasters.inputMasterId !== nextInputMasterId) {
+        setInputMaster(resolvedMasters.inputMasterId, true);
+        nextInputMasterId = resolvedMasters.inputMasterId;
+        shouldReloadForMasterSwitch = true;
       }
 
-      // After this connection update, if still no master, pick from any active route.
-      if (!nextInputMasterId || !nextOutputMasterId) {
-        const fallback = findActiveMasterPair(next.device || {});
-        if (fallback) {
-          if (!nextInputMasterId && fallback.inputDeviceId) {
-            setInputMaster(fallback.inputDeviceId, true);
-            nextInputMasterId = fallback.inputDeviceId;
-            shouldReloadForMasterSwitch = true;
-          }
-          if (!nextOutputMasterId && fallback.outputDeviceId) {
-            setOutputMaster(fallback.outputDeviceId, true);
-            nextOutputMasterId = fallback.outputDeviceId;
-            shouldReloadForMasterSwitch = true;
-          }
-        }
+      if (resolvedMasters.outputMasterId !== nextOutputMasterId) {
+        setOutputMaster(resolvedMasters.outputMasterId, true);
+        nextOutputMasterId = resolvedMasters.outputMasterId;
+        shouldReloadForMasterSwitch = true;
       }
 
       matrixRef.current = next;
