@@ -25,11 +25,11 @@ const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
 const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
-const CAPTURE_BUFFER_MIN = 10;
+const CAPTURE_BUFFER_MIN = 5;
 const CAPTURE_BUFFER_MAX = 200;
 const CAPTURE_BUFFER_DEFAULT = 40;
 const OUTPUT_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
-const OUTPUT_BUFFER_MIN = 10;
+const OUTPUT_BUFFER_MIN = 5;
 const OUTPUT_BUFFER_MAX = 200;
 const OUTPUT_BUFFER_DEFAULT = 40;
 

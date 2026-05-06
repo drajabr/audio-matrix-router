@@ -110,13 +110,8 @@ public class AudioEngine : IDisposable
             consumerId = inputMaster.Info.Id;
         }
 
-        int queuedFrames = inputMaster.RingBuffer.GetAvailableFrames(consumerId);
-        double captureQueueMs = inputMaster.Info.SampleRate > 0
-            ? (queuedFrames * 1000.0) / inputMaster.Info.SampleRate
-            : 0;
-
         int captureDriverMs = inputMaster.CaptureLatencyMs > 0 ? inputMaster.CaptureLatencyMs : _inputBufferMs;
-        latencyMs = captureDriverMs + captureQueueMs;
+        latencyMs = captureDriverMs;
         return true;
     }
 
@@ -501,8 +496,13 @@ public class AudioEngine : IDisposable
 
                 dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, _outputBufferMs);
                 dev.Render.Init(dev.MixProvider);
-                dev.Render.Play();
                 dev.RenderLatencyMs = _outputBufferMs;
+            }
+
+            // Play all outputs together after all are initialized to minimize startup cursor skew.
+            foreach (var dev in _outputDevices)
+            {
+                try { dev.Render?.Play(); } catch { }
             }
 
             ApplyPreferredMasterConsumerToInputs();
@@ -535,7 +535,7 @@ public class AudioEngine : IDisposable
 
     public bool SetInputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 10, 200);
+        int clamped = Math.Clamp(bufferMs, 5, 200);
         if (_inputBufferMs == clamped)
         {
             return true;
@@ -625,7 +625,7 @@ public class AudioEngine : IDisposable
 
     public bool SetOutputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 10, 200);
+        int clamped = Math.Clamp(bufferMs, 5, 200);
         if (_outputBufferMs == clamped)
         {
             return true;

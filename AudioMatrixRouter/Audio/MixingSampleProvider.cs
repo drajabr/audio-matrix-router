@@ -339,7 +339,10 @@ public sealed class OutputSyncCoordinator
                 return 0;
             }
 
-            double ResolveBuffered(OutputState s) => s.SmoothedBufferedFrames >= 0 ? s.SmoothedBufferedFrames : Math.Max(0, s.BufferedFrames);
+            // Reporting metric should track current spread quickly; prefer live buffered frames.
+            double ResolveBuffered(OutputState s) => s.BufferedFrames >= 0
+                ? s.BufferedFrames
+                : (s.SmoothedBufferedFrames >= 0 ? s.SmoothedBufferedFrames : 0);
 
             // For a follower, report current absolute spread to master.
             if (consumerId != _masterConsumerId)
