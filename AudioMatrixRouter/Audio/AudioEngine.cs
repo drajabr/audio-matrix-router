@@ -111,7 +111,18 @@ public class AudioEngine : IDisposable
         }
 
         int captureDriverMs = inputMaster.CaptureLatencyMs > 0 ? inputMaster.CaptureLatencyMs : _inputBufferMs;
-        latencyMs = captureDriverMs;
+
+        // The capture-to-render ring queue is the variable buffering the sync controller actively
+        // moves around. Without it the displayed latency is just the static driver constant and
+        // never reflects what the buffer is actually doing.
+        double queueMs = 0;
+        if (inputMaster.Info.SampleRate > 0)
+        {
+            int queuedFrames = inputMaster.RingBuffer.GetAvailableFrames(consumerId);
+            queueMs = (queuedFrames * 1000.0) / inputMaster.Info.SampleRate;
+        }
+
+        latencyMs = captureDriverMs + queueMs;
         return true;
     }
 
@@ -210,7 +221,6 @@ public class AudioEngine : IDisposable
             }
 
             _syncCoordinator?.SetMasterConsumer(string.Empty);
-            ApplyPersistedOutputBaseLatenciesToRunningSync();
             ApplyPreferredMasterConsumerToInputs();
 
             if (cleared)
@@ -236,7 +246,6 @@ public class AudioEngine : IDisposable
         }
 
         _syncCoordinator?.SetMasterConsumer(deviceId);
-        ApplyPersistedOutputBaseLatenciesToRunningSync();
         ApplyPreferredMasterConsumerToInputs();
 
         if (changed)
@@ -471,6 +480,7 @@ public class AudioEngine : IDisposable
                 .ToList();
 
             // Start render
+            var startedOutputs = new List<ActiveDevice>();
             foreach (var dev in _outputDevices)
             {
                 var mmDevice = _enumerator.GetDevice(dev.Info.Id);
@@ -485,7 +495,6 @@ public class AudioEngine : IDisposable
                     dev.Info.SampleRate,
                     dev.OutputDelayMs,
                     _outputBufferMs,
-                    dev.Info.Id == masterOutput.Info.Id ? 0 : dev.BaseLatencyMs,
                     dev.ConsumerId,
                     _syncCoordinator);
                 var inputMaster = GetInputMasterDevice();
@@ -494,9 +503,33 @@ public class AudioEngine : IDisposable
                     dev.MixProvider.SetInputMasterDevice(inputMaster.Info.Id);
                 }
 
-                dev.Render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, _outputBufferMs);
-                dev.Render.Init(dev.MixProvider);
-                dev.RenderLatencyMs = _outputBufferMs;
+                if (!TryInitRender(dev, mmDevice, _outputBufferMs))
+                {
+                    continue; // Skip this device; engine continues with the remaining outputs.
+                }
+
+                startedOutputs.Add(dev);
+            }
+
+            // Startup is not valid without at least one active render endpoint.
+            if (startedOutputs.Count == 0)
+            {
+                Stop();
+                return false;
+            }
+
+            // If the preferred master failed to initialize, promote a live output as runtime master.
+            if (!startedOutputs.Any(d => d.Info.Id == masterOutput.Info.Id))
+            {
+                var runtimeMaster = startedOutputs[0];
+                foreach (var d in _outputDevices)
+                {
+                    d.IsMasterDevice = d.Info.Id == runtimeMaster.Info.Id;
+                }
+
+                _syncCoordinator?.SetMasterConsumer(runtimeMaster.Info.Id);
+                var (runtimeBaseTargetFrames, runtimeMaxTargetFrames) = CalculateSyncTargetFrames(runtimeMaster);
+                _syncCoordinator?.SetMasterBufferTarget(runtimeBaseTargetFrames, runtimeMaxTargetFrames);
             }
 
             // Play all outputs together after all are initialized to minimize startup cursor skew.
@@ -535,7 +568,7 @@ public class AudioEngine : IDisposable
 
     public bool SetInputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 5, 200);
+        int clamped = Math.Clamp(bufferMs, 10, 200);
         if (_inputBufferMs == clamped)
         {
             return true;
@@ -557,6 +590,24 @@ public class AudioEngine : IDisposable
 
         StateChanged?.Invoke();
         return true;
+    }
+
+    private bool TryInitRender(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
+    {
+        try
+        {
+            var render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, latencyMs);
+            render.Init(dev.MixProvider!);
+            dev.Render = render;
+            dev.RenderLatencyMs = latencyMs;
+            return true;
+        }
+        catch
+        {
+            try { dev.Render?.Dispose(); } catch { }
+            dev.Render = null;
+            return false;
+        }
     }
 
     private bool CreateAndStartCapture(ActiveDevice dev)
@@ -625,7 +676,7 @@ public class AudioEngine : IDisposable
 
     public bool SetOutputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 5, 200);
+        int clamped = Math.Clamp(bufferMs, 10, 200);
         if (_outputBufferMs == clamped)
         {
             return true;
@@ -689,7 +740,6 @@ public class AudioEngine : IDisposable
             try { dev.Render?.Stop(); } catch { }
             try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
-            // BaseLatencyMs is now read-only (no learned bias adjustment)
             try { dev.MixProvider?.DetachConsumer(); } catch { }
             dev.MixProvider = null;
             dev.ConsumerId = string.Empty;
@@ -733,18 +783,6 @@ public class AudioEngine : IDisposable
         foreach (var input in _inputDevices)
         {
             input.RingBuffer?.SetPreferredConsumer(preferredConsumerId);
-        }
-    }
-
-    private void ApplyPersistedOutputBaseLatenciesToRunningSync()
-    {
-        var masterOutput = GetOutputMasterDevice();
-        foreach (var device in _outputDevices)
-        {
-            double baseLatencyMs = (masterOutput != null && device.Info.Id == masterOutput.Info.Id)
-                ? 0
-                : device.BaseLatencyMs;
-            // No longer setting base latency (learned bias removed from sync logic)
         }
     }
 

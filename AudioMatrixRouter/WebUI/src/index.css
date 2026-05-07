@@ -1862,6 +1862,12 @@ textarea {
   white-space: nowrap;
 }
 
+.metric-value-variance {
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
 .quick-row-actions {
   margin-top: 2px;
   display: flex;

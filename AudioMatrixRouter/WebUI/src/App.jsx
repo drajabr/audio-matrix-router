@@ -25,13 +25,18 @@ const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
 const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
-const CAPTURE_BUFFER_MIN = 5;
+const CAPTURE_BUFFER_MIN = 10;
 const CAPTURE_BUFFER_MAX = 200;
 const CAPTURE_BUFFER_DEFAULT = 40;
 const OUTPUT_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
-const OUTPUT_BUFFER_MIN = 5;
+const OUTPUT_BUFFER_MIN = 10;
 const OUTPUT_BUFFER_MAX = 200;
 const OUTPUT_BUFFER_DEFAULT = 40;
+const outputBufferStepFor = (_cur) => 5;
+const snapOutputBuffer = (raw) => {
+  const c = Math.max(OUTPUT_BUFFER_MIN, Math.min(OUTPUT_BUFFER_MAX, raw));
+  return Math.round(c / 5) * 5;
+};
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -1200,7 +1205,8 @@ export default function App({ runtime = "web" }) {
       setBufferMs(nativeInputPathLatency);
 
       if (nativeInputPathLatency != null && inputLatencyLastRef.current != null) {
-        setInputJitterMs(Math.round(Math.abs(nativeInputPathLatency - inputLatencyLastRef.current) * 10) / 10);
+        const inputDelta = Math.round(Math.abs(nativeInputPathLatency - inputLatencyLastRef.current) * 10) / 10;
+        setInputJitterMs(inputDelta < 0.5 ? 0 : inputDelta);
       } else {
         setInputJitterMs(nativeInputPathLatency != null ? 0 : null);
       }
@@ -1254,18 +1260,15 @@ export default function App({ runtime = "web" }) {
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
           latencyMs: Number.isFinite(d?.latencyMs) ? Math.round(Number(d.latencyMs) * 10) / 10 : null,
-          movingAverageMs: Number.isFinite(d?.movingAverageMs) ? Math.round(Number(d.movingAverageMs) * 10) / 10 : null,
           variationRangeMs: Number.isFinite(d?.variationRangeMs) ? Number(d.variationRangeMs) : null,
           variationOffsetMs: Number.isFinite(d?.variationOffsetMs) ? Number(d.variationOffsetMs) : null,
           syncErrorMs: Number.isFinite(d?.syncErrorMs) ? Math.round(Number(d.syncErrorMs) * 100) / 100 : null,
           syncIntegralMs: Number.isFinite(d?.syncIntegralMs) ? Math.round(Number(d.syncIntegralMs) * 100) / 100 : null,
           appliedPpm: Number.isFinite(d?.appliedPpm) ? Math.round(Number(d.appliedPpm) * 10) / 10 : null,
-          lastSlipFrames: Number.isFinite(d?.lastSlipFrames) ? Number(d.lastSlipFrames) : 0,
           jitterMs: Number.isFinite(d?.jitterMs) ? Math.round(Number(d.jitterMs) * 10) / 10 : null,
           underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
           droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
           syncCorrections: Number.isFinite(d?.syncCorrections) ? d.syncCorrections : 0,
-          syncCorrectionRatePerSec: Number.isFinite(d?.syncCorrectionRatePerSec) ? d.syncCorrectionRatePerSec : 0,
           fastCatchUpActive: !!d?.fastCatchUpActive,
           fastCatchUpDutyPercent: Number.isFinite(d?.fastCatchUpDutyPercent) ? d.fastCatchUpDutyPercent : 0,
           postRecoveryUnderruns: Number.isFinite(d?.postRecoveryUnderruns) ? d.postRecoveryUnderruns : 0,
@@ -3115,7 +3118,7 @@ export default function App({ runtime = "web" }) {
       if (locked) return;
       const next = Number(key);
       if (Number.isFinite(next)) {
-        const selected = clamp(Math.round(next / 5) * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+        const selected = snapOutputBuffer(next);
         setOutputBufferMs(selected);
         persistState(buildPersistedState({ outputBufferMs: selected }));
 
@@ -3181,7 +3184,7 @@ export default function App({ runtime = "web" }) {
 
   const applyOutputBufferDelta = (deltaMs) => {
     if (locked || !Number.isFinite(deltaMs)) return;
-    const snapped = clamp(Math.round((outputBufferMs + deltaMs) / 5) * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+    const snapped = snapOutputBuffer(outputBufferMs + deltaMs);
     if (snapped === outputBufferMs) return;
     applyQuickSelection("outputBuffer", String(snapped));
   };
@@ -3697,7 +3700,7 @@ export default function App({ runtime = "web" }) {
   const sourceLatencyDisplayMs = hasNativeBridge
     ? inputLatencyMs
     : inputLatencyMs;
-  const latencyLabel = runningLatencyDisplayMs != null ? `${runningLatencyDisplayMs}ms` : "n/a";
+  const latencyLabel = runningLatencyDisplayMs != null ? `${runningLatencyDisplayMs}ms` : "0ms";
   const selectedSourceDeviceId = selectedSource?.deviceId || parseChannelId(selectedSource?.id || "")?.deviceId || "";
   const selectedDestinationDeviceId = selectedDestination?.outputDeviceId || outputDeviceFromColId(selectedDestination?.id || "");
   const sourceDeviceDriverLatencyMs = Number.isFinite(nativeInputChannelMeta[selectedSourceDeviceId]?.driverLatencyMs)
@@ -3715,7 +3718,7 @@ export default function App({ runtime = "web" }) {
         : null)
   ;
   const formatCounter = (value) => {
-    if (!Number.isFinite(value) || value < 0) return "n/a";
+    if (!Number.isFinite(value) || value < 0) return "0";
     const rounded = Math.round(value);
     if (rounded >= 1000000) return `${(rounded / 1000000).toFixed(1)}M`;
     if (rounded >= 1000) return `${(rounded / 1000).toFixed(1)}k`;
@@ -3734,9 +3737,6 @@ export default function App({ runtime = "web" }) {
       if (Number.isFinite(outputSideMeta?.latencyMs)) {
         return Math.round(Number(outputSideMeta.latencyMs) * 10) / 10;
       }
-      if (Number.isFinite(outputSideMeta?.movingAverageMs)) {
-        return Math.round(Number(outputSideMeta.movingAverageMs) * 10) / 10;
-      }
       const outputDriverLatencyMs = Number.isFinite(outputSideMeta?.driverLatencyMs)
         ? Number(outputSideMeta.driverLatencyMs)
         : (destinationDeviceDriverLatencyMs != null ? Number(destinationDeviceDriverLatencyMs) : null);
@@ -3752,51 +3752,41 @@ export default function App({ runtime = "web" }) {
         : null
     );
   })();
-  const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
-  const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
+  const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "0ms";
+  const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "0ms";
   const inputBufferLabel = `${captureBufferMs}ms`;
-  const inputJitterLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
+  const inputJitterLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "0ms");
   const outputVarianceLabel = (() => {
     if (!hasNativeBridge) {
-      return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
+      return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "0ms");
     }
+
+    if (routedOutputs.length <= 1) return "0ms";
 
     if (Number.isFinite(outputSideMeta?.variationRangeMs)) {
       const rawRangeMs = Number(outputSideMeta.variationRangeMs);
       const rangeMsLabel = Math.abs(rawRangeMs) < 1
         ? `${rawRangeMs.toFixed(2)}ms`
         : `${(Math.round(rawRangeMs * 10) / 10)}ms`;
-      if (Number.isFinite(outputSideMeta?.variationOffsetMs)) {
-        const rawOffsetMs = Number(outputSideMeta.variationOffsetMs);
-        if (Math.abs(rawOffsetMs) >= 0.1) {
-          const offsetMsLabel = Math.abs(rawOffsetMs) < 1
-            ? `${rawOffsetMs > 0 ? "+" : ""}${rawOffsetMs.toFixed(2)}ms`
-            : `${rawOffsetMs > 0 ? "+" : ""}${(Math.round(rawOffsetMs * 10) / 10)}ms`;
-          return `${rangeMsLabel} (${offsetMsLabel})`;
-        }
-      }
       return rangeMsLabel;
     }
 
-    return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
+    return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "0ms");
   })();
 
-  const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "n/a";
-  const inputDroppedFramesLabel = hasNativeBridge ? formatCounter(inputSideMeta?.droppedFrames) : "n/a";
+  const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "0";
+  const inputDroppedFramesLabel = hasNativeBridge ? formatCounter(inputSideMeta?.droppedFrames) : "0";
   const inputDriverLatencyLabel = hasNativeBridge && Number.isFinite(inputSideMeta?.driverLatencyMs)
     ? `${Math.round(Number(inputSideMeta.driverLatencyMs) * 10) / 10}ms`
-    : "n/a";
-  const inputSyncCorrectionsLabel = hasNativeBridge ? formatCounter(inputSideMeta?.syncCorrections) : "n/a";
-  const outputUnderrunsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.underruns) : "n/a";
-  const outputDroppedFramesLabel = hasNativeBridge ? formatCounter(outputSideMeta?.droppedFrames) : "n/a";
+    : "0ms";
+  const inputSyncCorrectionsLabel = hasNativeBridge ? formatCounter(inputSideMeta?.syncCorrections) : "0";
+  const outputUnderrunsLabel = hasNativeBridge ? formatCounter(outputSideMeta?.underruns) : "0";
+  const outputDroppedFramesLabel = hasNativeBridge ? formatCounter(outputSideMeta?.droppedFrames) : "0";
   const outputFastCatchUpLabel = hasNativeBridge
     ? (outputSideMeta?.fastCatchUpActive
       ? `ON ${Math.round((Number(outputSideMeta?.fastCatchUpDutyPercent) || 0) * 10) / 10}%`
       : `OFF ${Math.round((Number(outputSideMeta?.fastCatchUpDutyPercent) || 0) * 10) / 10}%`)
-    : "n/a";
-  const outputCorrectionRateLabel = hasNativeBridge && Number.isFinite(outputSideMeta?.syncCorrectionRatePerSec)
-    ? `${Math.round(Number(outputSideMeta.syncCorrectionRatePerSec) * 10) / 10}/s`
-    : "n/a";
+    : "OFF 0%";
 
   const selectedSourceChannelLabels = Array.from(
     { length: Math.max(1, Number.isFinite(selectedSource?.channelCount) ? selectedSource.channelCount : 1) },
@@ -3855,7 +3845,7 @@ export default function App({ runtime = "web" }) {
               <h1>Audio Matrix Patch</h1>
               <span className="brand-version-pill">{APP_VERSION}</span>
             </div>
-            <p>{contextState === "running" ? `Running${latencyLabel !== "n/a" ? ` · ${latencyLabel}` : ""}` : "Standby"}</p>
+            <p>{contextState === "running" ? `Running · ${latencyLabel}` : "Standby"}</p>
           </div>
         </div>
 
@@ -4203,7 +4193,8 @@ export default function App({ runtime = "web" }) {
                     const dragPx = event.clientY - outputBufferDragRef.current.startY;
                     setOutputBufferWheelOffsetPx(outputBufferDragRef.current.startOffsetPx + dragPx);
                     const deltaSteps = Math.trunc((outputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                    const next = clamp(outputBufferDragRef.current.startMs + deltaSteps * 5, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+                    const step = outputBufferStepFor(outputBufferDragRef.current.startMs);
+                    const next = snapOutputBuffer(outputBufferDragRef.current.startMs + deltaSteps * step);
                     if (next !== outputBufferMs) {
                       applyOutputBufferDelta(next - outputBufferMs);
                       outputBufferDragSuppressClickRef.current = true;
@@ -4224,13 +4215,14 @@ export default function App({ runtime = "web" }) {
                     event.stopPropagation();
                     // Clear any active drag state
                     outputBufferDragRef.current = null;
-                    const delta = event.deltaY < 0 ? 5 : -5;
-                    const nextOutputBufferMs = clamp(outputBufferMs + delta, OUTPUT_BUFFER_MIN, OUTPUT_BUFFER_MAX);
+                    const step = outputBufferStepFor(outputBufferMs);
+                    const delta = event.deltaY < 0 ? step : -step;
+                    const nextOutputBufferMs = snapOutputBuffer(outputBufferMs + delta);
                     // Snap visual offset immediately to prevent drag appearance
                     setOutputBufferWheelOffsetPx(Math.round(nextOutputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
                     applyOutputBufferDelta(delta);
                   }}
-                  title={`${isApplyingOutputBuffer ? "Applying" : "Output buffer"} ${outputBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
+                  title={`${isApplyingOutputBuffer ? "Applying" : "Output buffer"} ${outputBufferMs}ms. ${outputBufferMs <= 5 ? "1ms" : "5ms"} steps. Click to reset.`}
                   aria-label="Adjust output buffer"
                   disabled={locked}
                 >
@@ -4719,7 +4711,7 @@ export default function App({ runtime = "web" }) {
             </div>
             <div className="metric-tile">
               <span className="metric-title">Variance</span>
-              <span className="metric-value">{outputVarianceLabel}</span>
+              <span className="metric-value metric-value-variance">{outputVarianceLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Underruns</span>

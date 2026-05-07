@@ -1235,16 +1235,12 @@ public sealed class MainForm : Form
                     : (double?)null,
                 Underruns = d.MixProvider?.UnderrunCount ?? 0,
                 DroppedFrames = d.MixProvider?.DroppedFrames ?? 0,
-                MovingAverageMs = d.MixProvider != null ? d.MixProvider.OutputMovingAverageMs : null,
                 VariationRangeMs = d.MixProvider != null ? d.MixProvider.OutputVariationRangeMs : null,
                 VariationOffsetMs = d.MixProvider != null ? d.MixProvider.OutputVariationOffsetMs : null,
                 SyncErrorMs = d.MixProvider != null ? d.MixProvider.OutputSyncErrorMs : null,
                 SyncIntegralMs = d.MixProvider != null ? d.MixProvider.OutputSyncIntegralMs : null,
                 AppliedPpm = d.MixProvider != null ? d.MixProvider.OutputAppliedPpm : null,
-                LastSlipFrames = d.MixProvider != null ? d.MixProvider.OutputLastSlipFrames : null,
                 JitterMs = null,
-                SyncCorrections = d.MixProvider?.SyncCorrectionCount ?? 0,
-                SyncCorrectionRatePerSec = d.MixProvider?.SyncCorrectionRatePerSec ?? 0,
                 FastCatchUpActive = d.MixProvider?.FastCatchUpActive ?? false,
                 FastCatchUpDutyPercent = d.MixProvider?.FastCatchUpDutyPercent ?? 0,
                 PostRecoveryUnderruns = d.MixProvider?.PostRecoveryUnderruns ?? 0,
@@ -1405,16 +1401,13 @@ public sealed class MainForm : Form
         public int DriverLatencyMs { get; set; }
         public double? LatencyMs { get; set; }
         public long Underruns { get; set; }
-        public double? MovingAverageMs { get; set; }
         public double? VariationRangeMs { get; set; }
         public double? VariationOffsetMs { get; set; }
         public double? SyncErrorMs { get; set; }
         public double? SyncIntegralMs { get; set; }
         public double? AppliedPpm { get; set; }
-        public int? LastSlipFrames { get; set; }
         public double? JitterMs { get; set; }
         public long SyncCorrections { get; set; }
-        public double SyncCorrectionRatePerSec { get; set; }
         public bool FastCatchUpActive { get; set; }
         public double FastCatchUpDutyPercent { get; set; }
         public long PostRecoveryUnderruns { get; set; }

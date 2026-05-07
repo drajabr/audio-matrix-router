@@ -67,6 +67,26 @@ public class RingBuffer
         return unread / _channels;
     }
 
+    /// <summary>
+    /// Returns the absolute read-pointer offset between two consumers, in frames.
+    /// Computed atomically so the shared write pointer cancels out — this is pure
+    /// positional divergence with no write-timing measurement noise.
+    /// Positive: follower has more frames available (master is ahead in playback).
+    /// </summary>
+    public int GetReadPointerDiffFrames(string masterId, string followerId)
+    {
+        lock (_cursorLock)
+        {
+            if (!_consumerReadPos.TryGetValue(masterId, out int mr)) return 0;
+            if (!_consumerReadPos.TryGetValue(followerId, out int fr)) return 0;
+            // mr - fr (mod capacity): positive = master read pointer is ahead of follower
+            int raw = (mr - fr + _capacity) % _capacity;
+            // Convert to signed so offsets near capacity/2 are handled correctly
+            if (raw > _capacity / 2) raw -= _capacity;
+            return raw / _channels;
+        }
+    }
+
     public void RemoveConsumer(string consumerId)
     {
         lock (_cursorLock)
