@@ -324,15 +324,44 @@ public sealed class MainForm : Form
         _trayMenu.Renderer = new TrayMenuRenderer();
         _trayMenu.BackColor = AppPanelColor;
         _trayMenu.ForeColor = AppTextColor;
+        _trayMenu.Padding = new Padding(4, 4, 4, 4);
+        _trayMenu.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
 
-        _trayMenu.Items.Add("Show", null, (_, _) => RestoreFromTray());
-        _trayMenu.Items.Add("Quit", null, (_, _) => QuitFromTray());
-
-        foreach (ToolStripItem item in _trayMenu.Items)
+        _trayMenu.Opened += (_, _) =>
         {
-            item.BackColor = AppPanelColor;
-            item.ForeColor = AppTextColor;
-        }
+            // Apply rounded corners to the popup window itself via DWM (Win 11+)
+            // and also via Region clip for older Windows.
+            const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+            int roundPref = 2; // DWMWCP_ROUND
+            try { DwmSetWindowAttribute(_trayMenu.Handle, DWMWA_WINDOW_CORNER_PREFERENCE, ref roundPref, sizeof(int)); }
+            catch { /* Windows 10 or DWM unavailable – fall through to Region */ }
+
+            const int r = 8;
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            int d = r * 2;
+            int w = _trayMenu.Width, h = _trayMenu.Height;
+            path.AddArc(0, 0, d, d, 180, 90);
+            path.AddArc(w - d, 0, d, d, 270, 90);
+            path.AddArc(w - d, h - d, d, d, 0, 90);
+            path.AddArc(0, h - d, d, d, 90, 90);
+            path.CloseFigure();
+            _trayMenu.Region = new Region(path);
+        };
+
+        var showItem = new ToolStripMenuItem("Show");
+        showItem.Click += (_, _) => RestoreFromTray();
+        showItem.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold, GraphicsUnit.Point);
+        showItem.BackColor = AppPanelColor;
+        showItem.ForeColor = AppTextColor;
+
+        var quitItem = new ToolStripMenuItem("Quit");
+        quitItem.Click += (_, _) => QuitFromTray();
+        quitItem.BackColor = AppPanelColor;
+        quitItem.ForeColor = Color.FromArgb(190, 190, 200);
+
+        _trayMenu.Items.Add(showItem);
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add(quitItem);
 
         _trayIcon.Text = "Audio Router Matrix";
         _trayIcon.Icon = _trayAppIcon;
@@ -363,6 +392,17 @@ public sealed class MainForm : Form
         WindowState = FormWindowState.Normal;
         Activate();
         ScheduleSave();
+    }
+
+    public void ShowFromSecondInstance()
+    {
+        _trayIcon.Visible = true;
+        Show();
+        ShowInTaskbar = true;
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = FormWindowState.Normal;
+        Activate();
+        NativeMethods.SetForegroundWindow(Handle);
     }
 
     private void MinimizeToTray(bool showBalloon)
@@ -466,62 +506,116 @@ public sealed class MainForm : Form
 
     private sealed class TrayMenuRenderer : ToolStripProfessionalRenderer
     {
-        public TrayMenuRenderer() : base(new TrayMenuColorTable())
+        private static readonly Color BgColor      = AppPanelColor;
+        private static readonly Color HoverBg      = Color.FromArgb(28, 45, 61, 84);   // very subtle tinted panel
+        private static readonly Color HoverBorder  = Color.FromArgb(90, AppAccentColor.R, AppAccentColor.G, AppAccentColor.B);
+        private static readonly Color AccentBar    = AppAccentColor;
+        private static readonly Color BorderColor  = AppLineColor;
+        private static readonly Color SepColor     = Color.FromArgb(100, AppLineColor.R, AppLineColor.G, AppLineColor.B);
+        private const int ItemHeight   = 34;
+        private const int ItemPadH     = 14;
+        private const int AccentBarW   = 3;
+        private const int Radius       = 5;
+
+        public TrayMenuRenderer() : base(new TrayMenuColorTable()) { RoundedEdges = false; }
+
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
         {
-            RoundedEdges = false;
-        }
-
-        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
-        {
-            e.TextColor = AppTextColor;
-            base.OnRenderItemText(e);
-        }
-
-        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
-        {
-            var bounds = new Rectangle(Point.Empty, e.Item.Size);
-            var fill = e.Item.Selected
-                ? Color.FromArgb(40, AppAccentColor)
-                : AppPanelColor;
-
-            using var backgroundBrush = new SolidBrush(fill);
-            e.Graphics.FillRectangle(backgroundBrush, bounds);
-
-            if (e.Item.Selected)
-            {
-                using var borderPen = new Pen(Color.FromArgb(120, AppAccentColor));
-                var borderBounds = Rectangle.Inflate(bounds, -1, -1);
-                e.Graphics.DrawRectangle(borderPen, borderBounds);
-            }
+            using var brush = new SolidBrush(BgColor);
+            e.Graphics.FillRectangle(brush, e.AffectedBounds);
         }
 
         protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
         {
-            using var borderPen = new Pen(AppLineColor);
-            var borderBounds = new Rectangle(Point.Empty, e.ToolStrip.Size - new Size(1, 1));
-            e.Graphics.DrawRectangle(borderPen, borderBounds);
+            using var pen = new Pen(BorderColor);
+            var r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+            e.Graphics.DrawRectangle(pen, r);
         }
 
         protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
         {
-            using var brush = new SolidBrush(AppPanelColor);
+            using var brush = new SolidBrush(BgColor);
             e.Graphics.FillRectangle(brush, e.AffectedBounds);
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            int y = e.Item.Height / 2;
+            using var pen = new Pen(SepColor);
+            e.Graphics.DrawLine(pen, ItemPadH, y, e.Item.Width - ItemPadH, y);
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (!e.Item.Selected || e.Item is ToolStripSeparator) return;
+
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            var bounds = new Rectangle(5, 2, e.Item.Width - 10, e.Item.Height - 4);
+
+            // Rounded hover background
+            using (var bgBrush = new SolidBrush(Color.FromArgb(38, AppAccentColor.R, AppAccentColor.G, AppAccentColor.B)))
+            using (var path = RoundedRect(bounds, Radius))
+            {
+                g.FillPath(bgBrush, path);
+            }
+
+            // Rounded hover border
+            using (var borderPen = new Pen(HoverBorder))
+            using (var path = RoundedRect(bounds, Radius))
+            {
+                g.DrawPath(borderPen, path);
+            }
+
+            // Accent left bar (only for the "Show" bold item)
+            if (e.Item.Font.Bold)
+            {
+                using var accentBrush = new SolidBrush(AccentBar);
+                g.FillRectangle(accentBrush, new Rectangle(bounds.X + 1, bounds.Y + 4, AccentBarW, bounds.Height - 8));
+            }
+
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.Default;
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            if (e.Item is ToolStripSeparator) return;
+            e.TextColor = e.Item.ForeColor;
+            // Indent text past the accent bar zone
+            var oldRect = e.TextRectangle;
+            e.TextRectangle = new Rectangle(oldRect.X + 8, oldRect.Y, oldRect.Width - 8, oldRect.Height);
+            base.OnRenderItemText(e);
+        }
+
+        private static System.Drawing.Drawing2D.GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            int d = radius * 2;
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
         }
 
         private sealed class TrayMenuColorTable : ProfessionalColorTable
         {
-            public override Color ToolStripDropDownBackground => AppPanelColor;
-            public override Color MenuBorder => AppLineColor;
-            public override Color MenuItemBorder => Color.FromArgb(120, AppAccentColor);
-            public override Color MenuItemSelected => Color.FromArgb(40, AppAccentColor);
-            public override Color MenuItemSelectedGradientBegin => Color.FromArgb(40, AppAccentColor);
-            public override Color MenuItemSelectedGradientEnd => Color.FromArgb(40, AppAccentColor);
-            public override Color MenuItemPressedGradientBegin => AppPanelColor;
-            public override Color MenuItemPressedGradientMiddle => AppPanelColor;
-            public override Color MenuItemPressedGradientEnd => AppPanelColor;
-            public override Color ImageMarginGradientBegin => AppPanelColor;
-            public override Color ImageMarginGradientMiddle => AppPanelColor;
-            public override Color ImageMarginGradientEnd => AppPanelColor;
+            public override Color ToolStripDropDownBackground        => AppPanelColor;
+            public override Color MenuBorder                         => AppLineColor;
+            public override Color MenuItemBorder                     => Color.Transparent;
+            public override Color MenuItemSelected                   => Color.Transparent;
+            public override Color MenuItemSelectedGradientBegin      => Color.Transparent;
+            public override Color MenuItemSelectedGradientEnd        => Color.Transparent;
+            public override Color MenuItemPressedGradientBegin       => Color.Transparent;
+            public override Color MenuItemPressedGradientMiddle      => Color.Transparent;
+            public override Color MenuItemPressedGradientEnd         => Color.Transparent;
+            public override Color ImageMarginGradientBegin           => AppPanelColor;
+            public override Color ImageMarginGradientMiddle          => AppPanelColor;
+            public override Color ImageMarginGradientEnd             => AppPanelColor;
+            public override Color SeparatorDark                      => AppLineColor;
+            public override Color SeparatorLight                     => Color.Transparent;
         }
     }
 
@@ -1136,10 +1230,18 @@ public sealed class MainForm : Form
                 DelayMs = d.OutputDelayMs,
                 SampleRate = d.Info.SampleRate,
                 DriverLatencyMs = d.RenderLatencyMs,
+                LatencyMs = d.RenderLatencyMs > 0
+                    ? Math.Round((double)d.RenderLatencyMs + d.OutputDelayMs, 1)
+                    : (double?)null,
                 Underruns = d.MixProvider?.UnderrunCount ?? 0,
                 DroppedFrames = d.MixProvider?.DroppedFrames ?? 0,
                 MovingAverageMs = d.MixProvider != null ? d.MixProvider.OutputMovingAverageMs : null,
                 VariationRangeMs = d.MixProvider != null ? d.MixProvider.OutputVariationRangeMs : null,
+                VariationOffsetMs = d.MixProvider != null ? d.MixProvider.OutputVariationOffsetMs : null,
+                SyncErrorMs = d.MixProvider != null ? d.MixProvider.OutputSyncErrorMs : null,
+                SyncIntegralMs = d.MixProvider != null ? d.MixProvider.OutputSyncIntegralMs : null,
+                AppliedPpm = d.MixProvider != null ? d.MixProvider.OutputAppliedPpm : null,
+                LastSlipFrames = d.MixProvider != null ? d.MixProvider.OutputLastSlipFrames : null,
                 JitterMs = null,
                 SyncCorrections = d.MixProvider?.SyncCorrectionCount ?? 0,
                 SyncCorrectionRatePerSec = d.MixProvider?.SyncCorrectionRatePerSec ?? 0,
@@ -1301,9 +1403,15 @@ public sealed class MainForm : Form
         public int DelayMs { get; set; }
         public int SampleRate { get; set; }
         public int DriverLatencyMs { get; set; }
+        public double? LatencyMs { get; set; }
         public long Underruns { get; set; }
         public double? MovingAverageMs { get; set; }
         public double? VariationRangeMs { get; set; }
+        public double? VariationOffsetMs { get; set; }
+        public double? SyncErrorMs { get; set; }
+        public double? SyncIntegralMs { get; set; }
+        public double? AppliedPpm { get; set; }
+        public int? LastSlipFrames { get; set; }
         public double? JitterMs { get; set; }
         public long SyncCorrections { get; set; }
         public double SyncCorrectionRatePerSec { get; set; }
@@ -1357,5 +1465,12 @@ public sealed class MainForm : Form
     private const int ICON_SMALL = 0;
     private const int ICON_BIG = 1;
     private static readonly int WM_TASKBARCREATED = RegisterWindowMessage("TaskbarCreated");
+
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll")]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        internal static extern bool SetForegroundWindow(IntPtr hWnd);
+    }
 
 }

@@ -901,6 +901,8 @@ export default function App({ runtime = "web" }) {
   });
 
   const [selectedCell, setSelectedCell] = useState(null);
+  const [hoveredInputDeviceId, setHoveredInputDeviceId] = useState("");
+  const [hoveredOutputDeviceId, setHoveredOutputDeviceId] = useState("");
   const [inputLevels, setInputLevels] = useState({});
   const [outputLevels, setOutputLevels] = useState({});
   const [dragSortState, setDragSortState] = useState({
@@ -1251,8 +1253,14 @@ export default function App({ runtime = "web" }) {
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          latencyMs: Number.isFinite(d?.latencyMs) ? Math.round(Number(d.latencyMs) * 10) / 10 : null,
           movingAverageMs: Number.isFinite(d?.movingAverageMs) ? Math.round(Number(d.movingAverageMs) * 10) / 10 : null,
-          variationRangeMs: Number.isFinite(d?.variationRangeMs) ? Math.round(Number(d.variationRangeMs) * 10) / 10 : null,
+          variationRangeMs: Number.isFinite(d?.variationRangeMs) ? Number(d.variationRangeMs) : null,
+          variationOffsetMs: Number.isFinite(d?.variationOffsetMs) ? Number(d.variationOffsetMs) : null,
+          syncErrorMs: Number.isFinite(d?.syncErrorMs) ? Math.round(Number(d.syncErrorMs) * 100) / 100 : null,
+          syncIntegralMs: Number.isFinite(d?.syncIntegralMs) ? Math.round(Number(d.syncIntegralMs) * 100) / 100 : null,
+          appliedPpm: Number.isFinite(d?.appliedPpm) ? Math.round(Number(d.appliedPpm) * 10) / 10 : null,
+          lastSlipFrames: Number.isFinite(d?.lastSlipFrames) ? Number(d.lastSlipFrames) : 0,
           jitterMs: Number.isFinite(d?.jitterMs) ? Math.round(Number(d.jitterMs) * 10) / 10 : null,
           underruns: Number.isFinite(d?.underruns) ? d.underruns : 0,
           droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
@@ -3713,22 +3721,37 @@ export default function App({ runtime = "web" }) {
     if (rounded >= 1000) return `${(rounded / 1000).toFixed(1)}k`;
     return String(rounded);
   };
-  const inputSideDeviceId = selectedSourceDeviceId || inputMasterId;
-  const outputSideDeviceId = selectedDestinationDeviceId || outputMasterId;
+  const inputSideDeviceId = hoveredInputDeviceId || selectedSourceDeviceId || inputMasterId;
+  const outputSideDeviceId = hoveredOutputDeviceId || selectedDestinationDeviceId || outputMasterId;
   const inputSideMeta = inputSideDeviceId ? nativeInputChannelMeta[inputSideDeviceId] : null;
   const outputSideMeta = outputSideDeviceId ? nativeOutputChannelMeta[outputSideDeviceId] : null;
   const inputSyncAverageMs = hasNativeBridge
     ? (Number.isFinite(inputSideMeta?.driverLatencyMs) ? inputSideMeta.driverLatencyMs : null)
     : null;
   const sourceLatencyEffectiveMs = inputSyncAverageMs ?? (sourceLatencyDisplayMs ?? sourceDeviceDriverLatencyMs);
-  const outputSyncAverageMs = hasNativeBridge
-    ? (Number.isFinite(outputSideMeta?.movingAverageMs) ? outputSideMeta.movingAverageMs : null)
-    : null;
-  const destinationLatencyEffectiveMs = outputSyncAverageMs ?? (destinationLatencyResolvedMs ?? (
-    destinationDeviceDriverLatencyMs != null || selectedDestinationDelayMs > 0
-      ? Math.round(((destinationDeviceDriverLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
-      : null
-  ));
+  const destinationLatencyEffectiveMs = (() => {
+    if (hasNativeBridge) {
+      if (Number.isFinite(outputSideMeta?.latencyMs)) {
+        return Math.round(Number(outputSideMeta.latencyMs) * 10) / 10;
+      }
+      if (Number.isFinite(outputSideMeta?.movingAverageMs)) {
+        return Math.round(Number(outputSideMeta.movingAverageMs) * 10) / 10;
+      }
+      const outputDriverLatencyMs = Number.isFinite(outputSideMeta?.driverLatencyMs)
+        ? Number(outputSideMeta.driverLatencyMs)
+        : (destinationDeviceDriverLatencyMs != null ? Number(destinationDeviceDriverLatencyMs) : null);
+      if (outputDriverLatencyMs != null || selectedDestinationDelayMs > 0) {
+        return Math.round(((outputDriverLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10;
+      }
+      return destinationLatencyResolvedMs;
+    }
+
+    return destinationLatencyResolvedMs ?? (
+      destinationDeviceDriverLatencyMs != null || selectedDestinationDelayMs > 0
+        ? Math.round(((destinationDeviceDriverLatencyMs ?? 0) + selectedDestinationDelayMs) * 10) / 10
+        : null
+    );
+  })();
   const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "n/a";
   const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "n/a";
   const inputBufferLabel = `${captureBufferMs}ms`;
@@ -3739,7 +3762,20 @@ export default function App({ runtime = "web" }) {
     }
 
     if (Number.isFinite(outputSideMeta?.variationRangeMs)) {
-      return `${Math.round(Number(outputSideMeta.variationRangeMs) * 10) / 10}ms`;
+      const rawRangeMs = Number(outputSideMeta.variationRangeMs);
+      const rangeMsLabel = Math.abs(rawRangeMs) < 1
+        ? `${rawRangeMs.toFixed(2)}ms`
+        : `${(Math.round(rawRangeMs * 10) / 10)}ms`;
+      if (Number.isFinite(outputSideMeta?.variationOffsetMs)) {
+        const rawOffsetMs = Number(outputSideMeta.variationOffsetMs);
+        if (Math.abs(rawOffsetMs) >= 0.1) {
+          const offsetMsLabel = Math.abs(rawOffsetMs) < 1
+            ? `${rawOffsetMs > 0 ? "+" : ""}${rawOffsetMs.toFixed(2)}ms`
+            : `${rawOffsetMs > 0 ? "+" : ""}${(Math.round(rawOffsetMs * 10) / 10)}ms`;
+          return `${rangeMsLabel} (${offsetMsLabel})`;
+        }
+      }
+      return rangeMsLabel;
     }
 
     return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "n/a");
@@ -3961,6 +3997,8 @@ export default function App({ runtime = "web" }) {
           onPointerLeave={() => {
             // Discard hover selection as soon as the pointer leaves the matrix surface.
             setShowResizeGuides(false);
+            setHoveredInputDeviceId("");
+            setHoveredOutputDeviceId("");
             if (locked) return;
             setSelectedCell(null);
           }}
@@ -3975,6 +4013,8 @@ export default function App({ runtime = "web" }) {
             onMouseLeave={() => {
               // Clear hover selection the moment the pointer exits the grid (not just the wrap).
               if (!locked) setSelectedCell(null);
+              setHoveredInputDeviceId("");
+              setHoveredOutputDeviceId("");
               setShowResizeGuides(false);
             }}
             onMouseMove={(event) => {
@@ -4365,6 +4405,12 @@ export default function App({ runtime = "web" }) {
                   onDragEnd={endSortDrag("destination")}
                   onDragOver={overSortTarget("destination", col.outputDeviceId)}
                   onDrop={dropSortTarget("destination")}
+                  onMouseEnter={() => {
+                    setHoveredOutputDeviceId(col.outputDeviceId || "");
+                  }}
+                  onMouseLeave={() => {
+                    setHoveredOutputDeviceId("");
+                  }}
                 >
                   <div
                     className="col-main"
@@ -4426,6 +4472,12 @@ export default function App({ runtime = "web" }) {
                   onDragEnd={endSortDrag("source")}
                   onDragOver={overSortTarget("source", row.deviceId)}
                   onDrop={dropSortTarget("source")}
+                  onMouseEnter={() => {
+                    setHoveredInputDeviceId(row.deviceId || "");
+                  }}
+                  onMouseLeave={() => {
+                    setHoveredInputDeviceId("");
+                  }}
                 >
                   <div
                     className="row-main"
@@ -4464,6 +4516,8 @@ export default function App({ runtime = "web" }) {
                   const key = getCellKey(row.id, col.id);
                   const state = activeMatrix[key] || makeDefaultConnection();
                   const selected = selectedCell?.rowId === row.id && selectedCell?.colId === col.id;
+                  const sameHoveredRow = selectedRowPathIndex >= 0 && rowIndex === selectedRowPathIndex;
+                  const sameHoveredCol = selectedColPathIndex >= 0 && colIndex === selectedColPathIndex;
                   const pathLeft = selectedRowPathIndex >= 0 && selectedColPathIndex >= 0
                     && rowIndex === selectedRowPathIndex && colIndex < selectedColPathIndex;
                   const pathUp = selectedRowPathIndex >= 0 && selectedColPathIndex >= 0
@@ -4509,10 +4563,16 @@ export default function App({ runtime = "web" }) {
                         ].filter(Boolean).join(" ")}
                         style={{ width: `${tileWidth}px`, height: `${tileHeight}px` }}
                         onMouseEnter={() => {
+                          setHoveredInputDeviceId(row.deviceId || "");
+                          setHoveredOutputDeviceId(col.outputDeviceId || "");
                           if (locked) return;
                           if (dragScrollRef.current.dragging) return;
                           if (selectedCell?.rowId === row.id && selectedCell?.colId === col.id) return;
                           setSelectedCell({ rowId: row.id, colId: col.id });
+                        }}
+                        onMouseLeave={() => {
+                          setHoveredInputDeviceId("");
+                          setHoveredOutputDeviceId("");
                         }}
                         onClick={() => {
                           if (dragScrollRef.current.blockNextClick) {

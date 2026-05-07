@@ -9,34 +9,49 @@ public sealed class OutputSyncCoordinator
     private const int WarmupFrames = 48000;  // ~1 second at 48kHz; allow system to stabilize before correcting
     
     // ===== Smoothing =====
-    private const double BufferedFramesSmoothingAlpha = 0.05;    // EMA for buffered frame measurements
-    private const double ErrorSmoothingAlpha = 0.06;            // EMA for error signal
+    private const double BufferedFramesSmoothingAlpha = 0.06;    // EMA for buffered frame measurements
+    private const double ErrorSmoothingAlpha = 0.15;            // EMA for error signal — faster tracking for tighter lock
     private const double TargetSmoothingRiseAlpha = 0.008;      // Raise target conservatively to avoid abrupt latency jumps
     private const double TargetSmoothingFallAlpha = 0.04;       // Drop target faster so runtime latency returns near floor quickly
     
     // ===== Follower Sync =====
-    private const double RatioGainPpmPerFrame = 2.0;            // PPM adjustment per frame of error
-    private const double RatioSmoothingAlpha = 0.08;            // EMA for playback speed correction
-    private const int StableSettleBandFrames = 16;              // Don't correct tiny errors (~0.3ms at 48kHz)
-    private const double MaxFollowerRatioPpm = 2400;            // Limit speed correction to +/-2400 ppm
-    private const int SlipThresholdFrames = 192;
+    private const double RatioSmoothingAlpha = 0.05;            // EMA for playback speed correction
+    private const int StableSettleBandFrames = 4;               // ~0.08ms deadband — tight enough for sub-0.2ms steady state
+    private const double MaxFollowerRatioPpm = 3000;            // More headroom for continuous drift correction
+    private const int SlipThresholdFrames = 168;
 
     // ===== Fast Catch-Up Mode =====
-    private const int FastCatchUpEnterErrorFrames = 64;         // Enter when lag is clearly visible
-    private const int FastCatchUpExitErrorFrames = 16;          // Exit only after tight re-lock
-    private const int FastCatchUpEnterConfirmBlocks = 3;        // Require persistence before entering
-    private const int FastCatchUpMinHoldBlocks = 8;             // Stay long enough to actually recover
-    private const double FastCatchUpRatioGainPpmPerFrame = 6.0; // Aggressive, bounded catch-up gain
-    private const double FastCatchUpMaxFollowerRatioPpm = 9000; // Temporary higher correction ceiling
-    private const int FastCatchUpSlipThresholdFrames = 96;      // Allow earlier slips while recovering
+    private const int FastCatchUpEnterErrorFrames = 30;         // Enter recovery sooner on real spikes
+    private const int FastCatchUpExitErrorFrames = 8;           // Exit only after very tight re-lock
+    private const int FastCatchUpEnterConfirmBlocks = 1;        // Spike recovery should react immediately
+    private const int FastCatchUpMinHoldBlocks = 8;             // Keep recovery short but sufficient
+    private const double FastCatchUpMaxFollowerRatioPpm = 6200; // Stronger temporary correction during spike recovery
+    private const int FastCatchUpSlipThresholdFrames = 48;      // Slip earlier while recovering from spikes
 
     // ===== Guardrails =====
-    private const int CorrectionCooldownBlocks = 4;             // Brief pause between slips to avoid back-to-back oscillation
+    private const int CorrectionCooldownBlocks = 2;             // Faster slip cadence during relock windows
     private const int PostRecoveryUnderrunWindowBlocks = 80;    // Track underruns shortly after recovery
     
     // ===== Spike Rejection =====
     private const int SpikeRejectThresholdFramesBase = 240;     // ~5ms spike threshold
-    private const double SpikeBlendAlpha = 0.005;               // Slowly learn spike pattern
+    private const double SpikeBlendAlpha = 0.02;                // Learn spike transitions faster for quicker recovery
+
+    // ===== Variance / Spread Peak Tracking =====
+    private const double SpreadPeakDecay = 0.998;               // Decaying peak per block (~3.5s half-life at 93 blocks/sec)
+
+    // ===== Ratio Dynamics =====
+    private const double RatioStepLimitPpmPerBlock = 260;       // Allow faster ratio movement while staying bounded
+    private const double FastCatchUpRatioStepLimitPpmPerBlock = 700;
+
+    // ===== Ratio Controller (PI-style) =====
+    private const double RatioKpPpmPerFrame = 2.5;              // Stronger proportional response in normal mode
+    private const double RatioKiPpmPerIntegralFrame = 0.10;     // Integral pull toward zero spread
+    private const double FastCatchUpRatioKpPpmPerFrame = 3.5;   // Stronger proportional response in catch-up mode
+    private const double FastCatchUpRatioKiPpmPerIntegralFrame = 0.16;
+    private const double RatioIntegralDecayInDeadband = 0.998;  // Near-zero decay — integral persists to hold drift correction
+    private const double RatioIntegralBleedPerBlock = 0.995;    // Slow bleed to prevent long-term windup
+    private const double RatioIntegralClampFrames = 3000;       // Bound integral state
+    private const int NormalSlipConfirmBlocks = 2;              // Require persistence before slip outside catch-up
     
     // ===== Underrun Recovery =====
     private const double MinTargetDuringUnderrunFraction = 0.5; // Drop floor to 50% during underruns
@@ -75,6 +90,14 @@ public sealed class OutputSyncCoordinator
         public long LastObservedFrames;
         public int PostRecoveryWindowBlocksRemaining;
         public long PostRecoveryUnderruns;
+        public int LastSlipDirection;
+        public int LastSlipMagnitude;
+        public int SlipPositiveConfirmBlocks;
+        public int SlipNegativeConfirmBlocks;
+        public double IntegralErrorFrames;
+        public double LastAppliedPpm;
+        public int LastSlipFrames;
+        public double SmoothedSpreadPeak = 0;  // Decaying peak of abs spread to master (frames)
     }
 
     public OutputSyncCoordinator(string masterConsumerId, int baseMasterTargetFrames, int maxMasterTargetFrames)
@@ -109,7 +132,15 @@ public sealed class OutputSyncCoordinator
                 state.CorrectionRatePerKFrames = 0;
                 state.LastObservedFrames = 0;
                 state.PostRecoveryWindowBlocksRemaining = 0;
+                state.SmoothedSpreadPeak = 0;
                 state.PostRecoveryUnderruns = 0;
+                state.LastSlipDirection = 0;
+                state.LastSlipMagnitude = 0;
+                state.SlipPositiveConfirmBlocks = 0;
+                state.SlipNegativeConfirmBlocks = 0;
+                state.IntegralErrorFrames = 0;
+                state.LastAppliedPpm = 0;
+                state.LastSlipFrames = 0;
             }
 
             _adaptiveMasterTargetFrames = _baseMasterTargetFrames;
@@ -221,6 +252,10 @@ public sealed class OutputSyncCoordinator
             state.SmoothedErrorFrames = state.SmoothedErrorFrames == 0
                 ? errorFrames
                 : (state.SmoothedErrorFrames * (1.0 - ErrorSmoothingAlpha)) + (errorFrames * ErrorSmoothingAlpha);
+
+            // Track decaying peak of the PI controller's error signal for UI variance display.
+            // Using SmoothedErrorFrames (not raw EMA difference) avoids cross-thread timing artifacts.
+            state.SmoothedSpreadPeak = Math.Max(Math.Abs(state.SmoothedErrorFrames), state.SmoothedSpreadPeak * SpreadPeakDecay);
         }
     }
 
@@ -231,6 +266,46 @@ public sealed class OutputSyncCoordinator
             return _states.TryGetValue(consumerId, out var state)
                 ? state.Ratio
                 : 1.0;
+        }
+    }
+
+    public double GetConsumerSmoothedErrorFrames(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            return _states.TryGetValue(consumerId, out var state)
+                ? state.SmoothedErrorFrames
+                : 0;
+        }
+    }
+
+    public double GetConsumerIntegralErrorFrames(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            return _states.TryGetValue(consumerId, out var state)
+                ? state.IntegralErrorFrames
+                : 0;
+        }
+    }
+
+    public double GetConsumerAppliedPpm(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            return _states.TryGetValue(consumerId, out var state)
+                ? state.LastAppliedPpm
+                : 0;
+        }
+    }
+
+    public int GetConsumerLastSlipFrames(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            return _states.TryGetValue(consumerId, out var state)
+                ? state.LastSlipFrames
+                : 0;
         }
     }
 
@@ -334,33 +409,47 @@ public sealed class OutputSyncCoordinator
         {
             if (!_states.TryGetValue(consumerId, out var state)) return 0;
 
-            if (!_states.TryGetValue(_masterConsumerId, out var masterState))
-            {
-                return 0;
-            }
-
-            // Reporting metric should track current spread quickly; prefer live buffered frames.
-            double ResolveBuffered(OutputState s) => s.BufferedFrames >= 0
-                ? s.BufferedFrames
-                : (s.SmoothedBufferedFrames >= 0 ? s.SmoothedBufferedFrames : 0);
-
-            // For a follower, report current absolute spread to master.
+            // For a follower, report the decaying peak spread to master (shows meaningful variance even when locked).
             if (consumerId != _masterConsumerId)
             {
-                return Math.Abs(ResolveBuffered(state) - ResolveBuffered(masterState));
+                return state.SmoothedSpreadPeak;
             }
 
-            // For master, report worst follower spread (max absolute delta to master).
-            double masterBuffered = ResolveBuffered(masterState);
+            // For master, report worst follower's decaying spread peak.
             double worstSpread = 0;
             foreach (var pair in _states)
             {
                 if (pair.Key == _masterConsumerId) continue;
-                double followerBuffered = ResolveBuffered(pair.Value);
-                worstSpread = Math.Max(worstSpread, Math.Abs(followerBuffered - masterBuffered));
+                worstSpread = Math.Max(worstSpread, pair.Value.SmoothedSpreadPeak);
             }
 
             return worstSpread;
+        }
+    }
+
+    public double GetConsumerBufferedFrames(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            if (!_states.TryGetValue(consumerId, out var state)) return 0;
+            if (state.SmoothedBufferedFrames >= 0) return Math.Max(0, state.SmoothedBufferedFrames);
+            return Math.Max(0, state.BufferedFrames);
+        }
+    }
+
+    public double GetConsumerSpreadToMasterFrames(string consumerId)
+    {
+        lock (_syncLock)
+        {
+            if (consumerId == _masterConsumerId) return 0;
+            if (!_states.TryGetValue(consumerId, out var state)) return 0;
+            if (!_states.TryGetValue(_masterConsumerId, out var masterState)) return 0;
+
+            double ResolveBuffered(OutputState s) => s.SmoothedBufferedFrames >= 0
+                ? s.SmoothedBufferedFrames
+                : Math.Max(0, s.BufferedFrames);
+
+            return ResolveBuffered(state) - ResolveBuffered(masterState);
         }
     }
 
@@ -502,6 +591,13 @@ public sealed class OutputSyncCoordinator
             state.FastCatchUpHoldBlocks = 0;
             state.PostRecoveryWindowBlocksRemaining = 0;
             state.Ratio = 1.0;
+            state.LastSlipDirection = 0;
+            state.LastSlipMagnitude = 0;
+            state.SlipPositiveConfirmBlocks = 0;
+            state.SlipNegativeConfirmBlocks = 0;
+            state.IntegralErrorFrames = 0;
+            state.LastAppliedPpm = 0;
+            state.LastSlipFrames = 0;
             return 0;
         }
 
@@ -546,8 +642,8 @@ public sealed class OutputSyncCoordinator
             }
         }
 
-        // Compute ratio correction (playback speed adjustment)
-        state.Ratio = ComputeFollowerRatioNoLock(consumerId, state.SmoothedErrorFrames, state.Ratio, state.FastCatchUpActive);
+        // Compute ratio correction (playback speed adjustment) using PI-like control.
+        state.Ratio = ComputeFollowerRatioNoLock(consumerId, state, state.FastCatchUpActive);
 
         // Slip on large residual errors after ratio correction.
         // +1 consumes one extra frame (drains follower queue), -1 consumes one less frame (builds queue).
@@ -562,6 +658,56 @@ public sealed class OutputSyncCoordinator
             slip = -1;
         }
 
+        if (slip > 0)
+        {
+            state.SlipPositiveConfirmBlocks += 1;
+            state.SlipNegativeConfirmBlocks = 0;
+        }
+        else if (slip < 0)
+        {
+            state.SlipNegativeConfirmBlocks += 1;
+            state.SlipPositiveConfirmBlocks = 0;
+        }
+        else
+        {
+            state.SlipPositiveConfirmBlocks = 0;
+            state.SlipNegativeConfirmBlocks = 0;
+        }
+
+        int requiredConfirmBlocks = state.FastCatchUpActive ? 1 : NormalSlipConfirmBlocks;
+        if (slip > 0 && state.SlipPositiveConfirmBlocks < requiredConfirmBlocks)
+        {
+            slip = 0;
+        }
+        else if (slip < 0 && state.SlipNegativeConfirmBlocks < requiredConfirmBlocks)
+        {
+            slip = 0;
+        }
+
+        if (slip != 0 && state.FastCatchUpActive)
+        {
+            int absErr = (int)Math.Abs(state.SmoothedErrorFrames);
+            int slipAbs = 1;
+            if (absErr >= slipThreshold * 2)
+            {
+                slipAbs = 2;
+            }
+            if (absErr >= slipThreshold * 3)
+            {
+                slipAbs = 3;
+            }
+
+            // Resist rapid sign flips that cause left/right image wandering when near lock.
+            if (state.LastSlipDirection != 0 && Math.Sign(slip) != state.LastSlipDirection && absErr < (slipThreshold + 28))
+            {
+                slip = 0;
+            }
+            else
+            {
+                slip *= slipAbs;
+            }
+        }
+
         if (slip != 0)
         {
             if (state.CorrectionCooldownBlocks > 0)
@@ -572,7 +718,15 @@ public sealed class OutputSyncCoordinator
             {
                 state.CorrectionCount += 1;
                 state.CorrectionCooldownBlocks = CorrectionCooldownBlocks;
+                state.LastSlipDirection = Math.Sign(slip);
+                state.LastSlipMagnitude = Math.Abs(slip);
+                state.LastSlipFrames = slip;
             }
+        }
+        else
+        {
+            state.LastSlipMagnitude = 0;
+            state.LastSlipFrames = 0;
         }
 
         long framesDelta = state.FramesRendered - state.LastRateSampleFrames;
@@ -590,28 +744,75 @@ public sealed class OutputSyncCoordinator
         return slip;
     }
 
-    private double ComputeFollowerRatioNoLock(string consumerId, double errorFrames, double currentRatio, bool fastCatchUp)
+    private double ComputeFollowerRatioNoLock(string consumerId, OutputState state, bool fastCatchUp)
     {
         if (consumerId == _masterConsumerId)
             return 1.0;
 
+        double errorFrames = state.SmoothedErrorFrames;
+        double currentRatio = state.Ratio;
+
         // Error definition: follower minus master buffered frames.
         // Positive error means follower has more queued audio (more delayed) and should speed up (>1.0).
         // Negative error means follower has less queued audio (less delayed) and should slow down (<1.0).
-        double settleBand = fastCatchUp ? 0 : StableSettleBandFrames;
-        double gain = fastCatchUp ? FastCatchUpRatioGainPpmPerFrame : RatioGainPpmPerFrame;
+        double settleBand = fastCatchUp ? 6 : StableSettleBandFrames;
         double maxPpm = fastCatchUp ? FastCatchUpMaxFollowerRatioPpm : MaxFollowerRatioPpm;
 
+        double kp = fastCatchUp ? FastCatchUpRatioKpPpmPerFrame : RatioKpPpmPerFrame;
+        double ki = fastCatchUp ? FastCatchUpRatioKiPpmPerIntegralFrame : RatioKiPpmPerIntegralFrame;
+
+        if (Math.Abs(errorFrames) <= settleBand)
+        {
+            state.IntegralErrorFrames *= RatioIntegralDecayInDeadband;
+        }
+        else
+        {
+            double proposed = state.IntegralErrorFrames + errorFrames;
+            double positiveClamp = RatioIntegralClampFrames * 0.65;
+            state.IntegralErrorFrames = Math.Clamp(
+                proposed,
+                -RatioIntegralClampFrames,
+                positiveClamp);
+
+            if (state.IntegralErrorFrames * errorFrames < 0 && Math.Abs(errorFrames) < FastCatchUpEnterErrorFrames)
+            {
+                // Bleed accumulated integral quickly if error flips sign near lock.
+                state.IntegralErrorFrames *= 0.6;
+            }
+        }
+        state.IntegralErrorFrames *= RatioIntegralBleedPerBlock;
+
+        // Inside deadband: output I-only (not zero!) so the accumulated drift correction persists.
+        // Without this, the ratio bleeds back to 1.0, clock drift resumes, and the error oscillates at ~0.5-1ms.
         double targetPpm = Math.Abs(errorFrames) <= settleBand
-            ? 0 
-            : Math.Clamp(errorFrames * gain, -maxPpm, maxPpm);
+            ? (state.IntegralErrorFrames * ki)
+            : (errorFrames * kp) + (state.IntegralErrorFrames * ki);
+
+        targetPpm = Math.Clamp(targetPpm, -maxPpm, maxPpm);
 
         double targetRatio = 1.0 + (targetPpm / 1_000_000.0);
         
         if (currentRatio <= 0)
+        {
+            state.LastAppliedPpm = targetPpm;
             return targetRatio;
+        }
 
-        return (currentRatio * (1.0 - RatioSmoothingAlpha)) + (targetRatio * RatioSmoothingAlpha);
+        // Bound ratio slew-rate per processing block to avoid audible flutter from rapid direction changes.
+        double maxRatioStep = (fastCatchUp ? FastCatchUpRatioStepLimitPpmPerBlock : RatioStepLimitPpmPerBlock) / 1_000_000.0;
+        double boundedTargetRatio = targetRatio;
+        if (targetRatio > currentRatio + maxRatioStep)
+        {
+            boundedTargetRatio = currentRatio + maxRatioStep;
+        }
+        else if (targetRatio < currentRatio - maxRatioStep)
+        {
+            boundedTargetRatio = currentRatio - maxRatioStep;
+        }
+
+        double nextRatio = (currentRatio * (1.0 - RatioSmoothingAlpha)) + (boundedTargetRatio * RatioSmoothingAlpha);
+        state.LastAppliedPpm = (nextRatio - 1.0) * 1_000_000.0;
+        return nextRatio;
     }
 }
 
@@ -682,11 +883,22 @@ public class MixingSampleProvider : ISampleProvider
     public long SyncCorrectionCount => _syncCoordinator.GetCorrectionCount(_consumerId);
     public long DroppedFrames => GetDroppedFramesForConsumer();
     public double OutputMovingAverageMs => _sampleRate > 0
-        ? Math.Round((_syncCoordinator.GetConsumerTargetFrames(_consumerId) * 1000.0) / _sampleRate, 1)
+        ? Math.Round((_syncCoordinator.GetConsumerBufferedFrames(_consumerId) * 1000.0) / _sampleRate, 1)
         : 0;
     public double OutputVariationRangeMs => _sampleRate > 0
-        ? Math.Round((_syncCoordinator.GetConsumerVariationRangeFrames(_consumerId) * 1000.0) / _sampleRate, 1)
+        ? (_syncCoordinator.GetConsumerVariationRangeFrames(_consumerId) * 1000.0) / _sampleRate
         : 0;
+    public double OutputVariationOffsetMs => _sampleRate > 0
+        ? (_syncCoordinator.GetConsumerSpreadToMasterFrames(_consumerId) * 1000.0) / _sampleRate
+        : 0;
+    public double OutputSyncErrorMs => _sampleRate > 0
+        ? Math.Round((_syncCoordinator.GetConsumerSmoothedErrorFrames(_consumerId) * 1000.0) / _sampleRate, 2)
+        : 0;
+    public double OutputSyncIntegralMs => _sampleRate > 0
+        ? Math.Round((_syncCoordinator.GetConsumerIntegralErrorFrames(_consumerId) * 1000.0) / _sampleRate, 2)
+        : 0;
+    public double OutputAppliedPpm => Math.Round(_syncCoordinator.GetConsumerAppliedPpm(_consumerId), 1);
+    public int OutputLastSlipFrames => _syncCoordinator.GetConsumerLastSlipFrames(_consumerId);
     public bool FastCatchUpActive => _syncCoordinator.IsFastCatchUpActive(_consumerId);
     public double FastCatchUpDutyPercent => Math.Round(_syncCoordinator.GetFastCatchUpDutyPercent(_consumerId), 1);
     public double SyncCorrectionRatePerSec => _sampleRate > 0

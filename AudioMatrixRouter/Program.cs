@@ -3,6 +3,7 @@ namespace AudioMatrixRouter;
 static class Program
 {
     private const string SingleInstanceMutexName = "AudioMatrixRouter.SingleInstance";
+    private const string ShowWindowEventName    = "AudioMatrixRouter.ShowWindow";
 
     [System.Runtime.InteropServices.DllImport("winmm.dll", ExactSpelling = true)]
     private static extern uint timeBeginPeriod(uint uPeriod);
@@ -16,11 +17,22 @@ static class Program
         using var mutex = new System.Threading.Mutex(true, SingleInstanceMutexName, out var createdNew);
         if (!createdNew)
         {
-            MessageBox.Show(
-                "Audio Router Matrix is already running.",
-                "Audio Router Matrix",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Information);
+            // Only signal the already-running instance to show itself when the user
+            // explicitly launched the app (not from a --startup / --minimized shortcut,
+            // which fires at boot when the app is already in the tray).
+            bool isStartupLaunch = args.Any(arg =>
+                string.Equals(arg, "--startup", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
+
+            if (!isStartupLaunch)
+            {
+                try
+                {
+                    using var ev = System.Threading.EventWaitHandle.OpenExisting(ShowWindowEventName);
+                    ev.Set();
+                }
+                catch { /* instance may have just exited; ignore */ }
+            }
             return;
         }
 
@@ -28,13 +40,20 @@ static class Program
             string.Equals(arg, "--startup", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
 
+        // Create the named event so a second instance can signal us.
+        using var showEvent = new System.Threading.EventWaitHandle(
+            false,
+            System.Threading.EventResetMode.AutoReset,
+            ShowWindowEventName);
+
         timeBeginPeriod(1);
         try
         {
             System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
             try
             {
-                System.Diagnostics.Process.GetCurrentProcess().PriorityClass = System.Diagnostics.ProcessPriorityClass.AboveNormal;
+                var process = System.Diagnostics.Process.GetCurrentProcess();
+                process.PriorityClass = System.Diagnostics.ProcessPriorityClass.RealTime;
             }
             catch
             {
@@ -42,7 +61,26 @@ static class Program
             }
 
             ApplicationConfiguration.Initialize();
-            Application.Run(new MainForm(startMinimized));
+            var form = new MainForm(startMinimized);
+
+            // Background thread: wait for second-instance signals and restore the window.
+            var showThread = new System.Threading.Thread(() =>
+            {
+                while (!form.IsDisposed)
+                {
+                    if (showEvent.WaitOne(500) && !form.IsDisposed)
+                    {
+                        form.BeginInvoke(form.ShowFromSecondInstance);
+                    }
+                }
+            })
+            {
+                IsBackground = true,
+                Name = "ShowWindowListener"
+            };
+            showThread.Start();
+
+            Application.Run(form);
         }
         finally
         {
