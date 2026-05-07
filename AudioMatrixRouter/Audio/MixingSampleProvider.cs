@@ -11,11 +11,11 @@ public sealed class OutputSyncCoordinator
     private const double MaxFollowerRatioPpm = 3000;            // More headroom for continuous drift correction
 
     // ===== Fast Catch-Up Mode =====
-    private const int FastCatchUpEnterErrorFrames = 30;         // Enter recovery sooner on real spikes
-    private const int FastCatchUpExitErrorFrames = 8;           // Exit only after very tight re-lock
+    private const int FastCatchUpEnterErrorFrames = 72;         // ~1.5ms at 48kHz — avoid triggering on CPU scheduling jitter
+    private const int FastCatchUpExitErrorFrames = 16;           // Exit only when genuinely re-locked
     private const int FastCatchUpEnterConfirmBlocks = 1;        // Spike recovery should react immediately
     private const int FastCatchUpMinHoldBlocks = 8;             // Keep recovery short but sufficient
-    private const double FastCatchUpMaxFollowerRatioPpm = 6200; // Stronger temporary correction during spike recovery
+    private const double FastCatchUpMaxFollowerRatioPpm = 3500; // 0.35% max pitch shift — audibly safe
 
     // ===== Guardrails =====
     private const int PostRecoveryUnderrunWindowBlocks = 80;    // Track underruns shortly after recovery
@@ -539,7 +539,25 @@ public sealed class OutputSyncCoordinator
             {
                 _totalMasterUnderruns += underrunDelta;
                 _recentUnderrunCount += underrunDelta;
-                _globalRefillHoldActive = true;
+
+                // Only pause all outputs (global refill hold) when a consumer is critically
+                // empty — buffer below half the floor. A few-frame deficit from the PI loop
+                // bottom is inaudible and must NOT cause a full silence gap across all outputs.
+                bool criticalEmpty = false;
+                foreach (var s in _states.Values)
+                {
+                    if (s.BufferedFrames >= 0 && s.HoldTargetFrames > 0
+                        && s.BufferedFrames < s.HoldTargetFrames / 2)
+                    {
+                        criticalEmpty = true;
+                        break;
+                    }
+                }
+
+                if (criticalEmpty)
+                {
+                    _globalRefillHoldActive = true;
+                }
 
                 // Permit a limited temporary dip in effective floor to recover from underruns,
                 // but keep it close to the user-selected base.
