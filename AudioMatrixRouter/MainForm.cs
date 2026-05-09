@@ -707,7 +707,11 @@ public sealed class MainForm : Form
         }
 
         var startMinimized = WindowState == FormWindowState.Minimized || !Visible || !ShowInTaskbar;
-        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _startupAtBoot, _uiPreferencesJson, _inputDeviceMode);
+        
+        // Load previous config to preserve dormant routes
+        var previousConfig = AppConfig.Load();
+        
+        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _startupAtBoot, _uiPreferencesJson, _inputDeviceMode, previousConfig);
         config.Save();
     }
 

@@ -34,6 +34,19 @@ public class OutputLatencyConfig
     public double BaseLatencyMs { get; set; }
 }
 
+public class DormantRouteConfig
+{
+    /// <summary>
+    /// Routes for unavailable/disconnected devices. Keyed by "inputDeviceId|outputDeviceId".
+    /// Each entry is an array of {inLocalChannel, outLocalChannel, gainDb}.
+    /// </summary>
+    public string InputDeviceId { get; set; } = "";
+    public string OutputDeviceId { get; set; } = "";
+    public int InputLocalChannel { get; set; }
+    public int OutputLocalChannel { get; set; }
+    public float GainDb { get; set; }
+}
+
 public class AppConfig
 {
     public WindowConfig Window { get; set; } = new();
@@ -41,6 +54,11 @@ public class AppConfig
     public List<DeviceConfig> OutputDevices { get; set; } = [];
     public List<CrosspointConfig> Crosspoints { get; set; } = [];
     public List<OutputLatencyConfig> OutputLatencies { get; set; } = [];
+    /// <summary>
+    /// Routes for devices that were previously configured but are not currently available.
+    /// These routes are never removed automatically and are restored when devices reconnect.
+    /// </summary>
+    public List<DormantRouteConfig> DormantRoutes { get; set; } = [];
     public bool Locked { get; set; }
     public bool StartupAtBoot { get; set; }
     public int InputBufferMs { get; set; } = 40;
@@ -118,7 +136,7 @@ public class AppConfig
         }
     }
 
-    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson, string inputDeviceMode)
+    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson, string inputDeviceMode, AppConfig? previousConfig = null)
     {
         var config = new AppConfig
         {
@@ -133,15 +151,24 @@ public class AppConfig
             UiPreferencesJson = uiPreferencesJson ?? ""
         };
 
+        // Build sets of active device IDs for comparison with dormant routes
+        var activeInputIds = new HashSet<string>();
+        var activeOutputIds = new HashSet<string>();
+
         foreach (var d in engine.InputDevices)
+        {
             config.InputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name, Channels = d.Info.Channels });
+            activeInputIds.Add(d.Info.Id);
+        }
         foreach (var d in engine.OutputDevices)
         {
             var baseLatencyMs = d.BaseLatencyMs;
             config.OutputDevices.Add(new DeviceConfig { Id = d.Info.Id, Name = d.Info.Name, Channels = d.Info.Channels });
             config.OutputLatencies.Add(new OutputLatencyConfig { DeviceId = d.Info.Id, DelayMs = d.OutputDelayMs, BaseLatencyMs = baseLatencyMs });
+            activeOutputIds.Add(d.Info.Id);
         }
 
+        // Save active routes
         var mat = engine.RoutingMatrix;
         for (int i = 0; i < mat.InputChannels; i++)
             for (int o = 0; o < mat.OutputChannels; o++)
@@ -150,6 +177,48 @@ public class AppConfig
                 if (cp.Active)
                     config.Crosspoints.Add(new CrosspointConfig { InCh = i, OutCh = o, GainDb = mat.GetGainDb(i, o) });
             }
+
+        // Preserve dormant routes from previous config for devices that are still unavailable.
+        // Only keep dormant routes if BOTH devices are still unavailable (not in active list).
+        if (previousConfig != null)
+        {
+            foreach (var dormant in previousConfig.DormantRoutes)
+            {
+                if (!activeInputIds.Contains(dormant.InputDeviceId) && 
+                    !activeOutputIds.Contains(dormant.OutputDeviceId))
+                {
+                    config.DormantRoutes.Add(dormant);
+                }
+            }
+        }
+
+        // Also capture dormant routes from the engine itself (routes that were just stored
+        // during device removal/refresh). Convert them to DormantRouteConfig format.
+        foreach (var engineDormant in engine.DormantRoutes)
+        {
+            if (!activeInputIds.Contains(engineDormant.InputDeviceId) &&
+                !activeOutputIds.Contains(engineDormant.OutputDeviceId))
+            {
+                // Check if this dormant route is already in the config
+                var existing = config.DormantRoutes.FirstOrDefault(d =>
+                    d.InputDeviceId == engineDormant.InputDeviceId &&
+                    d.InputLocalChannel == engineDormant.InputLocalChannel &&
+                    d.OutputDeviceId == engineDormant.OutputDeviceId &&
+                    d.OutputLocalChannel == engineDormant.OutputLocalChannel);
+
+                if (existing == null)
+                {
+                    config.DormantRoutes.Add(new DormantRouteConfig
+                    {
+                        InputDeviceId = engineDormant.InputDeviceId,
+                        InputLocalChannel = engineDormant.InputLocalChannel,
+                        OutputDeviceId = engineDormant.OutputDeviceId,
+                        OutputLocalChannel = engineDormant.OutputLocalChannel,
+                        GainDb = engineDormant.GainDb
+                    });
+                }
+            }
+        }
 
         return config;
     }
@@ -259,6 +328,29 @@ public class AppConfig
             int newIn = newInOffset + (cp.InCh - inDev.SavedOffset);
             int newOut = newOutOffset + (cp.OutCh - outDev.SavedOffset);
             engine.SetCrosspoint(newIn, newOut, true, cp.GainDb);
+        }
+
+        // Restore dormant routes when their devices reconnect.
+        // Dormant routes are routes for devices that were previously configured but have been disconnected.
+        // When they reconnect, automatically restore their previous routing.
+        foreach (var dormant in DormantRoutes)
+        {
+            // Check if both devices are now available
+            if (!newInputOffsets.TryGetValue(dormant.InputDeviceId, out var dormantInOffset)) continue;
+            if (!newOutputOffsets.TryGetValue(dormant.OutputDeviceId, out var dormantOutOffset)) continue;
+
+            // Calculate the global channel indices for this route
+            int dormantInGlobal = dormantInOffset + dormant.InputLocalChannel;
+            int dormantOutGlobal = dormantOutOffset + dormant.OutputLocalChannel;
+
+            // Validate channel indices are within bounds
+            int totalInChannels = engine.TotalInputChannels;
+            int totalOutChannels = engine.TotalOutputChannels;
+            if (dormantInGlobal < 0 || dormantInGlobal >= totalInChannels) continue;
+            if (dormantOutGlobal < 0 || dormantOutGlobal >= totalOutChannels) continue;
+
+            // Restore the route
+            engine.SetCrosspoint(dormantInGlobal, dormantOutGlobal, true, dormant.GainDb);
         }
     }
 

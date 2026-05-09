@@ -42,8 +42,14 @@ public class AudioEngine : IDisposable
     private OutputSyncCoordinator? _syncCoordinator;
     private int _inputBufferMs = DefaultInputRingBufferMs;
     private int _outputBufferMs = DefaultOutputBufferMs;
+    
+    /// <summary>
+    /// Stores routes that were active but whose devices became unavailable.
+    /// These routes are preserved so they can be restored when devices reconnect.
+    /// </summary>
+    private readonly List<RoutedCrosspoint> _dormantRoutes = [];
 
-    private readonly record struct RoutedCrosspoint(
+    public readonly record struct RoutedCrosspoint(
         string InputDeviceId,
         int InputLocalChannel,
         string OutputDeviceId,
@@ -57,6 +63,7 @@ public class AudioEngine : IDisposable
     public IReadOnlyList<ActiveDevice> InputDevices => _inputDevices;
     public IReadOnlyList<ActiveDevice> OutputDevices => _outputDevices;
     public RoutingMatrix RoutingMatrix => _routingMatrix;
+    public IReadOnlyList<RoutedCrosspoint> DormantRoutes => _dormantRoutes;
     public bool IsRunning => _running;
     public DeviceEnumerator Enumerator => _enumerator;
 
@@ -325,6 +332,10 @@ public class AudioEngine : IDisposable
         var ad = new ActiveDevice { Info = found, IsLoopback = isLoopback };
         _inputDevices.Add(ad);
         RecalcChannelOffsets();
+        
+        // Clear dormant routes for this device since it's now active
+        _dormantRoutes.RemoveAll(r => r.InputDeviceId == deviceId);
+        
         StateChanged?.Invoke();
         return true;
     }
@@ -343,6 +354,10 @@ public class AudioEngine : IDisposable
         };
         _outputDevices.Add(ad);
         RecalcChannelOffsets();
+        
+        // Clear dormant routes for this device since it's now active
+        _dormantRoutes.RemoveAll(r => r.OutputDeviceId == deviceId);
+        
         StateChanged?.Invoke();
         return true;
     }
@@ -366,6 +381,11 @@ public class AudioEngine : IDisposable
     public void RemoveInputDevice(int index)
     {
         if (index < 0 || index >= _inputDevices.Count) return;
+        
+        // Capture routes for this device before removing it
+        var deviceToRemove = _inputDevices[index];
+        CaptureRoutesForRemovedDevices(new List<ActiveDevice> { deviceToRemove }, new List<ActiveDevice>());
+        
         var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
         if (wasRunning) Stop();
@@ -379,6 +399,11 @@ public class AudioEngine : IDisposable
     public void RemoveOutputDevice(int index)
     {
         if (index < 0 || index >= _outputDevices.Count) return;
+        
+        // Capture routes for this device before removing it
+        var deviceToRemove = _outputDevices[index];
+        CaptureRoutesForRemovedDevices(new List<ActiveDevice>(), new List<ActiveDevice> { deviceToRemove });
+        
         var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
         if (wasRunning) Stop();
@@ -839,13 +864,19 @@ public class AudioEngine : IDisposable
             return captures.Any(c => c.Id == input.Info.Id);
         }
 
-        bool changed = _inputDevices.Any(d => !IsInputStillAvailable(d, captureDevices, renderDevices))
-            || _outputDevices.Any(d => !renderDevices.Any(rd => rd.Id == d.Info.Id));
+        // Identify inputs and outputs that will be removed
+        var inputsToRemove = _inputDevices.Where(d => !IsInputStillAvailable(d, captureDevices, renderDevices)).ToList();
+        var outputsToRemove = _outputDevices.Where(d => !renderDevices.Any(rd => rd.Id == d.Info.Id)).ToList();
+
+        bool changed = inputsToRemove.Count > 0 || outputsToRemove.Count > 0;
 
         if (!changed)
         {
             return;
         }
+
+        // Capture routes for devices that are being removed, before removing them
+        CaptureRoutesForRemovedDevices(inputsToRemove, outputsToRemove);
 
         var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
@@ -878,6 +909,70 @@ public class AudioEngine : IDisposable
         }
 
         StateChanged?.Invoke();
+    }
+
+    private void CaptureRoutesForRemovedDevices(List<ActiveDevice> inputsToRemove, List<ActiveDevice> outputsToRemove)
+    {
+        var removedInputIds = new HashSet<string>(inputsToRemove.Select(d => d.Info.Id));
+        var removedOutputIds = new HashSet<string>(outputsToRemove.Select(d => d.Info.Id));
+
+        if (removedInputIds.Count == 0 || removedOutputIds.Count == 0)
+            return;
+
+        var front = _routingMatrix.GetFrontBuffer();
+        if (front.Length == 0 || _routingMatrix.OutputChannels == 0)
+            return;
+
+        int outChannels = _routingMatrix.OutputChannels;
+        for (int inCh = 0; inCh < _routingMatrix.InputChannels; inCh++)
+        {
+            for (int outCh = 0; outCh < outChannels; outCh++)
+            {
+                int idx = inCh * outChannels + outCh;
+                if (idx < 0 || idx >= front.Length) continue;
+
+                var cp = front[idx];
+                if (!cp.Active) continue;
+
+                var inDevice = FindInputDeviceByChannel(inCh);
+                var outDevice = FindOutputDeviceByChannel(outCh);
+                if (inDevice == null || outDevice == null) continue;
+
+                // Only capture if at least one device is being removed
+                if (!removedInputIds.Contains(inDevice.Info.Id) && !removedOutputIds.Contains(outDevice.Info.Id))
+                    continue;
+
+                int inLocal = inCh - inDevice.GlobalChannelOffset;
+                int outLocal = outCh - outDevice.GlobalChannelOffset;
+                if (inLocal < 0 || outLocal < 0) continue;
+
+                float gainDb = cp.Gain <= 0f ? -60f : 20f * MathF.Log10(cp.Gain);
+                
+                // Add or update this route in dormant routes
+                var existing = _dormantRoutes.FirstOrDefault(r =>
+                    r.InputDeviceId == inDevice.Info.Id &&
+                    r.InputLocalChannel == inLocal &&
+                    r.OutputDeviceId == outDevice.Info.Id &&
+                    r.OutputLocalChannel == outLocal);
+                
+                if (existing == default)
+                {
+                    _dormantRoutes.Add(new RoutedCrosspoint(
+                        inDevice.Info.Id,
+                        inLocal,
+                        outDevice.Info.Id,
+                        outLocal,
+                        cp.Active,
+                        gainDb));
+                }
+                else
+                {
+                    // Update the gain if it changed
+                    var index = _dormantRoutes.IndexOf(existing);
+                    _dormantRoutes[index] = existing with { GainDb = gainDb };
+                }
+            }
+        }
     }
 
     private List<RoutedCrosspoint> CaptureRoutedCrosspoints()
