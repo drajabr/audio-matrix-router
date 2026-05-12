@@ -14,6 +14,10 @@ public class RingBuffer
     private readonly object _cursorLock = new();
     private readonly Dictionary<string, int> _consumerReadPos = new(StringComparer.Ordinal);
     private readonly Dictionary<string, long> _consumerDroppedFrames = new(StringComparer.Ordinal);
+    // Reused buffer for ordering consumer keys during the Write() trim path. Allocating a
+    // fresh List<string> on every overflowed write created GC pressure on the WASAPI capture
+    // thread under load. Always accessed under _cursorLock so it's single-threaded.
+    private readonly List<string> _trimKeysScratch = new();
     private string _preferredConsumerId = string.Empty;
     private long _totalFramesDropped;
 
@@ -137,17 +141,22 @@ public class RingBuffer
                 // Realtime policy: if a consumer lags too far behind, drop its oldest samples
                 // so producer never stalls all outputs.
                 int allowedUnread = _capacity - 1 - samples;
-                var keys = new List<string>(_consumerReadPos.Keys);
+                _trimKeysScratch.Clear();
+                foreach (var k in _consumerReadPos.Keys)
+                {
+                    _trimKeysScratch.Add(k);
+                }
 
                 // Followers are trimmed first. Keep the preferred consumer as the last one
                 // to be advanced so master timing remains as stable as possible.
-                if (!string.IsNullOrWhiteSpace(_preferredConsumerId) && keys.Remove(_preferredConsumerId))
+                if (!string.IsNullOrWhiteSpace(_preferredConsumerId) && _trimKeysScratch.Remove(_preferredConsumerId))
                 {
-                    keys.Add(_preferredConsumerId);
+                    _trimKeysScratch.Add(_preferredConsumerId);
                 }
 
-                foreach (var key in keys)
+                for (int ki = 0; ki < _trimKeysScratch.Count; ki++)
                 {
+                    var key = _trimKeysScratch[ki];
                     int rp = _consumerReadPos[key];
                     int unread = (wp - rp + _capacity) % _capacity;
                     if (unread <= allowedUnread) continue;

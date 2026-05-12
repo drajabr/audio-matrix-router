@@ -332,10 +332,9 @@ public class AudioEngine : IDisposable
         var ad = new ActiveDevice { Info = found, IsLoopback = isLoopback };
         _inputDevices.Add(ad);
         RecalcChannelOffsets();
-        
-        // Clear dormant routes for this device since it's now active
-        _dormantRoutes.RemoveAll(r => r.InputDeviceId == deviceId);
-        
+
+        RestoreDormantRoutesForInputDevice(deviceId);
+
         StateChanged?.Invoke();
         return true;
     }
@@ -354,12 +353,65 @@ public class AudioEngine : IDisposable
         };
         _outputDevices.Add(ad);
         RecalcChannelOffsets();
-        
-        // Clear dormant routes for this device since it's now active
-        _dormantRoutes.RemoveAll(r => r.OutputDeviceId == deviceId);
-        
+
+        RestoreDormantRoutesForOutputDevice(deviceId);
+
         StateChanged?.Invoke();
         return true;
+    }
+
+    private void RestoreDormantRoutesForInputDevice(string inputDeviceId)
+    {
+        // Re-establish any saved routes for this input whose paired output is currently active.
+        // Routes that pair with a still-disconnected output stay dormant.
+        var inDev = _inputDevices.FirstOrDefault(d => d.Info.Id == inputDeviceId);
+        if (inDev == null) return;
+
+        var restored = new List<RoutedCrosspoint>();
+        foreach (var dormant in _dormantRoutes.Where(r => r.InputDeviceId == inputDeviceId).ToList())
+        {
+            var outDev = _outputDevices.FirstOrDefault(d => d.Info.Id == dormant.OutputDeviceId);
+            if (outDev == null) continue;
+            if (dormant.InputLocalChannel < 0 || dormant.InputLocalChannel >= inDev.Info.Channels) continue;
+            if (dormant.OutputLocalChannel < 0 || dormant.OutputLocalChannel >= outDev.Info.Channels) continue;
+
+            int inGlobal = inDev.GlobalChannelOffset + dormant.InputLocalChannel;
+            int outGlobal = outDev.GlobalChannelOffset + dormant.OutputLocalChannel;
+            _routingMatrix.SetCrosspoint(inGlobal, outGlobal, dormant.Active, dormant.GainDb);
+            restored.Add(dormant);
+        }
+
+        if (restored.Count > 0)
+        {
+            foreach (var r in restored) _dormantRoutes.Remove(r);
+            _routingMatrix.Publish();
+        }
+    }
+
+    private void RestoreDormantRoutesForOutputDevice(string outputDeviceId)
+    {
+        var outDev = _outputDevices.FirstOrDefault(d => d.Info.Id == outputDeviceId);
+        if (outDev == null) return;
+
+        var restored = new List<RoutedCrosspoint>();
+        foreach (var dormant in _dormantRoutes.Where(r => r.OutputDeviceId == outputDeviceId).ToList())
+        {
+            var inDev = _inputDevices.FirstOrDefault(d => d.Info.Id == dormant.InputDeviceId);
+            if (inDev == null) continue;
+            if (dormant.InputLocalChannel < 0 || dormant.InputLocalChannel >= inDev.Info.Channels) continue;
+            if (dormant.OutputLocalChannel < 0 || dormant.OutputLocalChannel >= outDev.Info.Channels) continue;
+
+            int inGlobal = inDev.GlobalChannelOffset + dormant.InputLocalChannel;
+            int outGlobal = outDev.GlobalChannelOffset + dormant.OutputLocalChannel;
+            _routingMatrix.SetCrosspoint(inGlobal, outGlobal, dormant.Active, dormant.GainDb);
+            restored.Add(dormant);
+        }
+
+        if (restored.Count > 0)
+        {
+            foreach (var r in restored) _dormantRoutes.Remove(r);
+            _routingMatrix.Publish();
+        }
     }
 
     public bool RemoveInputDevice(string deviceId)
@@ -661,6 +713,13 @@ public class AudioEngine : IDisposable
 
         dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
         int channels = dev.Info.Channels;
+        // Reusable scratch for the WASAPI capture thread. NAudio's WasapiCapture exposes
+        // its packed-byte buffer via DataAvailable; we have to convert to float32 to fan out
+        // through the matrix. Allocating a fresh float[] every callback creates ~100 GC-tier
+        // allocations/sec per capture device, which under a game's CPU pressure causes Gen0
+        // collections that briefly stall the audio thread → overrun → ring trim → audible glitch.
+        // The scratch is owned only by this DataAvailable handler (single-threaded by NAudio).
+        float[] captureScratch = [];
         dev.Capture.DataAvailable += (s, e) =>
         {
             if (dev.RingBuffer == null)
@@ -669,9 +728,17 @@ public class AudioEngine : IDisposable
             }
 
             int floatCount = e.BytesRecorded / 4;
+            if (floatCount <= 0) return;
             int frames = floatCount / channels;
-            var floats = new float[floatCount];
-            Buffer.BlockCopy(e.Buffer, 0, floats, 0, e.BytesRecorded);
+
+            if (captureScratch.Length < floatCount)
+            {
+                // Grow with headroom so common jitter (callback delivering 2x frames after a stall)
+                // doesn't reallocate. Power-of-two-ish growth is fine.
+                int newSize = Math.Max(floatCount, captureScratch.Length * 2);
+                captureScratch = new float[newSize];
+            }
+            Buffer.BlockCopy(e.Buffer, 0, captureScratch, 0, e.BytesRecorded);
 
             var peaks = dev.PeakLevels;
             if (peaks != null)
@@ -681,14 +748,14 @@ public class AudioEngine : IDisposable
                     int baseIdx = f * channels;
                     for (int c = 0; c < channels; c++)
                     {
-                        float v = floats[baseIdx + c];
+                        float v = captureScratch[baseIdx + c];
                         if (v < 0) v = -v;
                         if (v > peaks[c]) peaks[c] = v;
                     }
                 }
             }
 
-            if (!dev.RingBuffer.Write(floats, 0, frames))
+            if (!dev.RingBuffer.Write(captureScratch, 0, frames))
             {
                 Interlocked.Increment(ref dev.InputOverflowCount);
             }
@@ -868,7 +935,34 @@ public class AudioEngine : IDisposable
         var inputsToRemove = _inputDevices.Where(d => !IsInputStillAvailable(d, captureDevices, renderDevices)).ToList();
         var outputsToRemove = _outputDevices.Where(d => !renderDevices.Any(rd => rd.Id == d.Info.Id)).ToList();
 
-        bool changed = inputsToRemove.Count > 0 || outputsToRemove.Count > 0;
+        // Identify devices that have reappeared and have dormant routes waiting on them.
+        // This is the path that brings monitor/HDMI tiles back when displays wake up.
+        var activeInputIds = new HashSet<string>(_inputDevices.Select(d => d.Info.Id), StringComparer.Ordinal);
+        var activeOutputIds = new HashSet<string>(_outputDevices.Select(d => d.Info.Id), StringComparer.Ordinal);
+
+        bool InputAvailable(string id)
+        {
+            if (id.StartsWith("loop:", StringComparison.Ordinal))
+            {
+                var renderId = id.Substring("loop:".Length);
+                return renderDevices.Any(r => r.Id == renderId);
+            }
+            return captureDevices.Any(c => c.Id == id);
+        }
+
+        var inputsToReattach = _dormantRoutes
+            .Select(r => r.InputDeviceId)
+            .Where(id => !activeInputIds.Contains(id) && InputAvailable(id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var outputsToReattach = _dormantRoutes
+            .Select(r => r.OutputDeviceId)
+            .Where(id => !activeOutputIds.Contains(id) && renderDevices.Any(d => d.Id == id))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        bool changed = inputsToRemove.Count > 0 || outputsToRemove.Count > 0
+            || inputsToReattach.Count > 0 || outputsToReattach.Count > 0;
 
         if (!changed)
         {
@@ -902,6 +996,18 @@ public class AudioEngine : IDisposable
 
         RecalcChannelOffsets();
         RestoreRoutedCrosspoints(routeSnapshot);
+
+        // Reattach devices that came back online (e.g. monitor woke up). AddInput/Output
+        // will run RestoreDormantRoutesForXxxDevice and re-establish their routes against
+        // any peer that's also currently active.
+        foreach (var id in inputsToReattach)
+        {
+            AddInputDevice(id);
+        }
+        foreach (var id in outputsToReattach)
+        {
+            AddOutputDevice(id);
+        }
 
         if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints())
         {

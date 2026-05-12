@@ -178,44 +178,88 @@ public class AppConfig
                     config.Crosspoints.Add(new CrosspointConfig { InCh = i, OutCh = o, GainDb = mat.GetGainDb(i, o) });
             }
 
-        // Preserve dormant routes from previous config for devices that are still unavailable.
-        // Only keep dormant routes if BOTH devices are still unavailable (not in active list).
+        // Preserve dormant routes from previous config. We persist EVERY known dormant
+        // route, regardless of whether one or both of its endpoints happen to be active
+        // right now. Reason: a route may be partially restorable (one peer reconnected,
+        // the other still gone). The engine's RestoreDormantRoutesForXxxDevice helpers
+        // remove an entry from _dormantRoutes only when both peers are present and the
+        // crosspoint is actually re-established. Anything still in _dormantRoutes after
+        // a save belongs on disk — otherwise reconnecting a single peer (input OR output)
+        // would silently drop the route from the file and the next disconnect would
+        // permanently forget it. Policy: a route is forgotten only by explicit user
+        // deletion.
         if (previousConfig != null)
         {
             foreach (var dormant in previousConfig.DormantRoutes)
             {
-                if (!activeInputIds.Contains(dormant.InputDeviceId) && 
-                    !activeOutputIds.Contains(dormant.OutputDeviceId))
-                {
-                    config.DormantRoutes.Add(dormant);
-                }
+                config.DormantRoutes.Add(dormant);
             }
         }
 
         // Also capture dormant routes from the engine itself (routes that were just stored
-        // during device removal/refresh). Convert them to DormantRouteConfig format.
+        // during device removal/refresh). Convert them to DormantRouteConfig format and
+        // dedupe against any already carried over from previousConfig.
         foreach (var engineDormant in engine.DormantRoutes)
         {
-            if (!activeInputIds.Contains(engineDormant.InputDeviceId) &&
-                !activeOutputIds.Contains(engineDormant.OutputDeviceId))
-            {
-                // Check if this dormant route is already in the config
-                var existing = config.DormantRoutes.FirstOrDefault(d =>
-                    d.InputDeviceId == engineDormant.InputDeviceId &&
-                    d.InputLocalChannel == engineDormant.InputLocalChannel &&
-                    d.OutputDeviceId == engineDormant.OutputDeviceId &&
-                    d.OutputLocalChannel == engineDormant.OutputLocalChannel);
+            var existing = config.DormantRoutes.FirstOrDefault(d =>
+                d.InputDeviceId == engineDormant.InputDeviceId &&
+                d.InputLocalChannel == engineDormant.InputLocalChannel &&
+                d.OutputDeviceId == engineDormant.OutputDeviceId &&
+                d.OutputLocalChannel == engineDormant.OutputLocalChannel);
 
-                if (existing == null)
+            if (existing == null)
+            {
+                config.DormantRoutes.Add(new DormantRouteConfig
                 {
-                    config.DormantRoutes.Add(new DormantRouteConfig
+                    InputDeviceId = engineDormant.InputDeviceId,
+                    InputLocalChannel = engineDormant.InputLocalChannel,
+                    OutputDeviceId = engineDormant.OutputDeviceId,
+                    OutputLocalChannel = engineDormant.OutputLocalChannel,
+                    GainDb = engineDormant.GainDb
+                });
+            }
+            else
+            {
+                // Refresh gain in case the engine's copy is more recent than the previous file's.
+                existing.GainDb = engineDormant.GainDb;
+            }
+        }
+
+        // Preserve device metadata (Id/Name/Channels) for any device that is referenced by a
+        // persisted dormant route but is not currently in the active list. Without this, the
+        // device entry vanishes from disk the moment it's offline, which (a) loses the friendly
+        // name + channel count needed by ApplyToEngine's saved-offset remap and (b) prevents
+        // the auto-add-on-launch path in MainForm from re-adding the device when it returns.
+        // Combined with the dormant-route persistence above, this gives the "never forget a
+        // device that was ever used in a tile" guarantee.
+        var dormantInputIds = config.DormantRoutes.Select(d => d.InputDeviceId).Distinct(StringComparer.Ordinal);
+        var dormantOutputIds = config.DormantRoutes.Select(d => d.OutputDeviceId).Distinct(StringComparer.Ordinal);
+
+        if (previousConfig != null)
+        {
+            foreach (var id in dormantInputIds)
+            {
+                if (activeInputIds.Contains(id)) continue;
+                if (config.InputDevices.Any(d => d.Id == id)) continue;
+                var prev = previousConfig.InputDevices.FirstOrDefault(d => d.Id == id);
+                if (prev != null)
+                {
+                    config.InputDevices.Add(new DeviceConfig { Id = prev.Id, Name = prev.Name, Channels = prev.Channels });
+                }
+            }
+            foreach (var id in dormantOutputIds)
+            {
+                if (activeOutputIds.Contains(id)) continue;
+                if (config.OutputDevices.Any(d => d.Id == id)) continue;
+                var prev = previousConfig.OutputDevices.FirstOrDefault(d => d.Id == id);
+                if (prev != null)
+                {
+                    config.OutputDevices.Add(new DeviceConfig { Id = prev.Id, Name = prev.Name, Channels = prev.Channels });
+                    var prevLatency = previousConfig.OutputLatencies.FirstOrDefault(l => l.DeviceId == id);
+                    if (prevLatency != null)
                     {
-                        InputDeviceId = engineDormant.InputDeviceId,
-                        InputLocalChannel = engineDormant.InputLocalChannel,
-                        OutputDeviceId = engineDormant.OutputDeviceId,
-                        OutputLocalChannel = engineDormant.OutputLocalChannel,
-                        GainDb = engineDormant.GainDb
-                    });
+                        config.OutputLatencies.Add(prevLatency);
+                    }
                 }
             }
         }
