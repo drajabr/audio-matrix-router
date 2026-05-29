@@ -1,16 +1,11 @@
 {
-  "name": "audio-router-matrix-web",
+  "name": "audio-router-matrix-desktop-ui",
   "private": true,
   "version": "0.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "npm run build:windows",
-    "build:web": "vite build --mode web",
-    "build:windows": "vite build --mode windows",
-    "build:gh-pages": "npm run build:web",
-    "predeploy": "npm run build:web",
-    "deploy": "gh-pages -d dist",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -21,7 +16,6 @@
   "devDependencies": {
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.20",
-    "gh-pages": "^6.3.0",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.13",
     "vite": "^5.4.8"
