@@ -49,14 +49,13 @@ Core project folders:
 ```powershell
 git clone https://github.com/drajabr/audio-matrix-router.git
 cd audio-matrix-router
-./build-all.ps1
+./build.ps1
 ./build/desktop/AudioMatrixRouter.exe
 ```
 
 The build script outputs:
 
-- build/web: static web build (Pages mode).
-- build/desktop: desktop app publish output.
+- build/desktop: desktop app publish output (WinForms host + bundled WebView2 UI).
 
 ## Run In Development
 

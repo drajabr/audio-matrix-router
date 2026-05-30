@@ -27,8 +27,8 @@ public class ActiveDevice
 
 public class AudioEngine : IDisposable
 {
-    private const int DefaultInputRingBufferMs = 40;
-    private const int DefaultOutputBufferMs = 40;
+    private const int DefaultInputRingBufferMs = 80;
+    private const int DefaultOutputBufferMs = 100;
     // Keep ring buffers at a stable ceiling to avoid producer/consumer rewire glitches at runtime.
     // The input buffer slider controls WASAPI capture period, while rings provide spike headroom.
     private const int RingBufferCapacityMs = 400;
@@ -522,6 +522,25 @@ public class AudioEngine : IDisposable
         try
         {
             var masterOutput = GetOutputMasterDevice() ?? _outputDevices.First();
+
+            // The mixer reads source-rate samples block-by-block at the output's nominal rate
+            // without resampling. If a routed input runs at a different sample rate than its
+            // destination output, the result is pitch-shifted audio. Surface this loudly in the
+            // debug log so it can be diagnosed from field reports; the engine still starts so
+            // matched-rate routes keep working.
+            foreach (var outDev in _outputDevices)
+            {
+                foreach (var inDev in _inputDevices)
+                {
+                    if (inDev.Info.SampleRate > 0
+                        && outDev.Info.SampleRate > 0
+                        && inDev.Info.SampleRate != outDev.Info.SampleRate)
+                    {
+                        System.Diagnostics.Debug.WriteLine(
+                            $"[AudioEngine] WARNING: sample-rate mismatch — input '{inDev.Info.Name}' @ {inDev.Info.SampleRate} Hz routed to output '{outDev.Info.Name}' @ {outDev.Info.SampleRate} Hz will play at the wrong pitch (no SRC).");
+                    }
+                }
+            }
 
             // Setup captures
             foreach (var dev in _inputDevices)

@@ -79,13 +79,13 @@ const FONT_SIZE_PRESETS = [
 ];
 
 const UI_SCALE_PRESETS = [
-  { key: "xxxs", label: "XXS", scale: 0.70 },
-  { key: "xxs", label: "XS", scale: 0.78 },
-  { key: "xs", label: "SM", scale: 0.86 },
-  { key: "sm", label: "MD", scale: 0.93 },
-  { key: "md", label: "LG", scale: 1.0 },
-  { key: "lg", label: "XL", scale: 1.08 },
-  { key: "xl", label: "XXL", scale: 1.16 },
+  { key: "xxs", label: "XXS", scale: 0.78 },
+  { key: "xs", label: "XS", scale: 0.86 },
+  { key: "sm", label: "SM", scale: 0.93 },
+  { key: "md", label: "MD", scale: 1.0 },
+  { key: "lg", label: "LG", scale: 1.08 },
+  { key: "xl", label: "XL", scale: 1.16 },
+  { key: "xxl", label: "XXL", scale: 1.25 },
 ];
 
 function getDynamicLabelSquareMax(uiScale = 1) {
@@ -842,7 +842,12 @@ class AudioMatrixManager {
   }
 }
 
-export default function App({ runtime = "web" }) {
+// Desktop-only build: runtime is always the WebView2 host. The `runtime`
+// label is kept for ARIA strings; web/PWA build target has been removed.
+const RUNTIME_LABEL = "windows";
+
+export default function App() {
+  const runtime = RUNTIME_LABEL;
   const managerRef = useRef(new AudioMatrixManager());
   const rafRef = useRef(null);
   const hasNativeBridge = ensureNativeBridge();
@@ -3845,7 +3850,7 @@ export default function App({ runtime = "web" }) {
               <h1>Audio Matrix Patch</h1>
               <span className="brand-version-pill">{APP_VERSION}</span>
             </div>
-            <p>{contextState === "running" ? `Running · ${latencyLabel}` : "Standby"}</p>
+            <p>{(hasNativeBridge ? powerOn : contextState === "running") ? `Running · ${latencyLabel}` : "Standby"}</p>
           </div>
         </div>
 

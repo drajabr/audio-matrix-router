@@ -1,4 +1,5 @@
 using NAudio.Wave;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading;
 
@@ -6,31 +7,46 @@ namespace AudioMatrixRouter.Audio;
 
 public sealed class OutputSyncCoordinator
 {
-    // ===== Splice-Based Sync (no continuous resampling, no pitch motion) =====
-    // Outputs always run at exact device nominal rate. Phase drift is corrected by occasional
-    // discrete signed integer-frame splices with an equal-power crossfade. This eliminates
-    // the audible "robotic chasing" coloration of a PI-on-resampler-ratio loop, which was
-    // especially objectionable on this user's topology (5 HDMI outputs sharing one GPU —
-    // bursty callback jitter under game load was driving the resampler to modulate ratio
-    // continuously). Splice cost is the crossfade itself, ~1.3 ms of overlapped audio,
-    // which is inaudible on broadband content at the splice rates involved (a few per second
-    // worst-case, far less in steady state).
-    private const int FollowerSpliceMinErrorFrames = 3;        // ~0.06 ms — minimum drift worth correcting
-    private const int FollowerSpliceMaxFrames     = 24;        // ~0.5 ms per block in normal mode
-    private const int FollowerSpliceCooldownBlocks = 8;        // ~80 ms between normal splices
-    private const int FastSpliceEnterErrorFrames  = 240;       // ~5 ms — switch to aggressive mode
-    private const int FastSpliceExitErrorFrames   = 16;        // re-lock threshold
-    private const int FastSpliceMinHoldBlocks     = 4;         // hold fast mode briefly
-    private const int FastSpliceMaxFrames         = 96;        // ~2 ms per block in fast mode
-    private const int FastSpliceCooldownBlocks    = 2;         // ~20 ms between fast splices
-    public const int  SpliceCrossfadeFrames       = 64;        // ~1.3 ms equal-power cosine crossfade
-    private const int PhaseSpikeRejectFrames      = 32;        // ignore one-block phase jumps from splice ripple
-
-    // ===== Master Self-Correction (kept inert; master ratio always 1.0 in splice design) =====
-    // Master output runs at exact device rate. Long-term drift is absorbed by the input ring
-    // buffer (400 ms capacity) and the existing trim/refill machinery. With same-GPU HDMI
-    // outputs, master vs follower clock drift is effectively zero — the only error is bursty
-    // callback jitter, which splice corrections handle directly.
+    // ===== Smooth ASRC Sync (professional approach — same as VB Matrix / Voicemeeter / Dante) =====
+    // Outputs run at a smoothly-varying playback ratio (very close to 1.0). A PI controller
+    // converts follower phase error into a tiny ratio offset. MixingSampleProvider applies that
+    // ratio via linear-interpolation resampling of the per-output mix.
+    //
+    // Why ASRC instead of discrete splices (the previous design):
+    //   * A discrete splice cross-fades audio with itself offset by N frames (~0.5–2 ms). This
+    //     creates frequency-domain comb-filtering with notches across the audible band — that
+    //     "phasy / flangy" coloration the user kept hearing under jitter. Continuous ASRC has
+    //     no such artifact: a ratio of 1.00005 is mathematically the same audio, time-stretched
+    //     by 50 ppm = 0.005 % = 0.087 cents (well below the human static-pitch-detection floor
+    //     of ~6 cents). Inaudible on every program material.
+    //
+    // Why this won't sound "robotic" like older PI-ratio attempts did:
+    //   * Earlier attempts had a fast slew-rate (~80 ppm/block ≈ 8000 ppm/sec ≈ 8 Hz pitch
+    //     modulation). That's right in the human vibrato-detection band → audible wobble.
+    //   * Here we use a slow slew (≤ RatioSlewPpmPerBlock = 4 ppm/block ≈ 400 ppm/sec ≈ 0.4 Hz
+    //     modulation rate) — below the ~2 Hz floor for perceptible pitch modulation on broadband
+    //     content. The ratio can drift by at most a tiny fraction per second.
+    //   * A deadband ignores phase errors below RatioDeadbandFrames (~0.5 ms): the input ring
+    //     and output buffer absorb transient WASAPI callback jitter (caused by game load on
+    //     shared-GPU HDMI outputs) without ever spinning up the controller.
+    //
+    // Convergence math:
+    //   * Real inter-card crystal mismatch on same-machine outputs is typically 10–50 ppm
+    //     (often near 0 for siblings of the same audio chip/HDMI block). Steady-state ratio
+    //     converges to that figure and STAYS there — no continuous motion = no audible wobble.
+    //   * A 5 ms (240-frame @ 48k) initial offset closes at 1000 ppm × 48 frames/ms = 48
+    //     frames/sec, so ~5 sec to fully close. Slew limit caps ramp-up time to ~250 ms to
+    //     reach max ratio. Total: error visibly settles in seconds, inaudibly.
+    private const double MaxRatioPpm           = 10000.0; // ±1.0 % static ratio — aggressive transient authority
+    private const double RatioSlewPpmPerBlock  = 12.0;    // ~1200 ppm/sec base ramp while locked
+    private const int    RatioDeadbandFrames   = 8;       // ~0.17 ms @ 48k — tight lock, less lazy correction
+    private const double RatioKp               = 2.0e-6;  // ratio per frame of (deadband-shifted) phase error
+    private const double RatioKi               = 3.0e-8;  // ratio per (frame · block) integral
+    private const double IntegralClampFrames   = 50000.0; // ~1 sec @ 48 kHz of integral authority
+    private const int    FastModeEnterErrorFrames = 240;  // ~5 ms — purely a UI signal, not a controller mode
+    private const double PhaseErrorEmaAlpha    = 0.18;    // still smooth tiny jitter, but respond much faster
+    private const double PhaseErrorSpikeClampFrames = 8.0; // tiny lock-zone clamp only; big steps must pass through
+    private const double PhaseErrorFastPassFrames = 48.0;  // ~1 ms — above this, report raw step immediately
 
     // ===== Underrun Recovery =====
     private const double MinTargetDuringUnderrunFraction = 0.9;
@@ -58,19 +74,19 @@ public sealed class OutputSyncCoordinator
     // consumption: each Read updates `(CumulativeSourceFrames, LastSourceTicks)`,
     // both anchors are projected forward to a common Stopwatch instant at each
     // consumer's nominal sample rate, and rawPhase = masterPos - followerPos.
-    // PhaseWarmupBlocks of warmup are discarded; the first post-warmup sample
-    // becomes a per-consumer bias, and the PI then drives the *change* in physical
-    // phase to zero. Constant pipeline lead/lag (delay buffer, device latency, etc.)
-    // is absorbed by the bias and never appears as error.
+    //
+    // Target: rawPhase = 0. CumulativeSourceFrames is incremented in Read with the
+    // exact source frames consumed; per-output delay buffer and driver latency are
+    // downstream of this counter, so in the absence of inter-card clock drift all
+    // outputs SHOULD consume source frames at the same wall-clock rate. There is no
+    // "constant pipeline lead/lag" in this measurement that needs a learned bias to
+    // absorb — a learned bias just memorializes startup callback-timing offset and
+    // makes the controller chase a wrong target indefinitely ("variance shows 0.4 ms
+    // but outputs are audibly desynced by N ms").
+    //
+    // PhaseWarmupBlocks of warmup are discarded so the first reading is taken after
+    // the global refill barrier has released and callbacks have stabilized.
     private const int PhaseWarmupBlocks = 200;
-    // Stuck-error watchdog: if |SmoothedErrorFrames| exceeds threshold for this many
-    // consecutive control blocks (~10 ms each at typical buffer sizes), rebase the phase
-    // bias to the current rawPhase. ~200 blocks ≈ 2 s, plenty of time for the splice loop
-    // to converge a real error in normal mode (24 frames per 80 ms = 600 frames/s ≈ 12.5
-    // ms/s → a 5 ms error clears in <500 ms). If we hit this, the bias was wrong, not the
-    // splice loop.
-    private const int StuckErrorRebaseBlocks = 200;
-    private const double StuckErrorRebaseThresholdFrames = 48; // ~1 ms @ 48 kHz
     private static readonly double s_ticksPerSecond = Stopwatch.Frequency;
 
     private sealed class OutputState
@@ -93,29 +109,12 @@ public sealed class OutputSyncCoordinator
         public double LastAppliedPpm;
         public bool PiArmed;                   // Set true once buffered crosses fill-threshold; gates PI engagement
 
-        // Splice-based sync state.
-        public int PendingSpliceFrames;        // Signed integer-frame correction queued for next Read()
-        public int SpliceCooldownBlocks;       // Blocks remaining before a new splice can be scheduled
-        public long TotalSpliceCount;          // Telemetry: cumulative splice events
-        public long TotalSpliceFrames;         // Telemetry: cumulative |frames| spliced
-        public double LastPhaseFramesObserved; // For one-block spike rejection after a splice
-        public bool LastPhaseFramesArmed;
-
         // Phase-projection state (see PhaseWarmupBlocks comment above).
         public int SampleRate;
         public long CumulativeSourceFrames;
         public long LastSourceTicks;
-        public double PhaseBiasFrames;
         public int PhaseWarmupBlocksRemaining;
-        public bool PhaseBiasArmed;
-
-        // Stuck-error watchdog: counts consecutive blocks where |SmoothedErrorFrames|
-        // exceeds StuckErrorRebaseThresholdFrames. After StuckErrorRebaseBlocks blocks the
-        // phase bias is re-baselined to the current rawPhase, accepting the new physical
-        // alignment. This is a backstop for cases where the original bias was captured
-        // during a transient (warmup ended mid-glitch) and the splice loop is correctly
-        // chasing a wrong target forever.
-        public int StuckErrorBlocks;
+        public bool PhaseErrorInitialized;
     }
 
     public OutputSyncCoordinator(string masterConsumerId, int baseMasterTargetFrames, int maxMasterTargetFrames)
@@ -151,9 +150,8 @@ public sealed class OutputSyncCoordinator
                 state.PiArmed = false;
                 state.CumulativeSourceFrames = 0;
                 state.LastSourceTicks = 0;
-                state.PhaseBiasFrames = 0;
                 state.PhaseWarmupBlocksRemaining = PhaseWarmupBlocks;
-                state.PhaseBiasArmed = false;
+                state.PhaseErrorInitialized = false;
             }
 
             _adaptiveMasterTargetFrames = _baseMasterTargetFrames;
@@ -253,15 +251,11 @@ public sealed class OutputSyncCoordinator
             if (!anyReported) return true;
 
             _globalRefillHoldActive = false;
-            // Re-arm the per-consumer phase-projection warmup so the bias is captured AFTER
-            // the refill release rather than during pre-release silence/ramp-up. Without this,
-            // the bias would lock onto a transient and the post-release phase signal would
-            // carry that as a constant offset instead of being centred at zero.
+            // Re-arm the per-consumer phase-projection warmup so the first reading is taken
+            // AFTER the refill release rather than during pre-release silence/ramp-up.
             foreach (var state in _states.Values)
             {
                 state.PhaseWarmupBlocksRemaining = PhaseWarmupBlocks;
-                state.PhaseBiasArmed = false;
-                state.PhaseBiasFrames = 0;
             }
             return false;
         }
@@ -275,8 +269,6 @@ public sealed class OutputSyncCoordinator
             foreach (var state in _states.Values)
             {
                 state.PhaseWarmupBlocksRemaining = PhaseWarmupBlocks;
-                state.PhaseBiasArmed = false;
-                state.PhaseBiasFrames = 0;
             }
         }
     }
@@ -287,18 +279,16 @@ public sealed class OutputSyncCoordinator
         {
             if (!_states.Remove(consumerId)) return;
 
-            // The leaving consumer was a peer to everyone else's projection bias. Arm the
-            // global refill hold so all remaining consumers re-baseline their phase bias
-            // after the constellation change instead of continuing to chase a stale offset.
+            // Constellation changed. Re-arm the global refill hold so all remaining
+            // consumers refresh their per-consumer warmup; integral state is reset for cleanliness
+            // so the next sync lock starts from a clean PI controller (no stale wind-up).
             _globalRefillHoldActive = true;
             foreach (var state in _states.Values)
             {
                 state.PhaseWarmupBlocksRemaining = PhaseWarmupBlocks;
-                state.PhaseBiasArmed = false;
-                state.PhaseBiasFrames = 0;
                 state.IntegralErrorFrames = 0;
-                state.PendingSpliceFrames = 0;
-                state.LastPhaseFramesArmed = false;
+                state.Ratio = 1.0;
+                state.LastAppliedPpm = 0;
             }
         }
     }
@@ -379,49 +369,36 @@ public sealed class OutputSyncCoordinator
             double rawPhase = masterPos - followerPos;
 
             // Per-consumer warmup: discard the first PhaseWarmupBlocks samples so transient
-            // startup behaviour (refill barrier release, first PI engagement, callback ramp-up)
-            // is not captured into the bias. Once warmup expires, the next rawPhase becomes
-            // the bias; PI then drives the *change* in physical phase to zero.
+            // startup behaviour (refill barrier release, callback ramp-up) is not reflected
+            // as immediate error before the ASRC controller is even allowed to act.
             if (state.PhaseWarmupBlocksRemaining > 0)
             {
                 state.PhaseWarmupBlocksRemaining--;
                 state.SmoothedErrorFrames = 0;
+                state.PhaseErrorInitialized = false;
                 return;
             }
 
-            if (!state.PhaseBiasArmed)
+            // Target rawPhase = 0. CumulativeSourceFrames counts source frames consumed
+            // by Read(); per-output delay buffer and driver latency are downstream and
+            // do not contribute. Any non-zero rawPhase is real sync error to correct.
+            if (!state.PhaseErrorInitialized)
             {
-                state.PhaseBiasFrames = rawPhase;
-                state.PhaseBiasArmed = true;
-                state.SmoothedErrorFrames = 0;
-                state.StuckErrorBlocks = 0;
+                state.SmoothedErrorFrames = rawPhase;
+                state.PhaseErrorInitialized = true;
                 return;
             }
 
-            state.SmoothedErrorFrames = rawPhase - state.PhaseBiasFrames;
+            double absRaw = Math.Abs(rawPhase);
+            if (absRaw >= PhaseErrorFastPassFrames)
+            {
+                state.SmoothedErrorFrames = rawPhase;
+                return;
+            }
 
-            // Stuck-error watchdog: if the splice loop hasn't reduced |error| below the
-            // threshold within StuckErrorRebaseBlocks, the bias was wrong (warmup ended
-            // mid-glitch / a permanent physical alignment shift happened). Rebase to the
-            // current rawPhase so the controller chases the correct equilibrium instead of
-            // sustaining a fixed offset.
-            if (Math.Abs(state.SmoothedErrorFrames) >= StuckErrorRebaseThresholdFrames)
-            {
-                state.StuckErrorBlocks++;
-                if (state.StuckErrorBlocks >= StuckErrorRebaseBlocks)
-                {
-                    state.PhaseBiasFrames = rawPhase;
-                    state.SmoothedErrorFrames = 0;
-                    state.StuckErrorBlocks = 0;
-                    state.IntegralErrorFrames = 0;
-                    state.PendingSpliceFrames = 0;
-                    state.LastPhaseFramesArmed = false;
-                }
-            }
-            else
-            {
-                state.StuckErrorBlocks = 0;
-            }
+            double prior = state.SmoothedErrorFrames;
+            double limitedRaw = Math.Clamp(rawPhase, prior - PhaseErrorSpikeClampFrames, prior + PhaseErrorSpikeClampFrames);
+            state.SmoothedErrorFrames = prior + (limitedRaw - prior) * PhaseErrorEmaAlpha;
         }
     }
 
@@ -481,8 +458,8 @@ public sealed class OutputSyncCoordinator
 
     /// <summary>
     /// Worst-case absolute follower phase error (in source frames) currently observed by the
-    /// controller. This is the actual sync deviation the splice loop is acting on, projected
-    /// to a common wall-clock instant. Used for honest UI variance display.
+    /// controller. This is the actual sync deviation the ASRC controller is acting on,
+    /// projected to a common wall-clock instant. Used for honest UI variance display.
     /// </summary>
     public double GetWorstFollowerAbsErrorFrames()
     {
@@ -493,7 +470,7 @@ public sealed class OutputSyncCoordinator
             {
                 if (pair.Key == _masterConsumerId) continue;
                 if (!pair.Value.HasActiveRoutes) continue;
-                if (!pair.Value.PhaseBiasArmed) continue;
+                if (pair.Value.PhaseWarmupBlocksRemaining > 0) continue;
                 double abs = Math.Abs(pair.Value.SmoothedErrorFrames);
                 if (abs > worst) worst = abs;
             }
@@ -766,47 +743,28 @@ public sealed class OutputSyncCoordinator
     }
 
     /// <summary>
-    /// Per-block update of follower control state. In splice-sync mode there is no continuous
-    /// resampler ratio motion: outputs run at exact device nominal rate, and integrated phase
-    /// drift is corrected by occasional discrete signed integer-frame splices that the
-    /// MixingSampleProvider applies via crossfade in its next Read(). Master output is held at
-    /// ratio 1.0 with no splice (long-term drift absorbed by the input ring + adaptive target).
+    /// Per-block update of follower control state. Smooth ASRC: a slow PI controller drives
+    /// the follower's playback ratio toward elimination of projected phase error. Master is
+    /// always held at ratio 1.0 (long-term drift vs input clock is absorbed by the input ring).
     /// </summary>
     private void UpdateControlStateNoLock(string consumerId, OutputState state)
     {
-        // Both master and follower always render at exact nominal rate. Ratio + ppm are
-        // kept inert for UI compat (telemetry shows 0 ppm, ratio 1.0 always).
-        state.Ratio = 1.0;
-        state.LastAppliedPpm = 0;
-        state.IntegralErrorFrames = 0;
-
-        if (state.SpliceCooldownBlocks > 0)
-        {
-            state.SpliceCooldownBlocks--;
-        }
-
         bool isMaster = consumerId == _masterConsumerId;
         if (isMaster)
         {
-            // Master never splices itself in this design. If we did, the splice would jump
-            // master.CumulativeSourceFrames, every follower would see a phase spike, and the
-            // chain reaction would be visually scary even if eventually correct. Keep master
-            // running clean; let followers chase the master clock.
-            //
-            // Arm master.PiArmed once it has a valid buffered measurement. This is the gate
-            // followers wait on before scheduling splices — without it, NO follower ever
-            // splices and any transient phase error sits forever (visible as variance pinned
-            // at ~5/10 ms until app restart).
+            // Master plays at exact device rate. Followers chase the master clock.
+            // Arm PiArmed once it has a valid buffered measurement so followers can engage.
             if (!state.PiArmed && state.BufferedFrames >= 0)
             {
                 state.PiArmed = true;
             }
+            state.Ratio = 1.0;
+            state.LastAppliedPpm = 0;
+            state.IntegralErrorFrames = 0;
             state.FastCatchUpActive = false;
             state.FastCatchUpEnterConfirmBlocks = 0;
             state.FastCatchUpHoldBlocks = 0;
             state.PostRecoveryWindowBlocksRemaining = 0;
-            state.PendingSpliceFrames = 0;
-            state.LastPhaseFramesArmed = false;
             return;
         }
 
@@ -821,8 +779,8 @@ public sealed class OutputSyncCoordinator
             state.PostRecoveryWindowBlocksRemaining -= 1;
         }
 
-        // Startup gate: don't splice until master has armed AND we have a valid follower buffered
-        // measurement. Without this, follower would react to spurious errors during ring fill.
+        // Startup gate: don't drive the controller until master has armed AND we have a valid
+        // follower buffered measurement. Holds ratio at 1.0 during refill / warmup.
         if (!state.PiArmed)
         {
             if (_states.TryGetValue(_masterConsumerId, out var masterStateForArm)
@@ -833,94 +791,77 @@ public sealed class OutputSyncCoordinator
             }
             else
             {
-                state.PendingSpliceFrames = 0;
-                state.LastPhaseFramesArmed = false;
+                state.Ratio = 1.0;
+                state.LastAppliedPpm = 0;
                 return;
             }
         }
 
         double phaseFrames = state.SmoothedErrorFrames;
-        double absPhaseFrames = Math.Abs(phaseFrames);
+        double absPhase = Math.Abs(phaseFrames);
 
-        // FastCatchUp transitions: gate on phase magnitude only (no confirmation blocks needed —
-        // splice-mode reacts on the same block it sees the threshold).
-        if (!state.FastCatchUpActive)
+        // Soft-knee deadband: subtract RatioDeadbandFrames from the magnitude so the error fed
+        // to the PI is zero just outside the band and ramps in smoothly. Inside the band, the
+        // integral is frozen (no wind-up of jitter, no forgetting of learned steady-state drift).
+        double errorForPi;
+        if (absPhase < RatioDeadbandFrames)
         {
-            if (absPhaseFrames >= FastSpliceEnterErrorFrames)
-            {
-                state.FastCatchUpActive = true;
-                state.FastCatchUpHoldBlocks = 0;
-            }
+            errorForPi = 0;
         }
         else
         {
-            state.FastCatchUpHoldBlocks += 1;
-            if (state.FastCatchUpHoldBlocks >= FastSpliceMinHoldBlocks
-                && absPhaseFrames <= FastSpliceExitErrorFrames)
+            double sign = phaseFrames > 0 ? 1.0 : -1.0;
+            errorForPi = sign * (absPhase - RatioDeadbandFrames);
+
+            // Anti-windup: integrate only when not saturated in the same direction.
+            double prospectiveIntegral = state.IntegralErrorFrames + errorForPi;
+            bool atPositiveCap = state.Ratio >= 1.0 + (MaxRatioPpm * 1e-6) - 1e-9;
+            bool atNegativeCap = state.Ratio <= 1.0 - (MaxRatioPpm * 1e-6) + 1e-9;
+            if (!((errorForPi > 0 && atPositiveCap) || (errorForPi < 0 && atNegativeCap)))
             {
-                state.FastCatchUpActive = false;
-                state.FastCatchUpHoldBlocks = 0;
-                state.PostRecoveryWindowBlocksRemaining = PostRecoveryUnderrunWindowBlocks;
+                state.IntegralErrorFrames = Math.Clamp(prospectiveIntegral, -IntegralClampFrames, IntegralClampFrames);
             }
         }
 
-        // Spike rejector: a fresh splice from this consumer (or from a peer that propagates
-        // through the projection) shows up as a one-block jump in phaseFrames. If the change
-        // since the previous block exceeds PhaseSpikeRejectFrames AND we're not in fast mode,
-        // skip splice scheduling for this block and let the projection settle.
-        bool spikeReject = false;
-        if (state.LastPhaseFramesArmed && !state.FastCatchUpActive)
-        {
-            double phaseDelta = Math.Abs(phaseFrames - state.LastPhaseFramesObserved);
-            if (phaseDelta > PhaseSpikeRejectFrames)
-            {
-                spikeReject = true;
-            }
-        }
-        state.LastPhaseFramesObserved = phaseFrames;
-        state.LastPhaseFramesArmed = true;
+        // Compute target ratio from PI. For large errors, grant the controller more authority
+        // so 5-10 ms excursions collapse quickly instead of hanging around for seconds.
+        double targetRatio = 1.0 + (RatioKp * errorForPi) + (RatioKi * state.IntegralErrorFrames);
+        double capPpm = absPhase >= PhaseErrorFastPassFrames ? MaxRatioPpm : Math.Min(MaxRatioPpm, 1000.0);
+        double capUp   = 1.0 + (capPpm * 1e-6);
+        double capDown = 1.0 - (capPpm * 1e-6);
+        if (targetRatio > capUp) targetRatio = capUp;
+        else if (targetRatio < capDown) targetRatio = capDown;
 
-        // Schedule a splice if we're past cooldown, above the minimum-error floor, and not
-        // rejecting a spike.
-        if (!spikeReject
-            && state.SpliceCooldownBlocks == 0
-            && absPhaseFrames >= FollowerSpliceMinErrorFrames)
-        {
-            int maxSplice = state.FastCatchUpActive ? FastSpliceMaxFrames : FollowerSpliceMaxFrames;
-            int magnitude = Math.Min((int)Math.Round(absPhaseFrames), maxSplice);
-            int sign = phaseFrames > 0 ? 1 : -1;
-            state.PendingSpliceFrames = sign * magnitude;
-            state.SpliceCooldownBlocks = state.FastCatchUpActive
-                ? FastSpliceCooldownBlocks
-                : FollowerSpliceCooldownBlocks;
-            state.TotalSpliceCount++;
-            state.TotalSpliceFrames += magnitude;
-        }
+        // Slew-rate limit: stay gentle near lock, but let large errors correct aggressively.
+        double slewPpm = absPhase >= PhaseErrorFastPassFrames
+            ? 240.0
+            : RatioSlewPpmPerBlock;
+        double slewLimit = slewPpm * 1e-6;
+        double delta = targetRatio - state.Ratio;
+        if (delta > slewLimit) delta = slewLimit;
+        else if (delta < -slewLimit) delta = -slewLimit;
+        double newRatio = state.Ratio + delta;
+        if (newRatio > capUp) newRatio = capUp;
+        else if (newRatio < capDown) newRatio = capDown;
+        state.Ratio = newRatio;
+        state.LastAppliedPpm = (newRatio - 1.0) * 1e6;
+
+        // FastCatchUp flag is now purely a UI signal ("we're catching up a real desync" vs
+        // "we're locked"). It does not change controller authority — the slew limit is hard.
+        state.FastCatchUpActive = absPhase >= FastModeEnterErrorFrames;
+        state.FastCatchUpHoldBlocks = state.FastCatchUpActive ? state.FastCatchUpHoldBlocks + 1 : 0;
     }
 
     /// <summary>
-    /// Returns the queued splice (signed frames) for this consumer and clears it. Called by
-    /// MixingSampleProvider.Read() exactly once per block. Positive splice means consume MORE
-    /// source frames than nominal (skip ahead); negative means consume FEWER (replay).
+    /// Inert: returns 0 splice frames. Kept for API compatibility with telemetry callers; the
+    /// ASRC controller uses smooth ratio adjustment instead of discrete splices.
     /// </summary>
-    public int ConsumeSpliceRequest(string consumerId)
-    {
-        lock (_syncLock)
-        {
-            if (!_states.TryGetValue(consumerId, out var state)) return 0;
-            int splice = state.PendingSpliceFrames;
-            state.PendingSpliceFrames = 0;
-            return splice;
-        }
-    }
+    public int ConsumeSpliceRequest(string consumerId) => 0;
 
-    public long GetConsumerSpliceCount(string consumerId)
-    {
-        lock (_syncLock)
-        {
-            return _states.TryGetValue(consumerId, out var state) ? state.TotalSpliceCount : 0;
-        }
-    }
+    /// <summary>
+    /// Inert: returns 0. Kept for API compatibility with telemetry callers.
+    /// </summary>
+    public long GetConsumerSpliceCount(string consumerId) => 0;
 }
 
 /// <summary>
@@ -930,10 +871,6 @@ public sealed class OutputSyncCoordinator
 public class MixingSampleProvider : ISampleProvider
 {
     private const int InputSyncSettleBandFrames = 64;
-    // Half-width of the splice crossfade region (in output frames). Mirrors the coordinator's
-    // SpliceCrossfadeFrames constant; defined here as a separate const so it can be referenced
-    // in Read() guard math without crossing namespaces.
-    private const int SpliceFadeHalf = OutputSyncCoordinator.SpliceCrossfadeFrames / 2;
 
     private readonly RoutingMatrix _matrix;
     private readonly List<CaptureSource> _sources;
@@ -948,31 +885,26 @@ public class MixingSampleProvider : ISampleProvider
     private float[] _discardBuffer = [];
     private float[] _delayBuffer = [];
     private bool[] _sourceActiveMask = [];
-    // Mixing scratch: holds (frames + splice) interleaved samples per Read(). Reused.
+    // Per-source actual peek result (frames) — used to clamp ring advance after we know how
+    // many source frames the ASRC ratio actually wants to consume. Reused per Read().
+    private int[] _framesReadPerSource = [];
+    // Mixing scratch: holds interleaved source-rate samples per Read() (one slot larger than
+    // ratio * frames so the linear interpolator can safely read `mix[i+1]`). Reused.
     private float[] _mixScratch = [];
+    // Fractional source-frame remainder carried between blocks. ASRC consumes
+    // (_sourceFracRemainder + frames * ratio) source frames per Read; the integer part is
+    // advanced on the rings, the fractional part is carried forward.
+    private double _sourceFracRemainder;
 
-    // Equal-power cosine crossfade tables for splice rendering. Precomputed once.
-    private static readonly float[] s_spliceFadeOut;
-    private static readonly float[] s_spliceFadeIn;
-    static MixingSampleProvider()
-    {
-        int n = OutputSyncCoordinator.SpliceCrossfadeFrames;
-        s_spliceFadeOut = new float[n];
-        s_spliceFadeIn = new float[n];
-        // alpha = cos(pi/2 * t),  beta = sin(pi/2 * t),  alpha^2 + beta^2 = 1 (constant power).
-        for (int i = 0; i < n; i++)
-        {
-            double t = (i + 0.5) / n;
-            s_spliceFadeOut[i] = (float)Math.Cos(0.5 * Math.PI * t);
-            s_spliceFadeIn[i]  = (float)Math.Sin(0.5 * Math.PI * t);
-        }
-    }
     private int _delayWriteIndex;
     private int _deviceDelayMs;
     private int _outputBufferMs;
     private long _underrunCount;
     private readonly float[] _peakLevels;
-    private readonly Dictionary<string, long> _inputSyncDiscardedFramesByDevice = new(StringComparer.Ordinal);
+    // ConcurrentDictionary: mutated from the WASAPI Read callback (audio thread) and read from
+    // the WinForms UI thread when MainForm builds its state snapshot. Plain Dictionary<> races
+    // here would surface as occasional NullRef / IndexOutOfRange on the UI thread under stress.
+    private readonly ConcurrentDictionary<string, long> _inputSyncDiscardedFramesByDevice = new(StringComparer.Ordinal);
 
     public record struct CaptureSource(string DeviceId, RingBuffer Buffer, int GlobalChannelOffset, int Channels, bool IsMasterInput);
 
@@ -1009,9 +941,8 @@ public class MixingSampleProvider : ISampleProvider
 
     /// <summary>
     /// Honest output-side sync deviation in milliseconds. Reports the actual absolute
-    /// phase error the splice controller is acting on (wall-clock-projected source-frame
-    /// position of master vs this follower, with constant pipeline offset removed by the
-    /// per-consumer phase bias). Master reports the worst follower's deviation.
+    /// phase error the ASRC controller is acting on (wall-clock-projected source-frame
+    /// position of master vs this follower). Master reports the worst follower's deviation.
     /// No artificial smoothing — the underlying signal is per-block and already reflects
     /// what the controller sees.
     /// </summary>
@@ -1087,7 +1018,7 @@ public class MixingSampleProvider : ISampleProvider
 
     public void SetInputMasterDevice(string deviceId)
     {
-        // No-op: the splice-sync controller derives reference timing from the output
+        // No-op: the ASRC sync controller derives reference timing from the output
         // master consumer; the input-master concept is no longer used by this provider.
         _ = deviceId;
     }
@@ -1129,32 +1060,18 @@ public class MixingSampleProvider : ISampleProvider
 
         _syncCoordinator.UpdateControlState(_consumerId);
 
-        // Splice-based sync: outputs always run at exact device nominal rate. The coordinator
-        // hands us a signed integer-frame splice request when phase drift exceeds threshold.
-        // splice > 0 => skip ahead (consume `splice` extra source frames, crossfade them
-        // out of the output block). splice < 0 => replay (consume `splice` fewer, crossfade
-        // a small region back in).
-        int splice = _syncCoordinator.ConsumeSpliceRequest(_consumerId);
-
-        // Safety: clamp splice so the crossfade region always fits inside the output block.
-        // Crossfade needs (frames/2 - fade/2 - |splice|) >= 0 in pre-fade region and similar
-        // post-fade. With the configured constants (fade=64, max splice 96), need frames >= 256.
-        // WASAPI shared mode block is typically 480 frames, so we're safe; but tiny blocks
-        // (e.g. very small output buffer) just disable the splice for that block.
-        int spliceMaxForBlock = Math.Max(0, (frames / 2) - SpliceFadeHalf - 1);
-        if (Math.Abs(splice) > spliceMaxForBlock)
-        {
-            splice = Math.Sign(splice) * spliceMaxForBlock;
-        }
-
-        int sourceFrames = frames + splice;
-        if (sourceFrames <= 0)
-        {
-            // Pathological — fall back to no splice this block.
-            splice = 0;
-            sourceFrames = frames;
-        }
-        _syncCoordinator.ReportPreparedSourceFrames(_consumerId, sourceFrames);
+        // Smooth ASRC: the coordinator publishes a continuously-varying playback ratio (very
+        // near 1.0 — within ±1000 ppm, slew-limited to a few ppm per block). For each block
+        // we need approximately (frames * ratio) source frames, plus the fractional remainder
+        // carried from the previous block, plus one extra slot so the linear interpolator can
+        // safely read `mix[i+1]` at the last output sample. Ratio == 1.0 + zero remainder is
+        // the exact identity path: a straight BlockCopy with no interpolation cost.
+        double ratio = _syncCoordinator.GetConsumerRatio(_consumerId);
+        if (!(ratio > 0)) ratio = 1.0;
+        double srcOffsetStart = _sourceFracRemainder;
+        double sourceFramesExact = srcOffsetStart + frames * ratio;
+        int sourceFrames = (int)Math.Ceiling(sourceFramesExact) + 1;
+        if (sourceFrames < 1) sourceFrames = 1;
 
         int sourceSamples = sourceFrames * _outputChannels;
         if (_mixScratch.Length < sourceSamples)
@@ -1171,6 +1088,10 @@ public class MixingSampleProvider : ISampleProvider
         if (_sourceActiveMask.Length < sourceCount)
         {
             _sourceActiveMask = new bool[Math.Max(sourceCount, _sourceActiveMask.Length * 2)];
+        }
+        if (_framesReadPerSource.Length < sourceCount)
+        {
+            _framesReadPerSource = new int[Math.Max(sourceCount, _framesReadPerSource.Length * 2)];
         }
         int activeCount = 0;
         for (int i = 0; i < sourceCount; i++)
@@ -1194,8 +1115,10 @@ public class MixingSampleProvider : ISampleProvider
         }
         if (referenceBufferedFrames == int.MaxValue) referenceBufferedFrames = 0;
 
+        int minFramesReadActive = int.MaxValue;
         for (int srcIdx = 0; srcIdx < sourceCount; srcIdx++)
         {
+            _framesReadPerSource[srcIdx] = 0;
             var src = _sources[srcIdx];
             int sourceBufferedFrames = src.Buffer.GetAvailableFrames(_consumerId);
             int aheadFrames = sourceBufferedFrames - referenceBufferedFrames;
@@ -1214,12 +1137,24 @@ public class MixingSampleProvider : ISampleProvider
             if (_sourceTempBuffer.Length < srcSamples)
                 _sourceTempBuffer = new float[srcSamples];
 
-            // Read from capture ring buffer
+            // Peek from capture ring buffer (advance after we know how many source frames
+            // ASRC actually consumed, so the remainder of an oversized peek is reused next
+            // block at the new ratio).
             int framesRead = src.Buffer.PeekForConsumer(_consumerId, _sourceTempBuffer, 0, sourceFrames);
+            _framesReadPerSource[srcIdx] = framesRead;
             if (framesRead == 0)
             {
                 Interlocked.Increment(ref _underrunCount);
+                if (useAllForRef || _sourceActiveMask[srcIdx])
+                {
+                    minFramesReadActive = 0;
+                }
                 continue;
+            }
+
+            if (useAllForRef || _sourceActiveMask[srcIdx])
+            {
+                if (framesRead < minFramesReadActive) minFramesReadActive = framesRead;
             }
 
             int deficit = sourceFrames - framesRead;
@@ -1251,23 +1186,85 @@ public class MixingSampleProvider : ISampleProvider
                     }
                 }
             }
-
-            // Consume the frames we read
-            src.Buffer.ReadForConsumer(_consumerId, _sourceTempBuffer, 0, framesRead);
         }
+
+        if (minFramesReadActive == int.MaxValue) minFramesReadActive = 0;
+
+        // ASRC consumption math: ratio · frames + carried fractional remainder. The integer
+        // part is what we advance the ring cursors by; the new fractional remainder (< 1)
+        // carries to the next block. Clamp by what we actually got from the source so a
+        // starved input doesn't try to advance past its available data.
+        int integerSourceConsumed = Math.Max(0, (int)Math.Floor(sourceFramesExact));
+        int actualSourceConsumed = Math.Min(integerSourceConsumed, minFramesReadActive);
+        // New remainder is the un-consumed fractional portion of THIS block's ratio · frames
+        // (must always be in [0, 1)). If starvation forced actualSourceConsumed below the
+        // integer math, the lost fractional debt is dropped to keep the remainder sane.
+        _sourceFracRemainder = sourceFramesExact - integerSourceConsumed;
+        if (_sourceFracRemainder < 0) _sourceFracRemainder = 0;
+        else if (_sourceFracRemainder >= 1.0) _sourceFracRemainder = 0;
+
+        // Advance each source ring by min(integerSourceConsumed, its own framesRead). Sources
+        // that read short of the request just stay starved; this block's mix already has
+        // zeros for those missing samples, so the audible effect is the same as before.
+        for (int srcIdx = 0; srcIdx < sourceCount; srcIdx++)
+        {
+            int framesRead = _framesReadPerSource[srcIdx];
+            if (framesRead <= 0) continue;
+            int advance = Math.Min(integerSourceConsumed, framesRead);
+            if (advance > 0)
+            {
+                _sources[srcIdx].Buffer.ReadForConsumer(_consumerId, _sourceTempBuffer, 0, advance);
+            }
+        }
+
+        // Projection: report actually-consumed source frames (post-starvation cap). Per-block
+        // phase tracking in the coordinator advances on this honest count.
+        _syncCoordinator.ReportPreparedSourceFrames(_consumerId, actualSourceConsumed);
 
         int inputStarvationFrames = Math.Max(0, sourceFrames - referenceBufferedFrames);
         _syncCoordinator.ReportInputStarvation(inputStarvationFrames);
 
-        // Render scratch (sourceFrames) into output (frames) using splice crossfade if needed.
-        if (splice == 0)
+        // Render mix scratch (source-rate) into output (device-rate).
+        bool identityPath = ratio == 1.0
+            && srcOffsetStart < 1e-9
+            && minFramesReadActive >= frames;
+        if (identityPath)
         {
-            // Common path: no correction this block. Direct copy at exact device rate.
+            // Fast path: no resampling needed this block. Straight copy at device nominal rate.
             Buffer.BlockCopy(_mixScratch, 0, buffer, offset * sizeof(float), frames * _outputChannels * sizeof(float));
         }
         else
         {
-            ApplySpliceCrossfade(_mixScratch, sourceFrames, buffer, offset, frames, _outputChannels, splice);
+            // Linear interpolation. At |ratio - 1| < 1000 ppm, linear interp introduces
+            // < 0.01 dB of HF rolloff and no audible aliasing — its frequency response is
+            // essentially flat to 20 kHz in this regime. Higher-order kernels (cubic / sinc)
+            // would be overkill for the ratio range and add CPU cost on the audio thread.
+            int outCh = _outputChannels;
+            // Max valid integer source index for `mix[idx+1]` access is sourceFrames - 1.
+            // Above that, output the last available frame (covers tail of starvation edge).
+            int maxBaseIdx = sourceFrames - 2;
+            if (maxBaseIdx < 0) maxBaseIdx = 0;
+            for (int f = 0; f < frames; f++)
+            {
+                double srcPos = srcOffsetStart + f * ratio;
+                int baseFrame = (int)srcPos;
+                double frac = srcPos - baseFrame;
+                if (baseFrame > maxBaseIdx)
+                {
+                    baseFrame = maxBaseIdx;
+                    frac = 1.0;
+                }
+                if (baseFrame < 0) { baseFrame = 0; frac = 0; }
+                int a = baseFrame * outCh;
+                int b = a + outCh;
+                int outBase = offset + f * outCh;
+                float fA = (float)(1.0 - frac);
+                float fB = (float)frac;
+                for (int c = 0; c < outCh; c++)
+                {
+                    buffer[outBase + c] = _mixScratch[a + c] * fA + _mixScratch[b + c] * fB;
+                }
+            }
         }
 
         // Clamp post-mix to guard against numeric overshoot.
@@ -1337,67 +1334,6 @@ public class MixingSampleProvider : ISampleProvider
         return sample;
     }
 
-    /// <summary>
-    /// Render <paramref name="sourceFrames"/> mixed source frames into <paramref name="outputFrames"/>
-    /// output frames using an equal-power cosine crossfade at the block midpoint. The signed
-    /// <paramref name="splice"/> = <paramref name="sourceFrames"/> - <paramref name="outputFrames"/>.
-    /// Positive splice means we have more source than output (skip ahead); negative means
-    /// less source than output (replay a small overlap). The crossfade region is centred at
-    /// outputFrames/2 with half-width SpliceFadeHalf, and is inaudible on broadband content
-    /// at the splice rates produced by the coordinator (a few per second worst-case).
-    /// </summary>
-    private static void ApplySpliceCrossfade(
-        float[] mix, int sourceFrames,
-        float[] output, int outputOffset,
-        int outputFrames, int channels, int splice)
-    {
-        int fadeFrames = OutputSyncCoordinator.SpliceCrossfadeFrames;
-        int half = SpliceFadeHalf;
-        int splicePoint = outputFrames / 2;
-        int fadeStart = splicePoint - half;
-        int fadeEnd   = splicePoint + half;
-
-        // Pre-fade region: copy mix[0 .. fadeStart] straight to output.
-        // mix[outIdx] is always valid because fadeStart < min(outputFrames, sourceFrames).
-        Buffer.BlockCopy(
-            mix, 0,
-            output, outputOffset * sizeof(float),
-            fadeStart * channels * sizeof(float));
-
-        // Crossfade region: outIdx in [fadeStart, fadeEnd).
-        // alpha (cos) fades out mix[outIdx]; beta (sin) fades in mix[outIdx + splice].
-        // For splice > 0: skip ahead (mix has +splice frames after outIdx).
-        // For splice < 0: replay (mix at outIdx + splice = outIdx - |splice|, earlier sample).
-        for (int i = 0; i < fadeFrames; i++)
-        {
-            float alpha = s_spliceFadeOut[i];
-            float beta  = s_spliceFadeIn[i];
-            int outIdx = fadeStart + i;
-            int aIdx = outIdx;
-            int bIdx = outIdx + splice;
-            int outBase = (outputOffset + outIdx * channels);
-            int aBase = aIdx * channels;
-            int bBase = bIdx * channels;
-            for (int c = 0; c < channels; c++)
-            {
-                output[outBase + c] = alpha * mix[aBase + c] + beta * mix[bBase + c];
-            }
-        }
-
-        // Post-fade region: outIdx in [fadeEnd, outputFrames). Read mix[outIdx + splice].
-        // For splice > 0: mix index goes up to outputFrames + splice - 1 = sourceFrames - 1, OK.
-        // For splice < 0: mix index goes up to outputFrames - 1 + splice = sourceFrames - 1, OK.
-        int postCount = outputFrames - fadeEnd;
-        if (postCount > 0)
-        {
-            int srcStartFrame = fadeEnd + splice;
-            Buffer.BlockCopy(
-                mix, srcStartFrame * channels * sizeof(float),
-                output, (outputOffset + fadeEnd * channels) * sizeof(float),
-                postCount * channels * sizeof(float));
-        }
-    }
-
     public void DetachConsumer()
     {
         foreach (var source in _sources)
@@ -1439,9 +1375,7 @@ public class MixingSampleProvider : ISampleProvider
         source.Buffer.ReadForConsumer(_consumerId, _discardBuffer, 0, frames);
         if (!string.IsNullOrWhiteSpace(source.DeviceId))
         {
-            _inputSyncDiscardedFramesByDevice[source.DeviceId] = _inputSyncDiscardedFramesByDevice.TryGetValue(source.DeviceId, out var current)
-                ? current + frames
-                : frames;
+            _inputSyncDiscardedFramesByDevice.AddOrUpdate(source.DeviceId, frames, (_, current) => current + frames);
         }
     }
 

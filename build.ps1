@@ -3,7 +3,6 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 $buildRoot = Join-Path $PSScriptRoot 'build'
-$webOut = Join-Path $buildRoot 'web'
 $desktopOut = Join-Path $buildRoot 'desktop'
 $webUiPath = Join-Path $PSScriptRoot 'AudioMatrixRouter\WebUI'
 $desktopProject = Join-Path $PSScriptRoot 'AudioMatrixRouter\AudioMatrixRouter.csproj'
@@ -14,7 +13,6 @@ Write-Host 'Stopping running desktop processes...'
 $appPids = @((Get-Process AudioMatrixRouter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id))
 $processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 $descendantPids = @()
-$escapedWebUiPath = [Regex]::Escape($webUiPath)
 
 if ($appPids.Count -gt 0 -and $processSnapshot.Count -gt 0) {
   $queue = New-Object System.Collections.Generic.Queue[int]
@@ -36,22 +34,7 @@ if ($appPids.Count -gt 0 -and $processSnapshot.Count -gt 0) {
 }
 
 $webViewChildPids = @($processSnapshot | Where-Object { $_.Name -eq 'msedgewebview2.exe' -and ($descendantPids -contains [int]$_.ProcessId) } | Select-Object -ExpandProperty ProcessId)
-
-# Kill stale node/cmd preview processes left by previous build runs.
-$stalePreviewPids = @(
-  $processSnapshot | Where-Object {
-    ($_.Name -in @('node.exe', 'cmd.exe')) -and
-    $_.CommandLine -and
-    ($_.CommandLine -match $escapedWebUiPath) -and
-    (
-      ($_.CommandLine -match '--port\s+4173') -or
-      ($_.CommandLine -match 'run\s+preview') -or
-      ($_.CommandLine -match 'vite(\.js)?\s+preview')
-    )
-  } | Select-Object -ExpandProperty ProcessId
-)
-
-$pidsToStop = @($appPids + $webViewChildPids + $stalePreviewPids | Sort-Object -Unique)
+$pidsToStop = @($appPids + $webViewChildPids | Sort-Object -Unique)
 if ($pidsToStop.Count -gt 0) {
   Write-Host ("Stopping stale processes: {0}" -f ($pidsToStop -join ', '))
   Stop-Process -Id $pidsToStop -Force -ErrorAction SilentlyContinue
@@ -70,23 +53,25 @@ Write-Host 'Cleaning build output folders...'
 if (Test-Path $buildRoot) {
   Remove-Item $buildRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
-New-Item -ItemType Directory -Path $webOut -Force | Out-Null
 New-Item -ItemType Directory -Path $desktopOut -Force | Out-Null
-
-Write-Host 'Building web deliverable (GitHub Pages/base-path mode)...'
-Push-Location $webUiPath
-npm run build:web
-Pop-Location
-Copy-Item (Join-Path $webUiPath 'dist\*') $webOut -Recurse -Force
 
 Write-Host 'Building desktop WebUI bundle...'
 Push-Location $webUiPath
-npm run build:windows
+npm run build
+if ($LASTEXITCODE -ne 0) {
+  Pop-Location
+  Write-Host 'ERROR: WebUI build failed.'
+  exit 1
+}
 Pop-Location
 
 Write-Host 'Publishing desktop app...'
 dotnet clean $desktopProject -c Release
 dotnet publish $desktopProject -c Release -r win-x64 --self-contained true -o $desktopOut -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:PublishTrimmed=false -p:Platform=x64 -p:UseSharedCompilation=false -t:Rebuild
+if ($LASTEXITCODE -ne 0) {
+  Write-Host 'ERROR: dotnet publish failed.'
+  exit 1
+}
 
 if ($null -ne $preservedConfig -and -not (Test-Path $desktopConfigPath)) {
   try {
@@ -107,7 +92,6 @@ Write-Host 'Removing nested build trees from desktop output...'
 
 Write-Host ''
 Write-Host 'Build complete.'
-Write-Host "Web output     : $webOut"
 Write-Host "Desktop output : $desktopOut"
 $exePath = Join-Path $desktopOut 'AudioMatrixRouter.exe'
 if (Test-Path $exePath) {
@@ -116,38 +100,7 @@ if (Test-Path $exePath) {
   } catch {
     Write-Host 'Warning: Could not update desktop exe timestamp; continuing.'
   }
-}
-Get-Item $exePath | Select-Object FullName, LastWriteTime, Length | Format-List
-
-Write-Host ''
-Write-Host 'Building windows mode for local preview (root base path)...'
-Push-Location $webUiPath
-npm run build:windows
-if ($LASTEXITCODE -ne 0) {
-  Write-Host 'ERROR: Windows build failed.'
-  Pop-Location
-  exit 1
-}
-Pop-Location
-
-Write-Host ''
-Write-Host 'Starting local preview server on http://localhost:4173'
-Write-Host 'Preview server will run in the background.'
-Write-Host ''
-
-$npmCmdPath = (Get-Command npm.cmd -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
-if (-not $npmCmdPath) {
-  Write-Host 'Warning: npm.cmd not found on PATH; skipping preview server startup.'
-  exit 0
-}
-
-$previewCommand = '"' + $npmCmdPath + '" run preview -- --host 127.0.0.1 --port 4173'
-try {
-  $previewProcess = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/c', $previewCommand) -WorkingDirectory $webUiPath -WindowStyle Hidden -PassThru
-  Write-Host "Preview process started (PID: $($previewProcess.Id))."
-}
-catch {
-  Write-Host "Warning: Failed to start preview server in background: $($_.Exception.Message)"
+  Get-Item $exePath | Select-Object FullName, LastWriteTime, Length | Format-List
 }
 
 exit 0
