@@ -320,6 +320,21 @@ public sealed class OutputSyncCoordinator
         }
     }
 
+    /// <summary>
+    /// Shifts this consumer's cumulative source-frame position by <paramref name="deltaFrames"/>.
+    /// Called once per hold→active transition so that rawPhase reflects actual ring read-pointer
+    /// differences rather than just frames-consumed-since-zero, which is blind to where in the
+    /// ring each consumer started.
+    /// </summary>
+    public void AdjustPhaseAnchor(string consumerId, long deltaFrames)
+    {
+        lock (_syncLock)
+        {
+            if (!_states.TryGetValue(consumerId, out var state)) return;
+            state.CumulativeSourceFrames += deltaFrames;
+        }
+    }
+
     public int GetLastPreparedSourceFrames(string consumerId)
     {
         lock (_syncLock)
@@ -901,6 +916,9 @@ public class MixingSampleProvider : ISampleProvider
     private int _outputBufferMs;
     private long _underrunCount;
     private readonly float[] _peakLevels;
+    // Tracks whether this output was in the global refill hold on the previous Read() block.
+    // Starts true so the first hold→active transition anchors the phase immediately.
+    private bool _wasInHold = true;
     // ConcurrentDictionary: mutated from the WASAPI Read callback (audio thread) and read from
     // the WinForms UI thread when MainForm builds its state snapshot. Plain Dictionary<> races
     // here would surface as occasional NullRef / IndexOutOfRange on the UI thread under stress.
@@ -1051,7 +1069,23 @@ public class MixingSampleProvider : ISampleProvider
 
         // Global refill barrier: on startup/underrun, all outputs wait until every output
         // reaches its output-buffer floor, then all release together.
-        if (_syncCoordinator.ShouldHoldForGlobalRefill())
+        bool inHold = _syncCoordinator.ShouldHoldForGlobalRefill();
+
+        // On the first Read() after a hold period ends, anchor the phase measurement to the
+        // actual ring-buffer read position of this output. Without this, rawPhase = masterCumulative
+        // - followerCumulative is blind to where in the ring each consumer started: two outputs
+        // that exit hold with different ring positions (e.g. master drained by an underrun while
+        // follower retained its buffer) will both show CumulativeSourceFrames = 0 yet be 50-200ms
+        // apart in ring position. The controller then sees rawPhase ≈ 0 and never corrects the
+        // desync — producing the "variance shows 0.4ms but massive audible desync" symptom.
+        //
+        // The fix: subtract the output's current ring buffer depth from CumulativeSourceFrames so
+        // that rawPhase = 0 exactly when both outputs are at the same ring read position.
+        if (_wasInHold && !inHold)
+            _syncCoordinator.AdjustPhaseAnchor(_consumerId, -(long)bufferedFrames);
+        _wasInHold = inHold;
+
+        if (inHold)
         {
             Array.Clear(buffer, offset, count);
             _syncCoordinator.OnFramesRendered(_consumerId, frames);
