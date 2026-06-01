@@ -10,7 +10,9 @@ public class ActiveDevice
     public int GlobalChannelOffset { get; set; }
     public RingBuffer? RingBuffer { get; set; }
     public WasapiCapture? Capture { get; set; }
+    public EventDrivenCaptureDevice? CaptureDriver { get; set; }
     public WasapiOut? Render { get; set; }
+    public EventDrivenRenderDevice? RenderDriver { get; set; }
     public MixingSampleProvider? MixProvider { get; set; }
     public bool IsMasterDevice { get; set; }
     public int OutputDelayMs { get; set; }
@@ -556,7 +558,7 @@ public class AudioEngine : IDisposable
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
                 dev.PeakLevels = new float[dev.Info.Channels];
-                if (!CreateAndStartCapture(dev))
+                if (!InitializeCaptureDriver(dev))
                 {
                     continue;
                 }
@@ -599,7 +601,7 @@ public class AudioEngine : IDisposable
                     dev.MixProvider.SetInputMasterDevice(inputMaster.Info.Id);
                 }
 
-                if (!TryInitRender(dev, mmDevice, _outputBufferMs))
+                if (!InitializeRenderDriver(dev, mmDevice, _outputBufferMs))
                 {
                     continue; // Skip this device; engine continues with the remaining outputs.
                 }
@@ -631,7 +633,7 @@ public class AudioEngine : IDisposable
             // Play all outputs together after all are initialized to minimize startup cursor skew.
             foreach (var dev in _outputDevices)
             {
-                try { dev.Render?.Play(); } catch { }
+                dev.RenderDriver?.Play();
             }
 
             ApplyPreferredMasterConsumerToInputs();
@@ -688,100 +690,34 @@ public class AudioEngine : IDisposable
         return true;
     }
 
-    private bool TryInitRender(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
+    private bool InitializeRenderDriver(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
     {
-        try
+        var driver = new EventDrivenRenderDevice(dev);
+        if (!driver.Start(mmDevice, latencyMs))
         {
-            var render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, latencyMs);
-            render.Init(dev.MixProvider!);
-            dev.Render = render;
-            dev.RenderLatencyMs = latencyMs;
-            return true;
-        }
-        catch
-        {
-            try { dev.Render?.Dispose(); } catch { }
-            dev.Render = null;
+            driver.Stop();
             return false;
         }
+
+        dev.RenderDriver = driver;
+        return true;
     }
 
-    private bool CreateAndStartCapture(ActiveDevice dev)
+    private bool InitializeCaptureDriver(ActiveDevice dev)
     {
         if (dev.RingBuffer == null)
         {
             return false;
         }
 
-        var mmDevice = _enumerator.GetDevice(dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
-            ? dev.Info.Id.Substring("loop:".Length)
-            : dev.Info.Id);
-        if (mmDevice == null)
+        var driver = new EventDrivenCaptureDevice(dev, _enumerator);
+        if (!driver.Start(_inputBufferMs))
         {
+            driver.Stop();
             return false;
         }
 
-        if (dev.IsLoopback)
-        {
-            dev.Capture = new WasapiLoopbackCapture(mmDevice);
-        }
-        else
-        {
-            dev.Capture = new WasapiCapture(mmDevice, true, _inputBufferMs);
-        }
-
-        dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
-        int channels = dev.Info.Channels;
-        // Reusable scratch for the WASAPI capture thread. NAudio's WasapiCapture exposes
-        // its packed-byte buffer via DataAvailable; we have to convert to float32 to fan out
-        // through the matrix. Allocating a fresh float[] every callback creates ~100 GC-tier
-        // allocations/sec per capture device, which under a game's CPU pressure causes Gen0
-        // collections that briefly stall the audio thread → overrun → ring trim → audible glitch.
-        // The scratch is owned only by this DataAvailable handler (single-threaded by NAudio).
-        float[] captureScratch = [];
-        dev.Capture.DataAvailable += (s, e) =>
-        {
-            if (dev.RingBuffer == null)
-            {
-                return;
-            }
-
-            int floatCount = e.BytesRecorded / 4;
-            if (floatCount <= 0) return;
-            int frames = floatCount / channels;
-
-            if (captureScratch.Length < floatCount)
-            {
-                // Grow with headroom so common jitter (callback delivering 2x frames after a stall)
-                // doesn't reallocate. Power-of-two-ish growth is fine.
-                int newSize = Math.Max(floatCount, captureScratch.Length * 2);
-                captureScratch = new float[newSize];
-            }
-            Buffer.BlockCopy(e.Buffer, 0, captureScratch, 0, e.BytesRecorded);
-
-            var peaks = dev.PeakLevels;
-            if (peaks != null)
-            {
-                for (int f = 0; f < frames; f++)
-                {
-                    int baseIdx = f * channels;
-                    for (int c = 0; c < channels; c++)
-                    {
-                        float v = captureScratch[baseIdx + c];
-                        if (v < 0) v = -v;
-                        if (v > peaks[c]) peaks[c] = v;
-                    }
-                }
-            }
-
-            if (!dev.RingBuffer.Write(captureScratch, 0, frames))
-            {
-                Interlocked.Increment(ref dev.InputOverflowCount);
-            }
-        };
-
-        dev.Capture.StartRecording();
-        dev.CaptureLatencyMs = _inputBufferMs;
+        dev.CaptureDriver = driver;
         return true;
     }
 
@@ -820,8 +756,8 @@ public class AudioEngine : IDisposable
     {
         foreach (var dev in _inputDevices)
         {
-            try { dev.Capture?.StopRecording(); } catch { }
-            try { dev.Capture?.Dispose(); } catch { }
+            try { dev.CaptureDriver?.Stop(); } catch { }
+            dev.CaptureDriver = null;
             dev.Capture = null;
         }
     }
@@ -830,8 +766,8 @@ public class AudioEngine : IDisposable
     {
         foreach (var dev in _outputDevices)
         {
-            try { dev.Render?.Stop(); } catch { }
-            try { dev.Render?.Dispose(); } catch { }
+            try { dev.RenderDriver?.Stop(); } catch { }
+            dev.RenderDriver = null;
             dev.Render = null;
         }
     }
@@ -840,16 +776,16 @@ public class AudioEngine : IDisposable
     {
         foreach (var dev in _inputDevices)
         {
-            try { dev.Capture?.StopRecording(); } catch { }
-            try { dev.Capture?.Dispose(); } catch { }
+            try { dev.CaptureDriver?.Stop(); } catch { }
+            dev.CaptureDriver = null;
             dev.Capture = null;
             dev.RingBuffer?.Clear();
         }
 
         foreach (var dev in _outputDevices)
         {
-            try { dev.Render?.Stop(); } catch { }
-            try { dev.Render?.Dispose(); } catch { }
+            try { dev.RenderDriver?.Stop(); } catch { }
+            dev.RenderDriver = null;
             dev.Render = null;
             try { dev.MixProvider?.DetachConsumer(); } catch { }
             dev.MixProvider = null;
