@@ -496,9 +496,14 @@ function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channel
 function mergeNativeMatrixWithLocalFlags(prevMatrix, nextNativeMatrix) {
   const mergeView = (prevView, nextView) => {
     const merged = {};
-    Object.keys(nextView || {}).forEach((key) => {
-      const nativeConn = nextView[key] || makeDefaultConnection();
+    const allKeys = new Set([...(Object.keys(prevView || {})), ...(Object.keys(nextView || {}))]);
+    allKeys.forEach((key) => {
+      const nativeConn = nextView?.[key];
       const prevConn = prevView?.[key] || makeDefaultConnection();
+      if (!nativeConn) {
+        merged[key] = prevConn;
+        return;
+      }
 
       const keepMutedLocal = !!prevConn?.muted;
       const keepGainLocal = !!prevConn?.on && Number.isFinite(prevConn?.gainDb);

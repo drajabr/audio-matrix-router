@@ -1041,7 +1041,10 @@ public class AudioEngine : IDisposable
         var removedInputIds = new HashSet<string>(inputsToRemove.Select(d => d.Info.Id));
         var removedOutputIds = new HashSet<string>(outputsToRemove.Select(d => d.Info.Id));
 
-        if (removedInputIds.Count == 0 || removedOutputIds.Count == 0)
+        // Capture routes when either side is being removed. If we require both sets to be
+        // non-empty, single-ended unplug/replug events (input-only or output-only) lose
+        // their dormant routes until a manual reload.
+        if (removedInputIds.Count == 0 && removedOutputIds.Count == 0)
             return;
 
         var front = _routingMatrix.GetFrontBuffer();

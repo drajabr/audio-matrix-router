@@ -874,9 +874,14 @@ public sealed class MainForm : Form
                     return;
 
                 case "setUiPreferences":
-                    _uiPreferencesJson = request.Params.TryGetProperty("json", out var uiJsonValue)
-                        ? uiJsonValue.GetString() ?? string.Empty
-                        : string.Empty;
+                    if (request.Params.TryGetProperty("json", out var uiJsonValue))
+                    {
+                        var nextUiJson = uiJsonValue.GetString();
+                        if (!string.IsNullOrWhiteSpace(nextUiJson))
+                        {
+                            _uiPreferencesJson = nextUiJson;
+                        }
+                    }
                     ScheduleSave();
                     await SendResultAsync(request.Id, true);
                     return;

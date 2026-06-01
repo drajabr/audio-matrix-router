@@ -148,7 +148,11 @@ public class AppConfig
             InputMasterDeviceId = engine.GetInputMasterDevice()?.Info.Id ?? "",
             OutputMasterDeviceId = engine.GetOutputMasterDevice()?.Info.Id ?? "",
             InputDeviceMode = inputDeviceMode is "input" or "loopback" or "both" ? inputDeviceMode : "both",
-            UiPreferencesJson = uiPreferencesJson ?? ""
+            // Never clear persisted tile/UI settings implicitly. If runtime hands us an empty
+            // string (race, startup gap, or transient bridge issue), keep the last good value.
+            UiPreferencesJson = !string.IsNullOrWhiteSpace(uiPreferencesJson)
+                ? uiPreferencesJson
+                : (previousConfig?.UiPreferencesJson ?? "")
         };
 
         // Build sets of active device IDs for comparison with dormant routes
