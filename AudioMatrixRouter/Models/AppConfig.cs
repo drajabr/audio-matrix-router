@@ -74,7 +74,26 @@ public class AppConfig
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase
     };
 
+    /// <summary>
+    /// Config now lives in %APPDATA%\AudioMatrixRouter\config.json.
+    ///
+    /// The previous location (next to the executable) silently lost settings whenever the
+    /// install directory was not writable (Program Files, read-only shares, sandboxed
+    /// installs): Save() swallowed the exception and the user's routes/devices vanished
+    /// on the next launch. %APPDATA% is always writable for the current user.
+    /// </summary>
     public static string GetConfigPath()
+    {
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+        if (string.IsNullOrWhiteSpace(appData))
+        {
+            // Extremely unusual; fall back to the legacy exe-side location.
+            return GetLegacyConfigPath();
+        }
+        return Path.Combine(appData, "AudioMatrixRouter", "config.json");
+    }
+
+    private static string GetLegacyConfigPath()
     {
         var exePath = Environment.ProcessPath ?? "";
         var dir = Path.GetDirectoryName(exePath) ?? ".";
@@ -83,14 +102,24 @@ public class AppConfig
 
     public static AppConfig? Load()
     {
-        var path = GetConfigPath();
-        if (!File.Exists(path)) return null;
-        try
+        // Preferred location first; fall back to the legacy exe-side file so existing
+        // installs migrate their settings transparently on first run (the next Save()
+        // writes to %APPDATA% and the legacy file is left untouched as a backup).
+        foreach (var path in new[] { GetConfigPath(), GetLegacyConfigPath() })
         {
-            var json = File.ReadAllText(path);
-            return JsonSerializer.Deserialize<AppConfig>(json, _jsonOptions);
+            if (!File.Exists(path)) continue;
+            try
+            {
+                var json = File.ReadAllText(path);
+                var config = JsonSerializer.Deserialize<AppConfig>(json, _jsonOptions);
+                if (config != null) return config;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[AppConfig] Load failed from '{path}': {ex}");
+            }
         }
-        catch { return null; }
+        return null;
     }
 
     public void Save()
@@ -148,11 +177,7 @@ public class AppConfig
             InputMasterDeviceId = engine.GetInputMasterDevice()?.Info.Id ?? "",
             OutputMasterDeviceId = engine.GetOutputMasterDevice()?.Info.Id ?? "",
             InputDeviceMode = inputDeviceMode is "input" or "loopback" or "both" ? inputDeviceMode : "both",
-            // Never clear persisted tile/UI settings implicitly. If runtime hands us an empty
-            // string (race, startup gap, or transient bridge issue), keep the last good value.
-            UiPreferencesJson = !string.IsNullOrWhiteSpace(uiPreferencesJson)
-                ? uiPreferencesJson
-                : (previousConfig?.UiPreferencesJson ?? "")
+            UiPreferencesJson = uiPreferencesJson ?? ""
         };
 
         // Build sets of active device IDs for comparison with dormant routes

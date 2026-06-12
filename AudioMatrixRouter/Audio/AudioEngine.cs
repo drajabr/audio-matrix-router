@@ -10,10 +10,9 @@ public class ActiveDevice
     public int GlobalChannelOffset { get; set; }
     public RingBuffer? RingBuffer { get; set; }
     public WasapiCapture? Capture { get; set; }
-    public EventDrivenCaptureDevice? CaptureDriver { get; set; }
     public WasapiOut? Render { get; set; }
-    public EventDrivenRenderDevice? RenderDriver { get; set; }
     public MixingSampleProvider? MixProvider { get; set; }
+    public InputAsrc? InputAsrc { get; set; }
     public bool IsMasterDevice { get; set; }
     public int OutputDelayMs { get; set; }
     public string ConsumerId { get; set; } = string.Empty;
@@ -24,17 +23,37 @@ public class ActiveDevice
     public double BaseLatencyMs { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
     public float[]? PeakLevels;
-
 }
 
+/// <summary>
+/// AudioEngine — sync-architecture rewrite.
+///
+/// Clocking model:
+///   * ENGINE CLOCK = master output device's nominal sample rate / render callback.
+///   * Capture side: each input's WASAPI callback feeds an InputAsrc that converts the
+///     capture stream (any rate, any crystal) into engine-rate frames before they enter
+///     the shared ring. A fill-level PI per input absorbs capture-crystal drift, so the
+///     master/input relationship can no longer drift unboundedly.
+///   * Render side: each output's MixingSampleProvider consumes engine-rate frames and
+///     resamples to its device rate; followers carry a ppm trim from the coordinator's
+///     cursor-truth phase loop. The master output plays at exactly 1.0.
+///
+/// Startup ordering (matters for phase zero):
+///   rings → coordinator → providers (consumer cursors pinned on empty rings)
+///   → renders initialised → captures started → renders played together.
+///   All consumers therefore observe identical stream positions; the prefill barrier
+///   releases everyone simultaneously with timelines zeroed together.
+/// </summary>
 public class AudioEngine : IDisposable
 {
     private const int DefaultInputRingBufferMs = 80;
     private const int DefaultOutputBufferMs = 100;
-    // Keep ring buffers at a stable ceiling to avoid producer/consumer rewire glitches at runtime.
-    // The input buffer slider controls WASAPI capture period, while rings provide spike headroom.
+    // Ring capacity stays at a stable ceiling; sliders move targets, not allocations.
     private const int RingBufferCapacityMs = 400;
     private const int RenderPeriodMs = 10;
+    // Input ASRC keeps ring fill at (output buffer + headroom) so render-side jitter
+    // never starves the ring in steady state.
+    private const int InputFillHeadroomMs = 30;
 
     private readonly DeviceEnumerator _enumerator = new();
     private readonly List<ActiveDevice> _inputDevices = [];
@@ -44,7 +63,8 @@ public class AudioEngine : IDisposable
     private OutputSyncCoordinator? _syncCoordinator;
     private int _inputBufferMs = DefaultInputRingBufferMs;
     private int _outputBufferMs = DefaultOutputBufferMs;
-    
+    private int _engineSampleRate = 48000;
+
     /// <summary>
     /// Stores routes that were active but whose devices became unavailable.
     /// These routes are preserved so they can be restored when devices reconnect.
@@ -88,11 +108,11 @@ public class AudioEngine : IDisposable
 
         var consumerId = string.IsNullOrWhiteSpace(output.ConsumerId) ? output.Info.Id : output.ConsumerId;
         int queuedFrames = input.RingBuffer.GetAvailableFrames(consumerId);
-        double captureQueueMs = input.Info.SampleRate > 0
-            ? (queuedFrames * 1000.0) / input.Info.SampleRate
+        // Rings hold engine-rate frames after the input ASRC stage.
+        double captureQueueMs = _engineSampleRate > 0
+            ? (queuedFrames * 1000.0) / _engineSampleRate
             : 0;
 
-        // Real driver latencies queried at Start(); fall back to the requested period if unavailable.
         int captureDriverMs = input.CaptureLatencyMs > 0 ? input.CaptureLatencyMs : _inputBufferMs;
         int renderDriverMs = output.RenderLatencyMs > 0 ? output.RenderLatencyMs : RenderPeriodMs;
 
@@ -121,14 +141,11 @@ public class AudioEngine : IDisposable
 
         int captureDriverMs = inputMaster.CaptureLatencyMs > 0 ? inputMaster.CaptureLatencyMs : _inputBufferMs;
 
-        // The capture-to-render ring queue is the variable buffering the sync controller actively
-        // moves around. Without it the displayed latency is just the static driver constant and
-        // never reflects what the buffer is actually doing.
         double queueMs = 0;
-        if (inputMaster.Info.SampleRate > 0)
+        if (_engineSampleRate > 0)
         {
             int queuedFrames = inputMaster.RingBuffer.GetAvailableFrames(consumerId);
-            queueMs = (queuedFrames * 1000.0) / inputMaster.Info.SampleRate;
+            queueMs = (queuedFrames * 1000.0) / _engineSampleRate;
         }
 
         latencyMs = captureDriverMs + queueMs;
@@ -157,6 +174,9 @@ public class AudioEngine : IDisposable
 
     public bool SetInputMasterDevice(string deviceId)
     {
+        // The input-master flag is retained for UI/telemetry; the sync architecture
+        // disciplines every input independently against the engine clock, so it has
+        // no controller role anymore.
         if (string.IsNullOrWhiteSpace(deviceId))
         {
             bool cleared = false;
@@ -166,14 +186,6 @@ public class AudioEngine : IDisposable
                 {
                     d.IsMasterDevice = false;
                     cleared = true;
-                }
-            }
-
-            if (_running)
-            {
-                foreach (var output in _outputDevices)
-                {
-                    output.MixProvider?.SetInputMasterDevice(string.Empty);
                 }
             }
 
@@ -199,14 +211,6 @@ public class AudioEngine : IDisposable
             }
         }
 
-        if (_running)
-        {
-            foreach (var output in _outputDevices)
-            {
-                output.MixProvider?.SetInputMasterDevice(deviceId);
-            }
-        }
-
         if (changed)
         {
             StateChanged?.Invoke();
@@ -229,8 +233,8 @@ public class AudioEngine : IDisposable
                 }
             }
 
-            _syncCoordinator?.SetMasterConsumer(string.Empty);
-            ApplyPreferredMasterConsumerToInputs();
+            // Changing the clock reference mid-flight requires a clean re-anchor.
+            if (_running) FullRestart();
 
             if (cleared)
             {
@@ -254,8 +258,9 @@ public class AudioEngine : IDisposable
             }
         }
 
-        _syncCoordinator?.SetMasterConsumer(deviceId);
-        ApplyPreferredMasterConsumerToInputs();
+        // The master output DEFINES the engine clock; switching it changes the clock
+        // domain, so restart cleanly rather than re-pointing controllers mid-stream.
+        if (changed && _running) FullRestart();
 
         if (changed)
         {
@@ -332,10 +337,14 @@ public class AudioEngine : IDisposable
         if (found == null) return false;
 
         var ad = new ActiveDevice { Info = found, IsLoopback = isLoopback };
+        bool wasRunning = _running;
+        if (wasRunning) Stop();
         _inputDevices.Add(ad);
         RecalcChannelOffsets();
 
         RestoreDormantRoutesForInputDevice(deviceId);
+
+        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
 
         StateChanged?.Invoke();
         return true;
@@ -353,10 +362,14 @@ public class AudioEngine : IDisposable
         {
             Info = found,
         };
+        bool wasRunning = _running;
+        if (wasRunning) Stop();
         _outputDevices.Add(ad);
         RecalcChannelOffsets();
 
         RestoreDormantRoutesForOutputDevice(deviceId);
+
+        if (wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
 
         StateChanged?.Invoke();
         return true;
@@ -435,11 +448,10 @@ public class AudioEngine : IDisposable
     public void RemoveInputDevice(int index)
     {
         if (index < 0 || index >= _inputDevices.Count) return;
-        
-        // Capture routes for this device before removing it
+
         var deviceToRemove = _inputDevices[index];
         CaptureRoutesForRemovedDevices(new List<ActiveDevice> { deviceToRemove }, new List<ActiveDevice>());
-        
+
         var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
         if (wasRunning) Stop();
@@ -453,11 +465,10 @@ public class AudioEngine : IDisposable
     public void RemoveOutputDevice(int index)
     {
         if (index < 0 || index >= _outputDevices.Count) return;
-        
-        // Capture routes for this device before removing it
+
         var deviceToRemove = _outputDevices[index];
         CaptureRoutesForRemovedDevices(new List<ActiveDevice>(), new List<ActiveDevice> { deviceToRemove });
-        
+
         var routeSnapshot = CaptureRoutedCrosspoints();
         bool wasRunning = _running;
         if (wasRunning) Stop();
@@ -525,47 +536,24 @@ public class AudioEngine : IDisposable
         {
             var masterOutput = GetOutputMasterDevice() ?? _outputDevices.First();
 
-            // The mixer reads source-rate samples block-by-block at the output's nominal rate
-            // without resampling. If a routed input runs at a different sample rate than its
-            // destination output, the result is pitch-shifted audio. Surface this loudly in the
-            // debug log so it can be diagnosed from field reports; the engine still starts so
-            // matched-rate routes keep working.
-            foreach (var outDev in _outputDevices)
-            {
-                foreach (var inDev in _inputDevices)
-                {
-                    if (inDev.Info.SampleRate > 0
-                        && outDev.Info.SampleRate > 0
-                        && inDev.Info.SampleRate != outDev.Info.SampleRate)
-                    {
-                        System.Diagnostics.Debug.WriteLine(
-                            $"[AudioEngine] WARNING: sample-rate mismatch — input '{inDev.Info.Name}' @ {inDev.Info.SampleRate} Hz routed to output '{outDev.Info.Name}' @ {outDev.Info.SampleRate} Hz will play at the wrong pitch (no SRC).");
-                    }
-                }
-            }
+            // ===== 1. Engine clock = master output's nominal rate =====
+            _engineSampleRate = masterOutput.Info.SampleRate > 0 ? masterOutput.Info.SampleRate : 48000;
 
-            // Setup captures
+            // ===== 2. Allocate rings (engine-rate content) =====
+            int ringFrames = Math.Max(_engineSampleRate * RingBufferCapacityMs / 1000, _engineSampleRate / 200);
             foreach (var dev in _inputDevices)
             {
-                var mmDevice = _enumerator.GetDevice(dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
-                    ? dev.Info.Id.Substring("loop:".Length)
-                    : dev.Info.Id);
-                if (mmDevice == null) continue;
-
-                // Allocate a stable ring once per run; avoid runtime ring object swaps.
-                int ringBufferMs = RingBufferCapacityMs;
-                int ringFrames = Math.Max(dev.Info.SampleRate * ringBufferMs / 1000, dev.Info.SampleRate / 200);
                 dev.RingBuffer = new RingBuffer(ringFrames, dev.Info.Channels);
                 dev.InputOverflowCount = 0;
                 dev.PeakLevels = new float[dev.Info.Channels];
-                if (!InitializeCaptureDriver(dev))
-                {
-                    continue;
-                }
+                dev.InputAsrc = null; // built when the capture is created
             }
 
-            var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
-            _syncCoordinator = new OutputSyncCoordinator(masterOutput.Info.Id, baseMasterTargetFrames, maxMasterTargetFrames);
+            // ===== 3. Coordinator =====
+            var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames();
+            _syncCoordinator = new OutputSyncCoordinator(
+                masterOutput.Info.Id, _engineSampleRate, baseMasterTargetFrames, maxMasterTargetFrames);
+            _syncCoordinator.ArmGlobalRefillHold();
 
             var sources = _inputDevices
                 .Where(d => d.RingBuffer != null)
@@ -577,7 +565,7 @@ public class AudioEngine : IDisposable
                     d.IsMasterDevice))
                 .ToList();
 
-            // Start render
+            // ===== 4. Providers + renders (consumer cursors pinned on EMPTY rings) =====
             var startedOutputs = new List<ActiveDevice>();
             foreach (var dev in _outputDevices)
             {
@@ -585,7 +573,6 @@ public class AudioEngine : IDisposable
                 if (mmDevice == null) continue;
 
                 dev.ConsumerId = dev.Info.Id;
-
                 dev.MixProvider = new MixingSampleProvider(
                     _routingMatrix, sources,
                     dev.GlobalChannelOffset,
@@ -595,14 +582,12 @@ public class AudioEngine : IDisposable
                     _outputBufferMs,
                     dev.ConsumerId,
                     _syncCoordinator);
-                var inputMaster = GetInputMasterDevice();
-                if (inputMaster != null)
-                {
-                    dev.MixProvider.SetInputMasterDevice(inputMaster.Info.Id);
-                }
 
-                if (!InitializeRenderDriver(dev, mmDevice, _outputBufferMs))
+                if (!TryInitRender(dev, mmDevice, _outputBufferMs))
                 {
+                    try { dev.MixProvider?.DetachConsumer(); } catch { }
+                    dev.MixProvider = null;
+                    dev.ConsumerId = string.Empty;
                     continue; // Skip this device; engine continues with the remaining outputs.
                 }
 
@@ -616,7 +601,10 @@ public class AudioEngine : IDisposable
                 return false;
             }
 
-            // If the preferred master failed to initialize, promote a live output as runtime master.
+            // If the preferred master failed to initialise, promote a live output as runtime
+            // master. The promoted device's nominal rate may differ from the engine rate that
+            // rings/providers were built around — providers convert by ratio, so audio stays
+            // correct; the engine rate is simply no longer 1:1 with the master (harmless).
             if (!startedOutputs.Any(d => d.Info.Id == masterOutput.Info.Id))
             {
                 var runtimeMaster = startedOutputs[0];
@@ -625,18 +613,30 @@ public class AudioEngine : IDisposable
                     d.IsMasterDevice = d.Info.Id == runtimeMaster.Info.Id;
                 }
 
-                _syncCoordinator?.SetMasterConsumer(runtimeMaster.Info.Id);
-                var (runtimeBaseTargetFrames, runtimeMaxTargetFrames) = CalculateSyncTargetFrames(runtimeMaster);
-                _syncCoordinator?.SetMasterBufferTarget(runtimeBaseTargetFrames, runtimeMaxTargetFrames);
+                _syncCoordinator.SetMasterConsumer(runtimeMaster.Info.Id);
+                _syncCoordinator.ArmGlobalRefillHold();
+                masterOutput = runtimeMaster;
             }
 
-            // Play all outputs together after all are initialized to minimize startup cursor skew.
+            // Preferred consumer for ring trim ordering + the input ASRC fill reference.
+            ApplyPreferredMasterConsumerToInputs();
+
+            // ===== 5. Start captures (rings begin filling; cursors already pinned) =====
+            int inputFillTargetFrames = CalculateInputFillTargetFrames();
+            foreach (var dev in _inputDevices)
+            {
+                if (dev.RingBuffer == null) continue;
+                if (!CreateAndStartCapture(dev, inputFillTargetFrames, masterOutput.Info.Id))
+                {
+                    continue;
+                }
+            }
+
+            // ===== 6. Play all outputs together =====
             foreach (var dev in _outputDevices)
             {
-                dev.RenderDriver?.Play();
+                try { dev.Render?.Play(); } catch { }
             }
-
-            ApplyPreferredMasterConsumerToInputs();
 
             _running = true;
             StateChanged?.Invoke();
@@ -684,40 +684,121 @@ public class AudioEngine : IDisposable
             FullRestart();
         }
 
-        UpdateSyncBufferTargets();
-
         StateChanged?.Invoke();
         return true;
     }
 
-    private bool InitializeRenderDriver(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
+    private bool TryInitRender(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
     {
-        var driver = new EventDrivenRenderDevice(dev);
-        if (!driver.Start(mmDevice, latencyMs))
+        try
         {
-            driver.Stop();
+            var render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, latencyMs);
+            render.Init(dev.MixProvider!);
+            dev.Render = render;
+            dev.RenderLatencyMs = latencyMs;
+            return true;
+        }
+        catch
+        {
+            try { dev.Render?.Dispose(); } catch { }
+            dev.Render = null;
             return false;
         }
-
-        dev.RenderDriver = driver;
-        return true;
     }
 
-    private bool InitializeCaptureDriver(ActiveDevice dev)
+    private bool CreateAndStartCapture(ActiveDevice dev, int fillTargetFrames, string masterConsumerId)
     {
         if (dev.RingBuffer == null)
         {
             return false;
         }
 
-        var driver = new EventDrivenCaptureDevice(dev, _enumerator);
-        if (!driver.Start(_inputBufferMs))
+        var mmDevice = _enumerator.GetDevice(dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
+            ? dev.Info.Id.Substring("loop:".Length)
+            : dev.Info.Id);
+        if (mmDevice == null)
         {
-            driver.Stop();
             return false;
         }
 
-        dev.CaptureDriver = driver;
+        if (dev.IsLoopback)
+        {
+            dev.Capture = new WasapiLoopbackCapture(mmDevice);
+        }
+        else
+        {
+            dev.Capture = new WasapiCapture(mmDevice, true, _inputBufferMs);
+        }
+
+        dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
+
+        // Capture-side ASRC: convert this device's stream into the engine clock domain.
+        // Handles BOTH static rate mismatch (e.g. 44.1k capture → 48k engine) and crystal
+        // drift (fill-level PI), so the rings always contain coherent engine-rate audio.
+        var asrc = new InputAsrc(dev.RingBuffer, dev.Info.Channels, dev.Info.SampleRate, _engineSampleRate, fillTargetFrames);
+        asrc.SetFillConsumer(masterConsumerId);
+        dev.InputAsrc = asrc;
+
+        int channels = dev.Info.Channels;
+        // Reusable scratch for the WASAPI capture thread; avoids per-callback GC pressure
+        // (allocation-triggered Gen0 collections were a real source of audio-thread stalls).
+        float[] captureScratch = [];
+        dev.Capture.DataAvailable += (s, e) =>
+        {
+            var ring = dev.RingBuffer;
+            var deviceAsrc = dev.InputAsrc;
+            if (ring == null || deviceAsrc == null)
+            {
+                return;
+            }
+
+            int floatCount = e.BytesRecorded / 4;
+            if (floatCount <= 0) return;
+            int frames = floatCount / channels;
+            if (frames <= 0) return;
+
+            if (captureScratch.Length < floatCount)
+            {
+                int newSize = Math.Max(floatCount, Math.Max(64, captureScratch.Length * 2));
+                captureScratch = new float[newSize];
+            }
+            Buffer.BlockCopy(e.Buffer, 0, captureScratch, 0, e.BytesRecorded);
+
+            var peaks = dev.PeakLevels;
+            if (peaks != null)
+            {
+                for (int f = 0; f < frames; f++)
+                {
+                    int baseIdx = f * channels;
+                    for (int c = 0; c < channels; c++)
+                    {
+                        float v = captureScratch[baseIdx + c];
+                        if (v < 0) v = -v;
+                        if (v > peaks[c]) peaks[c] = v;
+                    }
+                }
+            }
+
+            int written = deviceAsrc.ProcessAndWrite(captureScratch, frames);
+            if (written <= 0 && frames > 0)
+            {
+                Interlocked.Increment(ref dev.InputOverflowCount);
+            }
+        };
+
+        try
+        {
+            dev.Capture.StartRecording();
+        }
+        catch
+        {
+            try { dev.Capture?.Dispose(); } catch { }
+            dev.Capture = null;
+            dev.InputAsrc = null;
+            return false;
+        }
+
+        dev.CaptureLatencyMs = _inputBufferMs;
         return true;
     }
 
@@ -740,8 +821,6 @@ public class AudioEngine : IDisposable
             FullRestart();
         }
 
-        UpdateSyncBufferTargets();
-
         StateChanged?.Invoke();
         return true;
     }
@@ -752,40 +831,21 @@ public class AudioEngine : IDisposable
         Start();
     }
 
-    private void StopAllCapturesNoThrow()
-    {
-        foreach (var dev in _inputDevices)
-        {
-            try { dev.CaptureDriver?.Stop(); } catch { }
-            dev.CaptureDriver = null;
-            dev.Capture = null;
-        }
-    }
-
-    private void StopAllRendersNoThrow()
-    {
-        foreach (var dev in _outputDevices)
-        {
-            try { dev.RenderDriver?.Stop(); } catch { }
-            dev.RenderDriver = null;
-            dev.Render = null;
-        }
-    }
-
     public void Stop()
     {
         foreach (var dev in _inputDevices)
         {
-            try { dev.CaptureDriver?.Stop(); } catch { }
-            dev.CaptureDriver = null;
+            try { dev.Capture?.StopRecording(); } catch { }
+            try { dev.Capture?.Dispose(); } catch { }
             dev.Capture = null;
+            dev.InputAsrc = null;
             dev.RingBuffer?.Clear();
         }
 
         foreach (var dev in _outputDevices)
         {
-            try { dev.RenderDriver?.Stop(); } catch { }
-            dev.RenderDriver = null;
+            try { dev.Render?.Stop(); } catch { }
+            try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
             try { dev.MixProvider?.DetachConsumer(); } catch { }
             dev.MixProvider = null;
@@ -830,38 +890,25 @@ public class AudioEngine : IDisposable
         foreach (var input in _inputDevices)
         {
             input.RingBuffer?.SetPreferredConsumer(preferredConsumerId);
+            input.InputAsrc?.SetFillConsumer(preferredConsumerId);
         }
     }
 
-    private void UpdateSyncBufferTargets()
+    private int CalculateInputFillTargetFrames()
     {
-        if (_syncCoordinator == null) return;
-
-        var masterOutput = GetOutputMasterDevice() ?? _outputDevices.FirstOrDefault();
-        if (masterOutput == null) return;
-
-        var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames(masterOutput);
-        _syncCoordinator.SetMasterBufferTarget(baseMasterTargetFrames, maxMasterTargetFrames);
+        // Keep ring fill at output-buffer + headroom so render jitter never starves the
+        // ring, while staying well inside ring capacity (400 ms).
+        int targetMs = Math.Clamp(_outputBufferMs + InputFillHeadroomMs, 20, RingBufferCapacityMs * 3 / 4);
+        return Math.Max(64, _engineSampleRate * targetMs / 1000);
     }
 
-    private (int BaseMasterTargetFrames, int MaxMasterTargetFrames) CalculateSyncTargetFrames(ActiveDevice? masterOutput)
+    private (int BaseMasterTargetFrames, int MaxMasterTargetFrames) CalculateSyncTargetFrames()
     {
-        int sampleRate = masterOutput?.Info.SampleRate
-            ?? _inputDevices.FirstOrDefault()?.Info.SampleRate
-            ?? 48000;
+        int sampleRate = _engineSampleRate > 0 ? _engineSampleRate : 48000;
 
         int desiredByOutputBufferFrames = Math.Max(sampleRate * _outputBufferMs / 1000, sampleRate / 200);
-
-        // Use actual ring capacity from live ring buffers (stable 400ms buffers).
-        int projectedRingCapacityFrames = sampleRate * RingBufferCapacityMs / 1000;
-        int minRingCapacityFrames = _inputDevices
-            .Where(d => d.RingBuffer != null)
-            .Select(d => d.RingBuffer!.CapacityFrames)
-            .DefaultIfEmpty(projectedRingCapacityFrames)
-            .Min();
-
-        // Reserve some headroom before the ring overflows: allow up to 80% of ring capacity.
-        int maxSafeTargetFrames = Math.Max(64, (minRingCapacityFrames * 4) / 5);
+        int ringCapacityFrames = sampleRate * RingBufferCapacityMs / 1000;
+        int maxSafeTargetFrames = Math.Max(64, (ringCapacityFrames * 4) / 5);
         int baseTargetFrames = Math.Max(64, Math.Min(desiredByOutputBufferFrames, maxSafeTargetFrames));
 
         return (baseTargetFrames, Math.Max(baseTargetFrames, maxSafeTargetFrames));
@@ -977,9 +1024,6 @@ public class AudioEngine : IDisposable
         var removedInputIds = new HashSet<string>(inputsToRemove.Select(d => d.Info.Id));
         var removedOutputIds = new HashSet<string>(outputsToRemove.Select(d => d.Info.Id));
 
-        // Capture routes when either side is being removed. If we require both sets to be
-        // non-empty, single-ended unplug/replug events (input-only or output-only) lose
-        // their dormant routes until a manual reload.
         if (removedInputIds.Count == 0 && removedOutputIds.Count == 0)
             return;
 
@@ -1011,14 +1055,14 @@ public class AudioEngine : IDisposable
                 if (inLocal < 0 || outLocal < 0) continue;
 
                 float gainDb = cp.Gain <= 0f ? -60f : 20f * MathF.Log10(cp.Gain);
-                
+
                 // Add or update this route in dormant routes
                 var existing = _dormantRoutes.FirstOrDefault(r =>
                     r.InputDeviceId == inDevice.Info.Id &&
                     r.InputLocalChannel == inLocal &&
                     r.OutputDeviceId == outDevice.Info.Id &&
                     r.OutputLocalChannel == outLocal);
-                
+
                 if (existing == default)
                 {
                     _dormantRoutes.Add(new RoutedCrosspoint(
