@@ -496,14 +496,9 @@ function buildMatrixByViewFromNativeState(state, deviceRows, deviceCols, channel
 function mergeNativeMatrixWithLocalFlags(prevMatrix, nextNativeMatrix) {
   const mergeView = (prevView, nextView) => {
     const merged = {};
-    const allKeys = new Set([...(Object.keys(prevView || {})), ...(Object.keys(nextView || {}))]);
-    allKeys.forEach((key) => {
-      const nativeConn = nextView?.[key];
+    Object.keys(nextView || {}).forEach((key) => {
+      const nativeConn = nextView[key] || makeDefaultConnection();
       const prevConn = prevView?.[key] || makeDefaultConnection();
-      if (!nativeConn) {
-        merged[key] = prevConn;
-        return;
-      }
 
       const keepMutedLocal = !!prevConn?.muted;
       const keepGainLocal = !!prevConn?.on && Number.isFinite(prevConn?.gainDb);
@@ -1214,18 +1209,18 @@ export default function App() {
       setOutputLatencyMs(nativeOutputPathLatency);
       setBufferMs(nativeInputPathLatency);
 
-      if (nativeInputPathLatency != null && inputLatencyLastRef.current != null) {
-        const inputDelta = Math.round(Math.abs(nativeInputPathLatency - inputLatencyLastRef.current) * 10) / 10;
-        setInputJitterMs(inputDelta < 0.5 ? 0 : inputDelta);
-      } else {
-        setInputJitterMs(nativeInputPathLatency != null ? 0 : null);
-      }
+      // Input jitter is now a real engine measurement: peak-to-peak ring-fill excursion
+      // since the last state push (worst input). The old |Δlatency-between-polls| was
+      // sampling noise, not jitter.
+      const nativeInputJitter = Number.isFinite(state?.inputJitterMs)
+        ? Math.round(Number(state.inputJitterMs) * 10) / 10
+        : null;
+      setInputJitterMs(nativeInputJitter ?? (nativeInputPathLatency != null ? 0 : null));
 
-      if (nativeOutputPathLatency != null && outputLatencyLastRef.current != null) {
-        setOutputJitterMs(Math.round(Math.abs(nativeOutputPathLatency - outputLatencyLastRef.current) * 10) / 10);
-      } else {
-        setOutputJitterMs(nativeOutputPathLatency != null ? 0 : null);
-      }
+      // Output-path latency (driver buffer + fixed delay) is constant by construction, so
+      // a poll-delta "jitter" of it is always ~0 and meaningless; the output tile's sync
+      // metric (variationRangeMs from the phase controller) is the real signal.
+      setOutputJitterMs(null);
 
       inputLatencyLastRef.current = nativeInputPathLatency;
       outputLatencyLastRef.current = nativeOutputPathLatency;
@@ -3764,7 +3759,9 @@ export default function App() {
   })();
   const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "0ms";
   const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "0ms";
-  const inputBufferLabel = `${captureBufferMs}ms`;
+  // Input tile "Latency" is a MEASUREMENT (capture driver + measured ring queue), not an
+  // echo of the buffer knob. Fall back to the knob value only when no measurement exists.
+  const inputPathLatencyLabel = inputLatencyMs != null ? `${inputLatencyMs}ms` : `${captureBufferMs}ms`;
   const inputJitterLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "0ms");
   const outputVarianceLabel = (() => {
     if (!hasNativeBridge) {
@@ -3773,6 +3770,8 @@ export default function App() {
 
     if (routedOutputs.length <= 1) return "0ms";
 
+    // Under the native bridge this is always the phase controller's actual smoothed sync
+    // error (worst follower when looking at the master device). No noise fallbacks.
     if (Number.isFinite(outputSideMeta?.variationRangeMs)) {
       const rawRangeMs = Number(outputSideMeta.variationRangeMs);
       const rangeMsLabel = Math.abs(rawRangeMs) < 1
@@ -3781,7 +3780,7 @@ export default function App() {
       return rangeMsLabel;
     }
 
-    return outputJitterMs != null ? `${outputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "0ms");
+    return "0ms";
   })();
 
   const inputOverflowLabel = hasNativeBridge ? formatCounter(inputSideMeta?.overflows) : "0";
@@ -4639,14 +4638,14 @@ export default function App() {
           <div className="card-metrics-box">
             <div className="metric-tile">
               <span className="metric-title">Latency</span>
-              <span className="metric-value">{inputBufferLabel}</span>
+              <span className="metric-value">{inputPathLatencyLabel}</span>
             </div>
             <div className="metric-tile">
               <span className="metric-title">Jitter</span>
               <span className="metric-value">{inputJitterLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Underruns</span>
+              <span className="metric-title">Overflows</span>
               <span className="metric-value">{inputOverflowLabel}</span>
             </div>
             <div className="metric-tile">
@@ -4720,7 +4719,7 @@ export default function App() {
               <span className="metric-value">{destinationLatencyLabel}</span>
             </div>
             <div className="metric-tile">
-              <span className="metric-title">Variance</span>
+              <span className="metric-title">Sync</span>
               <span className="metric-value metric-value-variance">{outputVarianceLabel}</span>
             </div>
             <div className="metric-tile">

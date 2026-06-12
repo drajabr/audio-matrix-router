@@ -167,6 +167,25 @@ public class AudioEngine : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Measured input-side timing jitter: the worst peak-to-peak ring-fill excursion (ms)
+    /// across all inputs since the last call. A true engine measurement of capture/render
+    /// callback timing interplay — replaces the old UI's poll-delta sampling noise.
+    /// </summary>
+    public bool TryGetInputJitterMs(out double jitterMs)
+    {
+        jitterMs = 0;
+        bool any = false;
+        foreach (var dev in _inputDevices)
+        {
+            var sample = dev.InputAsrc?.GetAndResetFillJitterMs();
+            if (sample == null) continue;
+            any = true;
+            if (sample.Value > jitterMs) jitterMs = sample.Value;
+        }
+        return any;
+    }
+
     public void Init()
     {
         _enumerator.SetChangeCallback(() => DevicesChanged?.Invoke());

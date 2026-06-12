@@ -48,6 +48,14 @@ public sealed class InputAsrc
     private double _integralFrames;
     private string _fillConsumerId = string.Empty;
 
+    // Real jitter measurement: peak-to-peak ring-fill excursion observed since the last
+    // harvest by the UI. Because the fill servo holds the mean at target, this excursion
+    // IS the timing jitter of the capture/render callback interplay — a true measurement,
+    // unlike the old UI's |Δlatency-between-polls| sampling noise.
+    private int _fillMinFrames = int.MaxValue;
+    private int _fillMaxFrames = int.MinValue;
+    private readonly object _jitterLock = new();
+
     // Resampler state: previous block's last frame (for interpolation continuity across
     // callback boundaries) and the fractional source position carried between blocks.
     private readonly float[] _lastFrame;
@@ -81,6 +89,26 @@ public sealed class InputAsrc
     public void SetFillConsumer(string consumerId)
     {
         _fillConsumerId = consumerId ?? string.Empty;
+    }
+
+    /// <summary>
+    /// Peak-to-peak ring-fill excursion (ms) since the last call, then resets the window.
+    /// Returns null until at least two observations exist. Windowed by the UI's own poll
+    /// cadence, so the number shown is exactly "the jitter since you last looked".
+    /// </summary>
+    public double? GetAndResetFillJitterMs()
+    {
+        lock (_jitterLock)
+        {
+            int min = _fillMinFrames;
+            int max = _fillMaxFrames;
+            _fillMinFrames = int.MaxValue;
+            _fillMaxFrames = int.MinValue;
+
+            if (min == int.MaxValue || max == int.MinValue) return null; // no observations yet
+            if (max <= min) return 0;
+            return Math.Round((max - min) * 1000.0 / _engineSampleRate, 1);
+        }
     }
 
     /// <summary>
@@ -194,6 +222,12 @@ public sealed class InputAsrc
         int fill = string.IsNullOrEmpty(consumer)
             ? _ring.AvailableFrames
             : _ring.GetAvailableFrames(consumer);
+
+        lock (_jitterLock)
+        {
+            if (fill < _fillMinFrames) _fillMinFrames = fill;
+            if (fill > _fillMaxFrames) _fillMaxFrames = fill;
+        }
 
         double error = fill - _targetFillFrames; // positive: ring too full → slow down (trim negative)
 

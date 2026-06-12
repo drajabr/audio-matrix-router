@@ -874,14 +874,9 @@ public sealed class MainForm : Form
                     return;
 
                 case "setUiPreferences":
-                    if (request.Params.TryGetProperty("json", out var uiJsonValue))
-                    {
-                        var nextUiJson = uiJsonValue.GetString();
-                        if (!string.IsNullOrWhiteSpace(nextUiJson))
-                        {
-                            _uiPreferencesJson = nextUiJson;
-                        }
-                    }
+                    _uiPreferencesJson = request.Params.TryGetProperty("json", out var uiJsonValue)
+                        ? uiJsonValue.GetString() ?? string.Empty
+                        : string.Empty;
                     ScheduleSave();
                     await SendResultAsync(request.Id, true);
                     return;
@@ -1208,6 +1203,9 @@ public sealed class MainForm : Form
             TotalLatencyMs = maxWorkingLatencyMs,
             InputLatencyMs = inputPathLatencyMs,
             OutputLatencyMs = outputPathLatencyMs,
+            InputJitterMs = _engine.TryGetInputJitterMs(out var measuredInputJitter)
+                ? Math.Round(measuredInputJitter, 1)
+                : (double?)null,
             HasFullDeviceLists = includeAvailableDevices,
             AvailableInputs = availableInputs,
             AvailableOutputs = availableOutputs,
@@ -1446,6 +1444,7 @@ public sealed class MainForm : Form
         public double? TotalLatencyMs { get; set; }
         public double? InputLatencyMs { get; set; }
         public double? OutputLatencyMs { get; set; }
+        public double? InputJitterMs { get; set; }
         public bool HasFullDeviceLists { get; set; }
         public List<DeviceState>? AvailableInputs { get; set; }
         public List<DeviceState>? AvailableOutputs { get; set; }
