@@ -58,10 +58,6 @@ public partial class MainWindow : Window
 
     public MainWindow()
     {
-        InitializeComponent();
-
-        VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.0.0");
-
         _controller = new AppController(action => Dispatcher.UIThread.Post(action));
         _controller.UpdateDownloadProgress += OnUpdateDownloadProgress;
         // Initialize BEFORE subscribing StateChanged: it raises the event synchronously
@@ -69,6 +65,18 @@ public partial class MainWindow : Window
         _controller.Initialize();
 
         _prefs = new UiPreferences(_controller);
+
+        // THE ROOT FIX: honor the user's persisted theme presets BEFORE the first render.
+        // This must precede InitializeComponent() so the custom controls' cached palettes
+        // (and everything else that reads Theme.X) see the applied values, never defaults.
+        AppTheme.Apply(_prefs.BackgroundKey, _prefs.AccentKey, _prefs.FontKey,
+            _prefs.FontSizeKey, _prefs.UiScaleKey);
+
+        InitializeComponent();
+        ApplyThemeToWindow();
+
+        VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.0.0");
+
         ApplyPreferences();
         RestoreWindowPlacement();
 
@@ -122,6 +130,97 @@ public partial class MainWindow : Window
     // =====================================================================
     // startup / shutdown
     // =====================================================================
+
+    /// <summary>
+    /// Push the applied Theme into everything XAML declared statically: mutate the
+    /// resource brushes IN PLACE (StaticResource consumers keep the same instances),
+    /// overwrite the Fs* double resources (DynamicResource consumers re-resolve), set
+    /// the window font, and apply the whole-UI zoom.
+    /// </summary>
+    private void ApplyThemeToWindow()
+    {
+        // typography
+        FontFamily = AppTheme.FontFamily;
+        FontSize = AppTheme.FontSize;
+        Resources["Fs2xs"] = AppTheme.Fs2xs;
+        Resources["FsXs"] = AppTheme.FsXs;
+        Resources["FsSm"] = AppTheme.FsSm;
+        Resources["FsMd"] = AppTheme.FsMd;
+        Resources["FsLg"] = AppTheme.FsLg;
+        Resources["FsXl"] = AppTheme.FsXl;
+        Resources["FsPill"] = AppTheme.Fs2xs * 0.92; // CSS .brand-version-pill: 2xs × 0.92
+        // OVERFLOWS/UNDERRUNS must fit the fixed metric tile at every font-size preset.
+        Resources["FsMetricLabel"] = AppTheme.Fs2xs * 0.85;
+        TitleText.LetterSpacing = AppTheme.FsMd * 0.06; // 0.06em
+
+        Background = AppTheme.BgBrush;
+
+        // solid tokens
+        SetBrush("Bg", AppTheme.Bg);
+        SetBrush("Surface", AppTheme.Surface);
+        SetBrush("Panel", AppTheme.Panel);
+        SetBrush("Line", AppTheme.Line);
+        SetBrush("LineStrong", AppTheme.LineStrong);
+        SetBrush("Text", AppTheme.Text);
+        SetBrush("TextStrong", AppTheme.TextStrong);
+        SetBrush("Muted", AppTheme.Muted);
+        SetBrush("Accent", AppTheme.Accent);
+        SetBrush("AccentHl", AppTheme.AccentHl);
+        SetBrush("TextOnAccent", AppTheme.TextOnAccent);
+        SetBrush("HeaderLine", AppTheme.Mix(AppTheme.Line, Colors.Black, 0.5));
+        SetBrush("CardBg", AppTheme.WithAlpha(AppTheme.Panel, 0.76));   // CSS .card-main-copy-split
+        SetBrush("CornerBg", AppTheme.WithAlpha(AppTheme.Panel, 0.94));
+
+        // version/update pill (CSS .brand-version-pill / .brand-update-btn)
+        SetBrush("PillBg", AppTheme.Mix(AppTheme.Accent, AppTheme.Surface, 0.16));
+        SetBrush("PillBorder", AppTheme.Mix(AppTheme.Accent, AppTheme.Line, 0.48));
+        SetBrush("PillFg", AppTheme.Mix(AppTheme.Text, AppTheme.AccentHl, 0.92));
+        SetBrush("PillBgHover", AppTheme.Mix(AppTheme.Accent, AppTheme.Surface, 0.26));
+        SetBrush("PillBgActive", AppTheme.Mix(AppTheme.Accent, AppTheme.Surface, 0.34));
+        SetBrush("PillBorderActive", AppTheme.Mix(AppTheme.AccentHl, AppTheme.Line, 0.70));
+        SetBrush("PillFgActive", AppTheme.AccentHl);
+
+        // gradient faces
+        SetGradient("KeyFace",
+            AppTheme.Mix(AppTheme.Surface, Colors.White, 0.93),
+            AppTheme.Mix(AppTheme.Surface, Colors.Black, 0.84));
+        SetGradient("KeyFaceHover",
+            AppTheme.Mix(AppTheme.Surface, Colors.White, 0.90),
+            AppTheme.Mix(AppTheme.Surface, Colors.Black, 0.80));
+        SetGradient("AccentFace",
+            AppTheme.Mix(AppTheme.AccentHl, Colors.White, 0.72),
+            AppTheme.Mix(AppTheme.Accent, Colors.Black, 0.86));
+        SetGradient("BadgeFace",
+            AppTheme.Mix(AppTheme.AccentHl, Colors.White, 0.84),
+            AppTheme.Mix(AppTheme.Accent, Colors.Black, 0.92));
+
+        // background aurora follows the accent
+        if (Aurora.Background is RadialGradientBrush aurora && aurora.GradientStops.Count == 2)
+        {
+            aurora.GradientStops[0].Color = AppTheme.WithAlpha(AppTheme.Accent, 0.14);
+            aurora.GradientStops[1].Color = AppTheme.WithAlpha(AppTheme.Accent, 0);
+        }
+
+        // whole-UI zoom (uiScale preset) — like the web's zoom on the app root
+        if (Math.Abs(AppTheme.UiScale - 1.0) > 0.001)
+            RootScale.LayoutTransform = new ScaleTransform(AppTheme.UiScale, AppTheme.UiScale);
+    }
+
+    private void SetBrush(string key, Color color)
+    {
+        if (Resources.TryGetValue(key, out var res) && res is SolidColorBrush brush)
+            brush.Color = color;
+    }
+
+    private void SetGradient(string key, Color top, Color bottom)
+    {
+        if (Resources.TryGetValue(key, out var res) && res is LinearGradientBrush g &&
+            g.GradientStops.Count == 2)
+        {
+            g.GradientStops[0].Color = top;
+            g.GradientStops[1].Color = bottom;
+        }
+    }
 
     private void ApplyPreferences()
     {
@@ -288,19 +387,20 @@ public partial class MainWindow : Window
     {
         _updatePercent = Math.Clamp(percent, 0, 100);
         if (_updateState == UpdateState.Downloading)
-            UpdateBtn.Content = $"{_updatePercent}%";
+            UpdateSuffix.Text = $"{_updatePercent}%";
     }
 
     private void SetUpdateState(UpdateState state)
     {
         _updateState = state;
-        UpdateBtn.Content = state switch
+        // ONE pill: "v0.3.0" stays put, only the action suffix changes with state.
+        UpdateSuffix.Text = state switch
         {
             UpdateState.Checking => "…",
             UpdateState.Current => "✓",
-            UpdateState.Available => $"Update v{_updateVersion}",
+            UpdateState.Available => $"↓ v{_updateVersion}",
             UpdateState.Downloading => $"{_updatePercent}%",
-            UpdateState.Ready => "Restart to update",
+            UpdateState.Ready => "RESTART",
             UpdateState.Error => "!",
             UpdateState.Portable => "⟳",
             _ => "⟳",
@@ -386,8 +486,9 @@ public partial class MainWindow : Window
             UpdateCornerVisuals();
         };
 
-        InDrum.ValueFormatter = v => v.ToString("0");
-        OutDrum.ValueFormatter = v => v.ToString("0");
+        // reference shows "IN" over "10ms" — the unit rides in the value
+        InDrum.ValueFormatter = v => v.ToString("0") + "ms";
+        OutDrum.ValueFormatter = v => v.ToString("0") + "ms";
         GainDrum.ValueFormatter = v => v.ToString("+0.0;-0.0;0.0");
 
         InDrum.ValueCommitted += (_, v) =>
@@ -1098,10 +1199,10 @@ public partial class MainWindow : Window
         BuildChips(SourceChipsPanel, source?.Channels ?? 0);
         BuildChips(DestChipsPanel, dest?.Channels ?? 0);
 
-        // MASTER indicator simplified as an accent left border (TODO: full 20px edge
-        // bar with badge-corner geometry per DESIGN-REFERENCE §3.3).
-        StyleMasterCard(SourceCard, source?.IsMaster == true);
-        StyleMasterCard(DestCard, dest?.IsMaster == true);
+        // MASTER indicator: the 20px vertical badge (rotated MASTER text, accent face)
+        // shows ONLY when the displayed device is the master — nothing otherwise.
+        StyleMasterCard(SourceMasterBadge, SourceTextStack, SourceMeters, source?.IsMaster == true);
+        StyleMasterCard(DestMasterBadge, DestTextStack, DestMeters, dest?.IsMaster == true);
 
         // Route indicator between the cards.
         var active = false;
@@ -1119,13 +1220,18 @@ public partial class MainWindow : Window
         }
         var fanOut = active && source is not null && dest is not null && source.Channels != dest.Channels;
         RouteGlyph.Text = active ? (fanOut ? "⮆" : "🡢") : "⏸";
-        RouteGlyph.Foreground = active ? AppTheme.AccentHlBrush : AppTheme.MutedBrush;
+        RouteGlyph.Foreground = active ? AppTheme.AccentHlBrush : AppTheme.TextStrongBrush;
+        RouteBox.BorderBrush = active
+            ? new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, AppTheme.Line, 0.60))
+            : new SolidColorBrush(AppTheme.Mix(AppTheme.Line, Colors.White, 0.88));
     }
 
-    private static void StyleMasterCard(Border card, bool isMaster)
+    private static void StyleMasterCard(Border badge, StackPanel textStack, MeterBars meters, bool isMaster)
     {
-        card.BorderThickness = isMaster ? new Thickness(3, 1, 1, 1) : new Thickness(1);
-        card.BorderBrush = isMaster ? AppTheme.AccentBrush : AppTheme.LineBrush;
+        badge.IsVisible = isMaster;
+        // content clears the 20px badge (CSS pads the card 30px left when badged)
+        textStack.Margin = new Thickness(isMaster ? 30 : 10, 8, 10, 0);
+        meters.Margin = new Thickness(isMaster ? 24 : 4, 4, 4, 4);
     }
 
     private static MatrixDeviceInfo? FindInfo(List<MatrixDeviceInfo>? infos, string? id) =>
@@ -1137,6 +1243,8 @@ public partial class MainWindow : Window
         panel.Tag = channels;
         panel.Children.Clear();
 
+        // small key-face squares with visible borders (reference dock L/R chips)
+        var chipText = new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Text, 0.76));
         for (var i = 0; i < channels; i++)
         {
             var label = channels == 1 ? "M"
@@ -1144,8 +1252,8 @@ public partial class MainWindow : Window
                 : (i + 1).ToString();
             panel.Children.Add(new Border
             {
-                Width = AppTheme.ChipShort - 8,
-                Height = AppTheme.ChipShort - 8,
+                Width = AppTheme.ChipShort - 4,
+                Height = AppTheme.ChipShort - 4,
                 CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
                 BorderThickness = new Thickness(1),
                 BorderBrush = AppTheme.LineStrongBrush,
@@ -1154,9 +1262,9 @@ public partial class MainWindow : Window
                 Child = new TextBlock
                 {
                     Text = label,
-                    FontSize = 9,
+                    FontSize = AppTheme.Fs2xs,
                     FontWeight = FontWeight.ExtraBold,
-                    Foreground = AppTheme.AccentHlBrush,
+                    Foreground = chipText,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
                 },

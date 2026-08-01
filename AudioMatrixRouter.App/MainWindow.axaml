@@ -6,44 +6,77 @@
         Title="Audio Matrix Router"
         Width="1280" Height="820"
         MinWidth="900" MinHeight="600"
-        Background="#101113"
+        Background="#090909"
         FontFamily="Consolas,Cascadia Mono,monospace"
         WindowDecorations="BorderOnly"
         ExtendClientAreaToDecorationsHint="True"
         ExtendClientAreaTitleBarHeightHint="-1">
 
-  <!-- Design tokens (static mirror of Theme.cs; TODO: theme preset pickers swap these
-       via a ThemeService — docs/DESIGN-REFERENCE.md §2). -->
+  <!-- Design tokens. The VALUES here are placeholders: ApplyThemeToWindow() mutates every
+       brush in place (and fills the Fs* double resources) from Theme after Theme.Apply()
+       has honored the user's persisted preset keys — so the app renders the user's theme,
+       not these defaults. -->
   <Window.Resources>
-    <SolidColorBrush x:Key="Bg" Color="#101113" />
-    <SolidColorBrush x:Key="Surface" Color="#1A1D22" />
-    <SolidColorBrush x:Key="Panel" Color="#16181D" />
-    <SolidColorBrush x:Key="Line" Color="#39404D" />
-    <SolidColorBrush x:Key="LineStrong" Color="#555B66" />
-    <SolidColorBrush x:Key="Text" Color="#DBE0E8" />
-    <SolidColorBrush x:Key="TextStrong" Color="#DEE3EA" />
-    <SolidColorBrush x:Key="Muted" Color="#9AA4B2" />
-    <SolidColorBrush x:Key="Accent" Color="#2DD4BF" />
-    <SolidColorBrush x:Key="AccentHl" Color="#77F0DF" />
-    <SolidColorBrush x:Key="TextOnAccent" Color="#0D0E10" />
-    <SolidColorBrush x:Key="Danger" Color="#EF4444" />
+    <!-- font-size scale defaults (base 18 × the CSS multipliers); overwritten by
+         ApplyThemeToWindow() from Theme so DynamicResource consumers re-resolve -->
+    <x:Double x:Key="Fs2xs">11.2</x:Double>
+    <x:Double x:Key="FsXs">13</x:Double>
+    <x:Double x:Key="FsSm">14.8</x:Double>
+    <x:Double x:Key="FsMd">16.6</x:Double>
+    <x:Double x:Key="FsLg">19.4</x:Double>
+    <x:Double x:Key="FsXl">22</x:Double>
+    <x:Double x:Key="FsPill">10.3</x:Double>
 
-    <!-- key faces: surface +8% white → panel −14% black; lit face per §3.2 -->
+    <SolidColorBrush x:Key="Bg" Color="#090909" />
+    <SolidColorBrush x:Key="Surface" Color="#121212" />
+    <SolidColorBrush x:Key="Panel" Color="#101010" />
+    <SolidColorBrush x:Key="Line" Color="#2a2a2a" />
+    <SolidColorBrush x:Key="LineStrong" Color="#484848" />
+    <SolidColorBrush x:Key="Text" Color="#ececec" />
+    <SolidColorBrush x:Key="TextStrong" Color="#eeeeee" />
+    <SolidColorBrush x:Key="Muted" Color="#9a9a9a" />
+    <SolidColorBrush x:Key="Accent" Color="#e5e7eb" />
+    <SolidColorBrush x:Key="AccentHl" Color="#ffffff" />
+    <SolidColorBrush x:Key="TextOnAccent" Color="#080808" />
+    <SolidColorBrush x:Key="Danger" Color="#EF4444" />
+    <SolidColorBrush x:Key="HeaderLine" Color="#1d1d1d" />
+    <SolidColorBrush x:Key="CardBg" Color="#C2101010" />
+    <SolidColorBrush x:Key="CornerBg" Color="#F0101010" />
+
+    <!-- version/update pill (accent-mixed; recomputed in code) -->
+    <SolidColorBrush x:Key="PillBg" Color="#2a2a2a" />
+    <SolidColorBrush x:Key="PillBorder" Color="#6b6b6b" />
+    <SolidColorBrush x:Key="PillFg" Color="#ececec" />
+    <SolidColorBrush x:Key="PillBgHover" Color="#3a3a3a" />
+    <SolidColorBrush x:Key="PillBgActive" Color="#4a4a4a" />
+    <SolidColorBrush x:Key="PillBorderActive" Color="#c9c9c9" />
+    <SolidColorBrush x:Key="PillFgActive" Color="#ffffff" />
+
+    <!-- key faces: surface +7% white → surface −16% black; lit face per §3.2 -->
     <LinearGradientBrush x:Key="KeyFace" StartPoint="0%,0%" EndPoint="0%,100%">
-      <GradientStop Color="#2C2F34" Offset="0" />
-      <GradientStop Color="#131519" Offset="1" />
+      <GradientStop Color="#232323" Offset="0" />
+      <GradientStop Color="#0f0f0f" Offset="1" />
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="KeyFaceHover" StartPoint="0%,0%" EndPoint="0%,100%">
-      <GradientStop Color="#33373D" Offset="0" />
-      <GradientStop Color="#17191E" Offset="1" />
+      <GradientStop Color="#2b2b2b" Offset="0" />
+      <GradientStop Color="#141414" Offset="1" />
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="AccentFace" StartPoint="0%,0%" EndPoint="0%,100%">
-      <GradientStop Color="#8DF2E4" Offset="0" />
-      <GradientStop Color="#29C3B0" Offset="1" />
+      <GradientStop Color="#ffffff" Offset="0" />
+      <GradientStop Color="#c5c7ca" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="BadgeFace" StartPoint="0%,0%" EndPoint="0%,100%">
+      <GradientStop Color="#ffffff" Offset="0" />
+      <GradientStop Color="#d2d4d8" Offset="1" />
     </LinearGradientBrush>
     <LinearGradientBrush x:Key="DangerFace" StartPoint="0%,0%" EndPoint="0%,100%">
       <GradientStop Color="#5A292C" Offset="0" />
       <GradientStop Color="#3C1111" Offset="1" />
+    </LinearGradientBrush>
+    <!-- brand icon: FIXED teal per the web CSS (.brand-grid-icon span) — independent of accent -->
+    <LinearGradientBrush x:Key="BrandFace" StartPoint="0%,0%" EndPoint="0%,100%">
+      <GradientStop Color="#53EAD8" Offset="0" />
+      <GradientStop Color="#23B6A6" Offset="1" />
     </LinearGradientBrush>
   </Window.Resources>
 
@@ -81,7 +114,7 @@
       <Setter Property="BorderBrush" Value="{StaticResource LineStrong}" />
       <Setter Property="BorderThickness" Value="1" />
       <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="FontSize" Value="16" />
+      <Setter Property="FontSize" Value="{DynamicResource FsMd}" />
       <Setter Property="FontWeight" Value="Bold" />
     </Style>
     <Style Selector="Button.key:pointerover /template/ ContentPresenter#PART_ContentPresenter">
@@ -89,12 +122,12 @@
       <Setter Property="Foreground" Value="{StaticResource TextStrong}" />
     </Style>
     <Style Selector="Button.key:pressed /template/ ContentPresenter#PART_ContentPresenter">
-      <Setter Property="Background" Value="#101216" />
+      <Setter Property="Background" Value="#101010" />
     </Style>
     <Style Selector="Button.key.active">
       <Setter Property="Background" Value="{StaticResource AccentFace}" />
       <Setter Property="Foreground" Value="{StaticResource TextOnAccent}" />
-      <Setter Property="BorderBrush" Value="#4FDBC9" />
+      <Setter Property="BorderBrush" Value="{StaticResource AccentHl}" />
     </Style>
     <Style Selector="Button.key.active:pointerover /template/ ContentPresenter#PART_ContentPresenter">
       <Setter Property="Background" Value="{StaticResource AccentFace}" />
@@ -110,105 +143,133 @@
       <Setter Property="Foreground" Value="#F4B9B9" />
     </Style>
 
-    <!-- header pills (version / update) -->
+    <!-- header pill: ONE control carrying version + update state -->
     <Style Selector="Button.pill">
       <Setter Property="MinWidth" Value="46" />
       <Setter Property="MinHeight" Value="22" />
       <Setter Property="Padding" Value="9,2" />
       <Setter Property="CornerRadius" Value="999" />
       <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="BorderBrush" Value="#338784" />
-      <Setter Property="Background" Value="#1D3A3B" />
-      <Setter Property="Foreground" Value="#D3E1E7" />
-      <Setter Property="FontSize" Value="10" />
+      <Setter Property="BorderBrush" Value="{StaticResource PillBorder}" />
+      <Setter Property="Background" Value="{StaticResource PillBg}" />
+      <Setter Property="Foreground" Value="{StaticResource PillFg}" />
+      <Setter Property="FontSize" Value="{DynamicResource FsPill}" />
       <Setter Property="FontWeight" Value="Bold" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
       <Setter Property="VerticalContentAlignment" Value="Center" />
     </Style>
     <Style Selector="Button.pill:pointerover /template/ ContentPresenter#PART_ContentPresenter">
-      <Setter Property="Background" Value="#215B57" />
-      <Setter Property="Foreground" Value="#77F0DF" />
+      <Setter Property="Background" Value="{StaticResource PillBgHover}" />
     </Style>
     <Style Selector="Button.pill.actionable">
-      <Setter Property="Background" Value="#215B57" />
-      <Setter Property="Foreground" Value="#77F0DF" />
-      <Setter Property="BorderBrush" Value="#2DD4BF" />
+      <Setter Property="Background" Value="{StaticResource PillBgActive}" />
+      <Setter Property="Foreground" Value="{StaticResource PillFgActive}" />
+      <Setter Property="BorderBrush" Value="{StaticResource PillBorderActive}" />
     </Style>
 
-    <!-- dock metric tiles (§3.6) -->
+    <!-- dock metric tiles (§3.6): label + value centered both ways -->
     <Style Selector="Border.metric">
-      <Setter Property="Margin" Value="1" />
-      <Setter Property="Padding" Value="6,3" />
-      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="Margin" Value="3" />
+      <Setter Property="Padding" Value="5,3" />
+      <Setter Property="CornerRadius" Value="6" />
       <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="BorderBrush" Value="{StaticResource Line}" />
+      <Setter Property="BorderBrush" Value="{StaticResource LineStrong}" />
       <Setter Property="Background" Value="{StaticResource KeyFace}" />
     </Style>
+    <Style Selector="Border.metric > StackPanel">
+      <Setter Property="HorizontalAlignment" Value="Center" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="Spacing" Value="2" />
+    </Style>
     <Style Selector="TextBlock.metricLabel">
-      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontSize" Value="{DynamicResource FsMetricLabel}" />
       <Setter Property="Foreground" Value="{StaticResource Muted}" />
-      <Setter Property="LetterSpacing" Value="0.6" />
+      <Setter Property="TextAlignment" Value="Center" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+      <!-- Labels like OVERFLOWS/UNDERRUNS must never clip in the fixed 128px column. -->
+      <Setter Property="TextTrimming" Value="None" />
     </Style>
     <Style Selector="TextBlock.metricValue">
-      <Setter Property="FontSize" Value="12" />
+      <!-- xs, not md: values like "146.8ms" must fit the fixed-width metric tile
+           (the reference uses the small mono size here too). -->
+      <Setter Property="FontSize" Value="{DynamicResource FsXs}" />
       <Setter Property="FontWeight" Value="Bold" />
       <Setter Property="Foreground" Value="{StaticResource TextStrong}" />
+      <Setter Property="TextAlignment" Value="Center" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+    </Style>
+
+    <!-- dock card MASTER badge: 20px vertical accent bar with rotated MASTER text -->
+    <Style Selector="Border.masterBadge">
+      <Setter Property="Width" Value="20" />
+      <Setter Property="HorizontalAlignment" Value="Left" />
+      <Setter Property="VerticalAlignment" Value="Stretch" />
+      <Setter Property="Background" Value="{StaticResource BadgeFace}" />
+      <Setter Property="CornerRadius" Value="7,0,0,7" />
+    </Style>
+    <Style Selector="Border.masterBadge TextBlock">
+      <Setter Property="FontSize" Value="{DynamicResource Fs2xs}" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+      <Setter Property="LetterSpacing" Value="1.2" />
+      <Setter Property="Foreground" Value="{StaticResource TextOnAccent}" />
     </Style>
   </Window.Styles>
 
   <Panel>
-    <!-- window background aurora: radial accent glow at top-left (§3.7) -->
-    <Border IsHitTestVisible="False">
+    <!-- window background aurora: radial accent glow at top-left (§3.7); brush rebuilt in code -->
+    <Border Name="Aurora" IsHitTestVisible="False">
       <Border.Background>
         <RadialGradientBrush Center="10%,0%" GradientOrigin="10%,0%" RadiusX="55%" RadiusY="55%">
-          <GradientStop Color="#292DD4BF" Offset="0" />
-          <GradientStop Color="#002DD4BF" Offset="1" />
+          <GradientStop Color="#24E5E7EB" Offset="0" />
+          <GradientStop Color="#00E5E7EB" Offset="1" />
         </RadialGradientBrush>
       </Border.Background>
     </Border>
 
+    <!-- whole-UI zoom (the uiScale preset) applied in code as a LayoutTransform -->
+    <LayoutTransformControl Name="RootScale">
     <DockPanel>
       <!-- ===== Header IS the title bar. Avalonia 12 element roles: TitleBar gives
            native drag + double-click-maximize; interactive children opt out with the
            User role. ===== -->
       <Border DockPanel.Dock="Top" Background="{StaticResource Panel}"
-              BorderBrush="#23272E" BorderThickness="0,0,0,1"
+              BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,0,0,1"
               Name="HeaderBar" MinHeight="56"
               chrome:WindowDecorationProperties.ElementRole="TitleBar">
         <Grid ColumnDefinitions="Auto,*,Auto,Auto">
 
           <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12"
                       Margin="16,0,0,0" VerticalAlignment="Center">
-            <!-- brand: 3×3 accent grid, alternating 85%/35% opacity -->
+            <!-- brand: 3×3 fixed-teal grid; squares 2, 4 and 8 dimmed (CSS nth-child) -->
             <UniformGrid Columns="3" Rows="3" Width="24" Height="24">
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" Opacity="0.25" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" Opacity="0.25" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" Opacity="0.25" />
+              <Border Background="{StaticResource BrandFace}" Margin="1" CornerRadius="1" />
             </UniformGrid>
 
             <StackPanel Spacing="2" VerticalAlignment="Center">
               <StackPanel Orientation="Horizontal" Spacing="8">
-                <TextBlock Text="AUDIO MATRIX PATCH" FontSize="14" FontWeight="SemiBold"
-                           LetterSpacing="0.84" Foreground="{StaticResource Text}"
+                <TextBlock Name="TitleText" Text="AUDIO MATRIX PATCH"
+                           FontSize="{DynamicResource FsMd}" FontWeight="SemiBold"
+                           Foreground="{StaticResource Text}"
                            VerticalAlignment="Center" />
-                <Border CornerRadius="999" BorderBrush="#338784" BorderThickness="1"
-                        Background="#1D3A3B" Padding="9,2" VerticalAlignment="Center"
-                        MinWidth="46" MinHeight="22">
-                  <TextBlock Name="VersionText" Text="v0.0.0" FontSize="10" FontWeight="Bold"
-                             Foreground="#D3E1E7" HorizontalAlignment="Center"
-                             VerticalAlignment="Center" />
-                </Border>
-                <Button Name="UpdateBtn" Classes="pill" Content="⟳"
-                        VerticalAlignment="Center"
-                        chrome:WindowDecorationProperties.ElementRole="User" />
+                <!-- ONE pill: version text + update action glyph/state suffix -->
+                <Button Name="UpdateBtn" Classes="pill" VerticalAlignment="Center"
+                        chrome:WindowDecorationProperties.ElementRole="User">
+                  <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <TextBlock Name="VersionText" Text="v0.0.0" VerticalAlignment="Center" />
+                    <TextBlock Name="UpdateSuffix" Text="⟳" VerticalAlignment="Center" />
+                  </StackPanel>
+                </Button>
               </StackPanel>
-              <TextBlock Name="StatusText" Text="Standby" FontSize="11"
+              <TextBlock Name="StatusText" Text="Standby"
+                         FontSize="{DynamicResource FsXs}"
                          Foreground="{StaticResource Muted}" />
             </StackPanel>
           </StackPanel>
@@ -216,7 +277,7 @@
           <!-- empty space = drag region (TitleBar role on HeaderBar) -->
           <Border Grid.Column="1" Background="Transparent" Name="DragRegion" />
 
-          <!-- gear: settings placeholder (TODO: theme preset pickers — static Theme for now) -->
+          <!-- gear: settings placeholder (theme preset pickers TODO — presets applied from prefs) -->
           <Border Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
                   VerticalAlignment="Center" CornerRadius="7"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
@@ -237,8 +298,10 @@
 
       <!-- ===== Dock (§3.6): metrics | source card | chips | route | dest card | chips | metrics ===== -->
       <Border DockPanel.Dock="Bottom" Background="{StaticResource Panel}"
-              BorderBrush="#23272E" BorderThickness="0,1,0,0" Padding="10,8" Height="116">
-        <Grid ColumnDefinitions="128,*,20,56,*,20,128">
+              Name="DockBar"
+              BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,1,0,0"
+              Padding="10,8" Height="122">
+        <Grid ColumnDefinitions="132,*,26,112,*,26,132">
 
           <!-- input-side metric tiles -->
           <UniformGrid Grid.Column="0" Columns="2" Rows="2">
@@ -268,19 +331,29 @@
             </Border>
           </UniformGrid>
 
-          <!-- source card: name/sub top-left over full-lane horizontal meters;
-               MASTER simplified as an accent left border for the shell -->
+          <!-- source card: name/sub top-left over full-lane horizontal meters; the MASTER
+               badge (20px vertical bar, rotated text) shows ONLY when the device is master -->
           <Border Grid.Column="1" Name="SourceCard" Margin="8,0,4,0" CornerRadius="8"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
-                  Background="#E61A1D22" ClipToBounds="True">
+                  Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
               <controls:MeterBars Name="SourceMeters" Horizontal="True" Margin="4" />
-              <StackPanel Margin="10,6,10,0" Spacing="2"
+              <Border Name="SourceMasterBadge" Classes="masterBadge" IsVisible="False">
+                <LayoutTransformControl HorizontalAlignment="Center" VerticalAlignment="Center">
+                  <LayoutTransformControl.LayoutTransform>
+                    <RotateTransform Angle="-90" />
+                  </LayoutTransformControl.LayoutTransform>
+                  <TextBlock Text="MASTER" />
+                </LayoutTransformControl>
+              </Border>
+              <StackPanel Name="SourceTextStack" Margin="10,8,10,0" Spacing="2"
                           HorizontalAlignment="Left" VerticalAlignment="Top">
-                <TextBlock Name="SourceName" Text="—" FontSize="12" FontWeight="Bold"
+                <TextBlock Name="SourceName" Text="—"
+                           FontSize="{DynamicResource FsLg}" FontWeight="Bold"
                            Foreground="{StaticResource TextStrong}"
                            TextTrimming="CharacterEllipsis" />
-                <TextBlock Name="SourceSub" Text="" FontSize="9"
+                <TextBlock Name="SourceSub" Text=""
+                           FontSize="{DynamicResource Fs2xs}"
                            Foreground="{StaticResource Muted}"
                            TextTrimming="CharacterEllipsis" />
               </StackPanel>
@@ -288,15 +361,15 @@
           </Border>
 
           <!-- detached source chip column (one bordered mini-key per channel) -->
-          <StackPanel Grid.Column="2" Name="SourceChipsPanel" Spacing="4"
-                      VerticalAlignment="Stretch" />
+          <StackPanel Grid.Column="2" Name="SourceChipsPanel" Spacing="6"
+                      HorizontalAlignment="Center" VerticalAlignment="Center" />
 
-          <!-- route indicator: 🡢 active / ⏸ none -->
-          <Border Grid.Column="3" Width="44" Height="44" CornerRadius="6"
+          <!-- route indicator: large rounded key, just the arrow (🡢 active / ⏸ none) -->
+          <Border Grid.Column="3" Name="RouteBox" Width="100" Height="100" CornerRadius="8"
                   HorizontalAlignment="Center" VerticalAlignment="Center"
-                  BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
-                  Background="{StaticResource KeyFace}">
-            <TextBlock Name="RouteGlyph" Text="⏸" FontSize="16"
+                  BorderBrush="{StaticResource LineStrong}" BorderThickness="2"
+                  Background="Transparent">
+            <TextBlock Name="RouteGlyph" Text="⏸" FontSize="{DynamicResource FsXl}"
                        Foreground="{StaticResource Muted}"
                        HorizontalAlignment="Center" VerticalAlignment="Center" />
           </Border>
@@ -304,15 +377,25 @@
           <!-- destination card -->
           <Border Grid.Column="4" Name="DestCard" Margin="4,0,8,0" CornerRadius="8"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
-                  Background="#E61A1D22" ClipToBounds="True">
+                  Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
               <controls:MeterBars Name="DestMeters" Horizontal="True" Margin="4" />
-              <StackPanel Margin="10,6,10,0" Spacing="2"
+              <Border Name="DestMasterBadge" Classes="masterBadge" IsVisible="False">
+                <LayoutTransformControl HorizontalAlignment="Center" VerticalAlignment="Center">
+                  <LayoutTransformControl.LayoutTransform>
+                    <RotateTransform Angle="-90" />
+                  </LayoutTransformControl.LayoutTransform>
+                  <TextBlock Text="MASTER" />
+                </LayoutTransformControl>
+              </Border>
+              <StackPanel Name="DestTextStack" Margin="10,8,10,0" Spacing="2"
                           HorizontalAlignment="Left" VerticalAlignment="Top">
-                <TextBlock Name="DestName" Text="—" FontSize="12" FontWeight="Bold"
+                <TextBlock Name="DestName" Text="—"
+                           FontSize="{DynamicResource FsLg}" FontWeight="Bold"
                            Foreground="{StaticResource TextStrong}"
                            TextTrimming="CharacterEllipsis" />
-                <TextBlock Name="DestSub" Text="" FontSize="9"
+                <TextBlock Name="DestSub" Text=""
+                           FontSize="{DynamicResource Fs2xs}"
                            Foreground="{StaticResource Muted}"
                            TextTrimming="CharacterEllipsis" />
               </StackPanel>
@@ -320,8 +403,8 @@
           </Border>
 
           <!-- detached destination chip column -->
-          <StackPanel Grid.Column="5" Name="DestChipsPanel" Spacing="4"
-                      VerticalAlignment="Stretch" />
+          <StackPanel Grid.Column="5" Name="DestChipsPanel" Spacing="6"
+                      HorizontalAlignment="Center" VerticalAlignment="Center" />
 
           <!-- output-side metric tiles -->
           <UniformGrid Grid.Column="6" Columns="2" Rows="2">
@@ -361,7 +444,7 @@
         <Border Name="CornerBox" HorizontalAlignment="Left" VerticalAlignment="Top"
                 Width="224" Height="224" CornerRadius="8" Padding="3"
                 BorderBrush="{StaticResource Line}" BorderThickness="1"
-                Background="#F016181D">
+                Background="{StaticResource CornerBg}">
           <Grid Name="CornerGrid"
                 RowDefinitions="*,*,*,*" ColumnDefinitions="*,*,*,*">
             <!-- row 1: power · IN drum · OUT drum · lock -->
@@ -374,21 +457,21 @@
                                   PxPerStep="10" Caption="OUT" />
             <Button Name="LockBtn" Classes="key" Grid.Row="0" Grid.Column="3" Content="🔓" />
 
-            <!-- row 2: reload · master gain drum (2×2) -->
+            <!-- row 2: reload · master gain drum (2×2, big value + small dB suffix) -->
             <Button Name="ReloadBtn" Classes="key" Grid.Row="1" Grid.Column="0" Content="↻" />
             <controls:DrumControl Name="GainDrum" Grid.Row="1" Grid.Column="1"
                                   Grid.RowSpan="2" Grid.ColumnSpan="2" Margin="2"
                                   Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"
-                                  PxPerStep="24" Caption="GAIN" />
+                                  PxPerStep="24" Suffix="dB" />
 
             <!-- row 3: input-mode cycle -->
             <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
-                    Content="BOTH" FontSize="9" />
+                    Content="BOTH" FontSize="{DynamicResource Fs2xs}" />
 
             <!-- row 4: show-all · transient mute (wide) · view toggle -->
             <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
             <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
-                    Grid.ColumnSpan="2" Content="🔈 MUTE" FontSize="12" />
+                    Grid.ColumnSpan="2" Content="🔈 MUTE" FontSize="{DynamicResource FsSm}" />
             <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
           </Grid>
         </Border>
@@ -398,10 +481,12 @@
                 VerticalAlignment="Top" Margin="0,10,0,0" CornerRadius="6"
                 Background="#F03C1111" BorderBrush="#EF4444" BorderThickness="1"
                 Padding="14,7" MaxWidth="720" ZIndex="10">
-          <TextBlock Name="BannerText" Foreground="#F6D9D9" FontSize="12"
+          <TextBlock Name="BannerText" Foreground="#F6D9D9"
+                     FontSize="{DynamicResource FsXs}"
                      TextWrapping="Wrap" />
         </Border>
       </Panel>
     </DockPanel>
+    </LayoutTransformControl>
   </Panel>
 </Window>

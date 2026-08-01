@@ -18,47 +18,116 @@ public sealed class MatrixControl : Control
     private const double PanThreshold = 12;
     private const double WheelScrollStep = 48;
 
-    private static readonly FontFamily MonoFamily = new("Consolas,Courier New,monospace");
-    private static readonly Typeface FaceRegular = new(MonoFamily);
-    private static readonly Typeface FaceBold = new(MonoFamily, FontStyle.Normal, FontWeight.Bold);
-    private static readonly Typeface FaceHeavy = new(MonoFamily, FontStyle.Normal, FontWeight.ExtraBold);
+    // ===== theme-derived palette, re-cached whenever AppTheme.Apply bumps Version =====
+    private static int s_palVersion = -1;
 
-    // cached brushes/pens (per DESIGN-REFERENCE mixes)
-    private static readonly IBrush CardFill = new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Panel, 0.92));
-    private static readonly IBrush ChipTextBrush = new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Text, 0.76));
-    private static readonly IBrush EdgeLightBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.White, 0.10));
-    private static readonly IBrush EdgeShadeBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.38));
-    private static readonly IBrush TextShadowBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.55));
+    private static Typeface FaceRegular;
+    private static Typeface FaceBold;
+    private static Typeface FaceHeavy;
 
-    private static readonly IPen LinePen = new Pen(AppTheme.LineBrush);
-    private static readonly IPen LineStrongPen = new Pen(AppTheme.LineStrongBrush);
-    private static readonly IPen OffTilePen = new Pen(AppTheme.LineStrongBrush);
-    private static readonly IPen OnTilePen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, Colors.White, 0.84)), 1);
-    private static readonly IPen HoverTilePen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Line, 0.58)), 1.25);
-    private static readonly IPen PhaseTilePen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Phase, Colors.White, 0.72)), 1);
-    private static readonly IPen BlockedPen = new Pen(AppTheme.LineStrongBrush, 1, new DashStyle(new double[] { 3, 3 }, 0));
-    private static readonly IPen GlowInnerPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.45)), 2.5);
-    private static readonly IPen GlowOuterPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.14)), 4);
-    private static readonly IPen PhaseGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Phase, 0.30)), 2.5);
-    private static readonly IPen PhaseStripePen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Phase, 0.18)), 4);
-    private static readonly IPen HatchPenA = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Mix(AppTheme.Surface, Colors.Black, 0.55), 0.85)), 4);
-    private static readonly IPen MasterRingPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, Colors.White, 0.78)), 1);
-    private static readonly IPen MasterRingInsetPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.45)), 1);
-    private static readonly IPen MasterGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.22)), 4);
-    private static readonly IPen BadgeGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.35)), 2);
-    private static readonly IPen DragTargetPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Line, 0.70)), 1.5);
+    private static IBrush CardFill = null!;
+    private static IBrush ChipTextBrush = null!;
+    private static IBrush EdgeLightBrush = null!;
+    private static IBrush EdgeLightOnBrush = null!;
+    private static IBrush EdgeShadeBrush = null!;
+    private static IBrush TextShadowBrush = null!;
+    private static IBrush ReadoutBrush = null!;
 
-    private static readonly IBrush KeyFaceBrush = AppTheme.KeyFace();
-    private static readonly IBrush AccentFaceBrush = AppTheme.AccentFace();
-    private static readonly IBrush MeterFillH = AppTheme.MeterFill(horizontal: true);
-    private static readonly IBrush MeterFillV = AppTheme.MeterFill(horizontal: false);
+    private static IPen LinePen = null!;
+    private static IPen LineStrongPen = null!;
+    private static IPen OffTilePen = null!;
+    private static IPen OnTilePen = null!;
+    private static IPen HoverTilePen = null!;
+    private static IPen PhaseTilePen = null!;
+    private static IPen BlockedPen = null!;
+    private static IPen[] GlowPens = null!;        // concentric accent glow rings, inner → outer
+    private static double[] GlowInflates = null!;
+    private static IPen PhaseGlowPen = null!;
+    private static IPen PhaseStripePen = null!;
+    private static IPen HatchPenA = null!;
+    private static IPen MasterRingPen = null!;
+    private static IPen MasterRingInsetPen = null!;
+    private static IPen MasterGlowPen = null!;
+    private static IPen BadgeGlowPen = null!;
+    private static IPen DragTargetPen = null!;
+
+    private static IBrush KeyFaceBrush = null!;
+    private static IBrush AccentFaceBrush = null!;
+    private static IBrush BadgeFaceBrush = null!;
+    private static IBrush MeterFillH = null!;
+    private static IBrush MeterFillV = null!;
+    private static IBrush BadgeLightBrush = null!;
+    private static IBrush BadgeShadeBrush = null!;
+
+    private static void EnsurePalette()
+    {
+        if (s_palVersion == AppTheme.Version) return;
+        s_palVersion = AppTheme.Version;
+
+        FaceRegular = AppTheme.FaceRegular;
+        FaceBold = AppTheme.FaceBold;
+        FaceHeavy = AppTheme.FaceHeavy;
+
+        CardFill = new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Panel, 0.92));
+        ChipTextBrush = new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Text, 0.76));
+        EdgeLightBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.White, 0.10));
+        EdgeLightOnBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.White, 0.18));
+        EdgeShadeBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.28));
+        TextShadowBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.35));
+        // CSS .tile-gain-readout: color-mix(text-on-accent 86%, white 14%)
+        ReadoutBrush = new SolidColorBrush(AppTheme.Mix(AppTheme.TextOnAccent, Colors.White, 0.86));
+
+        LinePen = new Pen(AppTheme.LineBrush);
+        LineStrongPen = new Pen(AppTheme.LineStrongBrush);
+        OffTilePen = new Pen(AppTheme.LineStrongBrush);
+        OnTilePen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, Colors.White, 0.84)), 1);
+        HoverTilePen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Line, 0.58)), 1.25);
+        PhaseTilePen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Phase, Colors.White, 0.72)), 1);
+        BlockedPen = new Pen(AppTheme.LineStrongBrush, 1, new DashStyle(new double[] { 3, 3 }, 0));
+
+        // soft accent glow: CSS `0 0 10px accent 45%` + `0 12px 20px accent 14%` approximated
+        // with concentric strokes of decreasing alpha (a blurred-looking falloff)
+        GlowPens = new IPen[]
+        {
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.40)), 2),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.22)), 3),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.11)), 4),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.05)), 5),
+        };
+        GlowInflates = new[] { 1.0, 3.5, 7.0, 11.0 };
+
+        PhaseGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Phase, 0.30)), 2.5);
+        PhaseStripePen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Phase, 0.18)), 4);
+        HatchPenA = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Mix(AppTheme.Surface, Colors.Black, 0.55), 0.85)), 4);
+        MasterRingPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, Colors.White, 0.78)), 1);
+        MasterRingInsetPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.45)), 1);
+        MasterGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.22)), 4);
+        BadgeGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.35)), 2);
+        DragTargetPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Line, 0.70)), 1.5);
+
+        KeyFaceBrush = AppTheme.KeyFace();
+        AccentFaceBrush = AppTheme.AccentFace();
+        BadgeFaceBrush = AppTheme.BadgeFace();
+        MeterFillH = AppTheme.MeterFill(horizontal: true);
+        MeterFillV = AppTheme.MeterFill(horizontal: false);
+        BadgeLightBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.White, 0.34));
+        BadgeShadeBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.24));
+    }
 
     private MatrixModel? _model;
     private MatrixLayout? _layout;
     private double _labelSquare = 224;
 
+    // smooth scrolling: wheel moves the target, an RAF loop eases current toward it
     private double _scrollX;
     private double _scrollY;
+    private double _targetScrollX;
+    private double _targetScrollY;
+    private bool _scrollAnimating;
+
+    // meter interpolation: model Peaks are targets, these display values ease toward them
+    private readonly Dictionary<string, float[]> _meterDisplay = new();
+    private bool _meterAnimating;
 
     private string? _hoverRowKey;
     private string? _hoverColKey;
@@ -111,8 +180,8 @@ public sealed class MatrixControl : Control
     public event EventHandler<MatrixReorderEvent>? ReorderRequested;
     public event EventHandler<MatrixSelectionEvent>? SelectionChanged;
 
-    /// <summary>Cheap invalidate — peaks arrays are mutated in place by the shell.</summary>
-    public void RefreshPeaks() => InvalidateVisual();
+    /// <summary>Peaks arrays (the targets) were mutated in place by the shell — ease toward them.</summary>
+    public void RefreshPeaks() => StartMeterAnimation();
 
     // ===================================================================== layout / measure
 
@@ -141,12 +210,148 @@ public sealed class MatrixControl : Control
         var maxY = Math.Max(0, l.ContentHeight - Bounds.Height);
         _scrollX = Math.Clamp(_scrollX, 0, maxX);
         _scrollY = Math.Clamp(_scrollY, 0, maxY);
+        _targetScrollX = Math.Clamp(_targetScrollX, 0, maxX);
+        _targetScrollY = Math.Clamp(_targetScrollY, 0, maxY);
+    }
+
+    // ===================================================================== animation loops
+
+    private void StartScrollAnimation()
+    {
+        if (_scrollAnimating) return;
+        var top = TopLevel.GetTopLevel(this);
+        if (top is null)
+        {
+            _scrollX = _targetScrollX;
+            _scrollY = _targetScrollY;
+            InvalidateVisual();
+            return;
+        }
+        _scrollAnimating = true;
+        top.RequestAnimationFrame(ScrollTick);
+    }
+
+    private void ScrollTick(TimeSpan _)
+    {
+        _scrollAnimating = false;
+        var dx = _targetScrollX - _scrollX;
+        var dy = _targetScrollY - _scrollY;
+        if (Math.Abs(dx) <= 0.5 && Math.Abs(dy) <= 0.5)
+        {
+            _scrollX = _targetScrollX;
+            _scrollY = _targetScrollY;
+            InvalidateVisual();
+            return;
+        }
+        // the web's easing: offset += (target - offset) * 0.22 per frame
+        _scrollX += dx * 0.22;
+        _scrollY += dy * 0.22;
+        InvalidateVisual();
+        var top = TopLevel.GetTopLevel(this);
+        if (top is not null)
+        {
+            _scrollAnimating = true;
+            top.RequestAnimationFrame(ScrollTick);
+        }
+        else
+        {
+            _scrollX = _targetScrollX;
+            _scrollY = _targetScrollY;
+        }
+    }
+
+    private float[] DisplayPeaks(MatrixDeviceInfo d)
+    {
+        if (!_meterDisplay.TryGetValue(d.Id, out var arr) || arr.Length != d.Peaks.Length)
+        {
+            arr = (float[])d.Peaks.Clone();
+            _meterDisplay[d.Id] = arr;
+        }
+        return arr;
+    }
+
+    private void StartMeterAnimation()
+    {
+        if (_meterAnimating) return;
+        var top = TopLevel.GetTopLevel(this);
+        if (top is null)
+        {
+            SnapMeters();
+            InvalidateVisual();
+            return;
+        }
+        _meterAnimating = true;
+        top.RequestAnimationFrame(MeterTick);
+    }
+
+    private void SnapMeters()
+    {
+        var m = _model;
+        if (m is null) return;
+        foreach (var d in m.Inputs) Array.Copy(d.Peaks, DisplayPeaks(d), d.Peaks.Length);
+        foreach (var d in m.Outputs) Array.Copy(d.Peaks, DisplayPeaks(d), d.Peaks.Length);
+    }
+
+    private void MeterTick(TimeSpan _)
+    {
+        _meterAnimating = false;
+        var m = _model;
+        if (m is null) return;
+
+        var moving = false;
+        moving |= EaseDevicePeaks(m.Inputs);
+        moving |= EaseDevicePeaks(m.Outputs);
+        InvalidateVisual();
+
+        if (moving)
+        {
+            var top = TopLevel.GetTopLevel(this);
+            if (top is not null)
+            {
+                _meterAnimating = true;
+                top.RequestAnimationFrame(MeterTick);
+            }
+        }
+    }
+
+    private bool EaseDevicePeaks(List<MatrixDeviceInfo> devices)
+    {
+        var moving = false;
+        foreach (var d in devices)
+        {
+            var cur = DisplayPeaks(d);
+            for (var i = 0; i < cur.Length; i++)
+            {
+                var delta = d.Peaks[i] - cur[i];
+                if (Math.Abs(delta) <= 0.004f)
+                {
+                    cur[i] = d.Peaks[i];
+                }
+                else
+                {
+                    // 70ms-style ease: cur += (target - cur) * 0.35 per frame
+                    cur[i] += delta * 0.35f;
+                    moving = true;
+                }
+            }
+        }
+        return moving;
     }
 
     // ===================================================================== rendering
 
+    /// <summary>Snap a rect to whole pixels: round positions AND end edges so adjacent
+    /// rects never leave 1px seams (size = round(end) - round(start)).</summary>
+    private static Rect Snap(Rect r)
+    {
+        var x = Math.Round(r.X);
+        var y = Math.Round(r.Y);
+        return new Rect(x, y, Math.Round(r.Right) - x, Math.Round(r.Bottom) - y);
+    }
+
     public override void Render(DrawingContext context)
     {
+        EnsurePalette();
         var size = Bounds.Size;
         // transparent fill so the whole control is pointer-hit-testable
         context.DrawRectangle(Brushes.Transparent, null, new Rect(size));
@@ -233,7 +438,7 @@ public sealed class MatrixControl : Control
                 if (x + w < clip.X || x > clip.Right) continue;
 
                 m.Cells.TryGetValue(rt.Key + "|" + ct.Key, out var cell);
-                DrawTile(ctx, new Rect(x, y, w, h), rt, ct, cell, hasSel, selRow, selCol);
+                DrawTile(ctx, Snap(new Rect(x, y, w, h)), rt, ct, cell, hasSel, selRow, selCol);
             }
         }
     }
@@ -249,9 +454,11 @@ public sealed class MatrixControl : Control
                      ((rt.Key == selRow!.Key && ct.StartUnit < selCol!.StartUnit) ||
                       (ct.Key == selCol!.Key && rt.StartUnit < selRow!.StartUnit));
 
+        // CSS: base off 0.62, on 1, blocked 0.5; with a selection, path cells 0.9 and
+        // everything else dims hard (.28 off / .38 on)
         var opacity = blocked ? 0.5 : on ? 1.0 : 0.62;
-        if (hasSel && !isHover && !onPath)
-            opacity = on ? 0.8 : blocked ? 0.4 : 0.45;
+        if (hasSel && !isHover)
+            opacity = onPath ? 0.9 : on ? 0.38 : 0.28;
 
         var pen = blocked ? BlockedPen
             : isHover ? HoverTilePen
@@ -265,9 +472,12 @@ public sealed class MatrixControl : Control
         {
             if (on)
             {
-                // approximate the accent glow with two layered semi-transparent strokes
-                ctx.DrawRectangle(null, GlowOuterPen, new RoundedRect(rect.Inflate(4), AppTheme.RadiusTile + 4));
-                ctx.DrawRectangle(null, GlowInnerPen, new RoundedRect(rect.Inflate(1.5), AppTheme.RadiusTile + 1.5));
+                // soft outer glow: concentric rounded strokes with decreasing alpha
+                for (var g = GlowPens.Length - 1; g >= 0; g--)
+                {
+                    var inf = GlowInflates[g];
+                    ctx.DrawRectangle(null, GlowPens[g], new RoundedRect(rect.Inflate(inf), AppTheme.RadiusTile + inf));
+                }
             }
             if (phase)
                 ctx.DrawRectangle(null, PhaseGlowPen, new RoundedRect(rect.Inflate(1.5), AppTheme.RadiusTile + 1.5));
@@ -275,10 +485,12 @@ public sealed class MatrixControl : Control
             ctx.DrawRectangle(on ? AccentFaceBrush : KeyFaceBrush, pen, rr);
 
             // --fx-edge: 1px light on top, 1px shade on the bottom (inset, corner-clear)
-            if (rect.Width > 12 && rect.Height > 10)
+            if (rect.Width > 16 && rect.Height > 12)
             {
-                ctx.DrawRectangle(EdgeLightBrush, null, new Rect(rect.X + 4, rect.Y + 1, rect.Width - 8, 1));
-                ctx.DrawRectangle(EdgeShadeBrush, null, new Rect(rect.X + 4, rect.Bottom - 2, rect.Width - 8, 1));
+                ctx.DrawRectangle(on ? EdgeLightOnBrush : EdgeLightBrush, null,
+                    new Rect(rect.X + AppTheme.RadiusTile, rect.Y + 1, rect.Width - 2 * AppTheme.RadiusTile, 1));
+                ctx.DrawRectangle(EdgeShadeBrush, null,
+                    new Rect(rect.X + AppTheme.RadiusTile, rect.Bottom - 2, rect.Width - 2 * AppTheme.RadiusTile, 1));
             }
 
             if (blocked)
@@ -288,10 +500,11 @@ public sealed class MatrixControl : Control
 
             if (on && cell is not null && Math.Abs(cell.GainDb) >= 0.5)
             {
+                // small bold centered readout, dark-on-accent, e.g. "+3.5dB"
                 var text = FormatGain(cell.GainDb);
-                var ft = Ft(text, FaceBold, 9, AppTheme.TextOnAccentBrush);
+                var ft = Ft(text, FaceBold, AppTheme.Fs2xs, ReadoutBrush);
                 var origin = new Point(rect.Center.X - ft.Width / 2, rect.Center.Y - ft.Height / 2);
-                var shadow = Ft(text, FaceBold, 9, TextShadowBrush);
+                var shadow = Ft(text, FaceBold, AppTheme.Fs2xs, TextShadowBrush);
                 ctx.DrawText(shadow, origin + new Vector(0, 1));
                 ctx.DrawText(ft, origin);
             }
@@ -320,7 +533,7 @@ public sealed class MatrixControl : Control
 
     private void DrawColHeader(DrawingContext ctx, MatrixLayout l, MatrixAxisEntry e, double viewWidth)
     {
-        var card = l.ColCardRect(e, _scrollX);
+        var card = Snap(l.ColCardRect(e, _scrollX));
         if (card.Right < l.TilesOriginX || card.X > viewWidth) return;
 
         var master = e.Device.IsMaster;
@@ -347,15 +560,16 @@ public sealed class MatrixControl : Control
                 // meters: one vertical glass bar per channel, bottom-aligned; inset 24px at the
                 // bottom when the MASTER badge occupies that edge
                 var n = Math.Max(1, e.Device.Channels);
-                var meterBottom = card.Bottom - (master ? AppTheme.BadgeInset : AppTheme.Gap);
-                var meterTop = card.Y + AppTheme.Gap;
-                var laneW = (card.Width - 2 * AppTheme.Gap - AppTheme.Gap * (n - 1)) / n;
+                var peaks = DisplayPeaks(e.Device);
+                var meterBottom = card.Bottom - (master ? AppTheme.BadgeInset : AppTheme.MeterPad);
+                var meterTop = card.Y + AppTheme.MeterPad;
+                var laneW = (card.Width - 2 * AppTheme.MeterPad - AppTheme.MeterPad * (n - 1)) / n;
                 for (var c = 0; c < n && laneW > 1; c++)
                 {
-                    var level = PeakOf(e.Device, c);
+                    var level = PeakOf(peaks, c);
                     if (level <= 0) continue;
                     var bh = Math.Max(0, (meterBottom - meterTop) * level);
-                    var bx = card.X + AppTheme.Gap + c * (laneW + AppTheme.Gap);
+                    var bx = card.X + AppTheme.MeterPad + c * (laneW + AppTheme.MeterPad);
                     ctx.DrawRectangle(MeterFillV, null,
                         new RoundedRect(new Rect(bx, meterBottom - bh, laneW, bh), AppTheme.RadiusMicro));
                 }
@@ -363,7 +577,7 @@ public sealed class MatrixControl : Control
                 // rotated name + sub-label (reads bottom-up), anchored bottom-left, over the meters
                 var textBottom = card.Bottom - (master ? AppTheme.BadgeInset : 0) - 8;
                 var maxLen = Math.Max(8, textBottom - card.Y - 8);
-                var name = Ft(e.Device.Label, FaceBold, 13, AppTheme.TextStrongBrush, maxLen);
+                var name = Ft(e.Device.Label, FaceBold, AppTheme.FsSm, AppTheme.TextStrongBrush, maxLen);
                 var tx = card.X + 8;
                 using (ctx.PushTransform(Matrix.CreateRotation(-Math.PI / 2) * Matrix.CreateTranslation(tx, textBottom)))
                 {
@@ -371,7 +585,7 @@ public sealed class MatrixControl : Control
                 }
                 if (!string.IsNullOrEmpty(e.Device.SubLabel))
                 {
-                    var sub = Ft(e.Device.SubLabel, FaceRegular, 9, AppTheme.MutedBrush, maxLen);
+                    var sub = Ft(e.Device.SubLabel, FaceRegular, AppTheme.Fs2xs, AppTheme.MutedBrush, maxLen);
                     using (ctx.PushTransform(Matrix.CreateRotation(-Math.PI / 2) *
                                              Matrix.CreateTranslation(tx + name.Height + 6, textBottom)))
                     {
@@ -390,7 +604,7 @@ public sealed class MatrixControl : Control
 
             // detached channel chips BELOW the card — one per channel unit
             for (var c = 0; c < Math.Max(1, e.Device.Channels); c++)
-                DrawChip(ctx, l.ColChipRect(e, c, _scrollX), ChipLabel(e.Device.Channels, c));
+                DrawChip(ctx, Snap(l.ColChipRect(e, c, _scrollX)), ChipLabel(e.Device.Channels, c));
         }
     }
 
@@ -398,7 +612,7 @@ public sealed class MatrixControl : Control
 
     private void DrawRowHeader(DrawingContext ctx, MatrixLayout l, MatrixAxisEntry e, double viewHeight)
     {
-        var card = l.RowCardRect(e, _scrollY);
+        var card = Snap(l.RowCardRect(e, _scrollY));
         if (card.Bottom < l.TilesOriginY || card.Y > viewHeight) return;
 
         var master = e.Device.IsMaster;
@@ -425,15 +639,16 @@ public sealed class MatrixControl : Control
                 // meters: one horizontal glass bar per channel, each filling its full tile lane
                 // height (minus 4px pad/gaps); left inset 24px when the MASTER bar sits there
                 var n = Math.Max(1, e.Device.Channels);
-                var meterLeft = card.X + (master ? AppTheme.BadgeInset : AppTheme.Gap);
-                var meterRight = card.Right - AppTheme.Gap;
-                var laneH = (card.Height - 2 * AppTheme.Gap - AppTheme.Gap * (n - 1)) / n;
+                var peaks = DisplayPeaks(e.Device);
+                var meterLeft = card.X + (master ? AppTheme.BadgeInset : AppTheme.MeterPad);
+                var meterRight = card.Right - AppTheme.MeterPad;
+                var laneH = (card.Height - 2 * AppTheme.MeterPad - AppTheme.MeterPad * (n - 1)) / n;
                 for (var c = 0; c < n && laneH > 1; c++)
                 {
-                    var level = PeakOf(e.Device, c);
+                    var level = PeakOf(peaks, c);
                     if (level <= 0) continue;
                     var bw = Math.Max(0, (meterRight - meterLeft) * level);
-                    var by = card.Y + AppTheme.Gap + c * (laneH + AppTheme.Gap);
+                    var by = card.Y + AppTheme.MeterPad + c * (laneH + AppTheme.MeterPad);
                     ctx.DrawRectangle(MeterFillH, null,
                         new RoundedRect(new Rect(meterLeft, by, bw, laneH), AppTheme.RadiusMicro));
                 }
@@ -441,11 +656,11 @@ public sealed class MatrixControl : Control
                 // name + sub anchored TOP-LEFT, floating over the meters
                 var textLeft = card.X + (master ? AppTheme.BadgeInset : 0) + 8;
                 var maxW = Math.Max(8, card.Right - textLeft - 8);
-                var name = Ft(e.Device.Label, FaceBold, 13, AppTheme.TextStrongBrush, maxW);
+                var name = Ft(e.Device.Label, FaceBold, AppTheme.FsSm, AppTheme.TextStrongBrush, maxW);
                 ctx.DrawText(name, new Point(textLeft, card.Y + 8));
                 if (!string.IsNullOrEmpty(e.Device.SubLabel))
                 {
-                    var sub = Ft(e.Device.SubLabel, FaceRegular, 9, AppTheme.MutedBrush, maxW);
+                    var sub = Ft(e.Device.SubLabel, FaceRegular, AppTheme.Fs2xs, AppTheme.MutedBrush, maxW);
                     ctx.DrawText(sub, new Point(textLeft, card.Y + 8 + name.Height + 6));
                 }
 
@@ -460,7 +675,7 @@ public sealed class MatrixControl : Control
 
             // detached channel chips at the RIGHT of the card — one per channel unit
             for (var c = 0; c < Math.Max(1, e.Device.Channels); c++)
-                DrawChip(ctx, l.RowChipRect(e, c, _scrollY), ChipLabel(e.Device.Channels, c));
+                DrawChip(ctx, Snap(l.RowChipRect(e, c, _scrollY)), ChipLabel(e.Device.Channels, c));
         }
     }
 
@@ -469,14 +684,12 @@ public sealed class MatrixControl : Control
     private static void DrawMasterBadge(DrawingContext ctx, Rect badge, bool vertical, RoundedRect rr)
     {
         ctx.DrawRectangle(null, BadgeGlowPen, rr);
-        ctx.DrawRectangle(AccentFaceBrush, null, rr);
+        ctx.DrawRectangle(BadgeFaceBrush, null, rr);
         // inner top light / bottom shade
-        ctx.DrawRectangle(new SolidColorBrush(AppTheme.WithAlpha(Colors.White, 0.34)), null,
-            new Rect(badge.X + 3, badge.Y + 1, badge.Width - 6, 1));
-        ctx.DrawRectangle(new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.24)), null,
-            new Rect(badge.X + 3, badge.Bottom - 2, badge.Width - 6, 1));
+        ctx.DrawRectangle(BadgeLightBrush, null, new Rect(badge.X + 3, badge.Y + 1, badge.Width - 6, 1));
+        ctx.DrawRectangle(BadgeShadeBrush, null, new Rect(badge.X + 3, badge.Bottom - 2, badge.Width - 6, 1));
 
-        var ft = Ft("MASTER", FaceHeavy, 8.5, AppTheme.TextOnAccentBrush);
+        var ft = Ft("MASTER", FaceHeavy, Math.Min(AppTheme.Fs2xs, 11), AppTheme.TextOnAccentBrush);
         if (vertical)
         {
             // rotated bottom-up, centered in the bar
@@ -499,15 +712,15 @@ public sealed class MatrixControl : Control
         ctx.DrawRectangle(KeyFaceBrush, LineStrongPen, rr);
         ctx.DrawRectangle(EdgeLightBrush, null, new Rect(rect.X + 3, rect.Y + 1, rect.Width - 6, 1));
         ctx.DrawRectangle(EdgeShadeBrush, null, new Rect(rect.X + 3, rect.Bottom - 2, rect.Width - 6, 1));
-        var ft = Ft(label, FaceHeavy, 9, ChipTextBrush);
+        var ft = Ft(label, FaceHeavy, AppTheme.Fs2xs, ChipTextBrush);
         ctx.DrawText(ft, new Point(rect.Center.X - ft.Width / 2, rect.Center.Y - ft.Height / 2));
     }
 
     private static string ChipLabel(int channels, int c) =>
         channels <= 1 ? "M" : channels == 2 ? (c == 0 ? "L" : "R") : (c + 1).ToString(CultureInfo.InvariantCulture);
 
-    private static double PeakOf(MatrixDeviceInfo d, int channel) =>
-        d.Peaks.Length > channel ? Math.Clamp(d.Peaks[channel], 0f, 1f) : 0;
+    private static double PeakOf(float[] peaks, int channel) =>
+        peaks.Length > channel ? Math.Clamp(peaks[channel], 0f, 1f) : 0;
 
     private static RoundedRect RoundRect(Rect r, double tl, double tr, double br, double bl) =>
         new(r, new Vector(tl, tl), new Vector(tr, tr), new Vector(br, br), new Vector(bl, bl));
@@ -619,8 +832,11 @@ public sealed class MatrixControl : Control
             }
             if (_panning)
             {
+                // direct manipulation: current AND target track the pointer 1:1
                 _scrollX = _panStartScrollX - delta.X;
                 _scrollY = _panStartScrollY - delta.Y;
+                _targetScrollX = _scrollX;
+                _targetScrollY = _scrollY;
                 ClampScroll(l);
                 InvalidateVisual();
                 UpdateHover(MatrixHit.None);
@@ -709,12 +925,12 @@ public sealed class MatrixControl : Control
             return;
         }
 
-        // scroll the tile region; headers stay pinned by construction (they only translate
-        // along their own axis)
-        _scrollX -= e.Delta.X * WheelScrollStep;
-        _scrollY -= e.Delta.Y * WheelScrollStep;
+        // scroll the tile region smoothly: the wheel moves the TARGET, the RAF loop eases
+        // the visible offset toward it; headers stay pinned by construction
+        _targetScrollX -= e.Delta.X * WheelScrollStep;
+        _targetScrollY -= e.Delta.Y * WheelScrollStep;
         ClampScroll(l);
-        InvalidateVisual();
+        StartScrollAnimation();
         UpdateHover(l.HitTest(p, _scrollX, _scrollY));
         e.Handled = true;
     }

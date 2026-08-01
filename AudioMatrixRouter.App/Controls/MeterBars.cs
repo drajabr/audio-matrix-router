@@ -9,42 +9,113 @@ namespace AudioMatrixRouter.App.Controls;
 /// N-lane glass meter (docs/DESIGN-REFERENCE.md §3.3/§3.4): one 1fr lane per level with
 /// 4px padding and gaps, each bar rounded-4 and filling the whole lane cross-axis, length
 /// = level fraction, AppTheme.MeterFill gradient. Horizontal bars grow left→right, vertical
-/// bars grow bottom→up.
+/// bars grow bottom→up. <see cref="SetLevels"/> only sets TARGETS; a RequestAnimationFrame
+/// loop eases the displayed levels toward them so 10Hz data reads as 60fps (like the CSS
+/// 70ms transition did).
 /// </summary>
 public sealed class MeterBars : Control
 {
-    private static readonly IBrush FillH = AppTheme.MeterFill(horizontal: true);
-    private static readonly IBrush FillV = AppTheme.MeterFill(horizontal: false);
+    private static int s_palVersion = -1;
+    private static IBrush FillH = null!;
+    private static IBrush FillV = null!;
 
-    private double[] _levels = Array.Empty<double>();
+    private static void EnsurePalette()
+    {
+        if (s_palVersion == AppTheme.Version) return;
+        s_palVersion = AppTheme.Version;
+        FillH = AppTheme.MeterFill(horizontal: true);
+        FillV = AppTheme.MeterFill(horizontal: false);
+    }
+
+    private double[] _levels = Array.Empty<double>();   // displayed
+    private double[] _targets = Array.Empty<double>();  // where the data wants to be
+    private bool _animating;
 
     public bool Horizontal { get; set; } = true;
 
-    /// <summary>0..1 per lane; invalidates.</summary>
+    /// <summary>0..1 per lane; sets the animation targets and kicks the ease loop.</summary>
     public void SetLevels(IReadOnlyList<double> levels)
     {
         if (levels is null || levels.Count == 0)
         {
+            if (_targets.Length == 0 && _levels.Length == 0) return;
+            _targets = Array.Empty<double>();
             _levels = Array.Empty<double>();
+            InvalidateVisual();
+            return;
         }
-        else
+
+        if (_targets.Length != levels.Count)
         {
-            if (_levels.Length != levels.Count) _levels = new double[levels.Count];
-            for (var i = 0; i < levels.Count; i++)
-                _levels[i] = Math.Clamp(levels[i], 0, 1);
+            _targets = new double[levels.Count];
+            var old = _levels;
+            _levels = new double[levels.Count];
+            for (var i = 0; i < _levels.Length && i < old.Length; i++)
+                _levels[i] = old[i];
+        }
+        for (var i = 0; i < levels.Count; i++)
+            _targets[i] = Math.Clamp(levels[i], 0, 1);
+
+        StartAnimation();
+    }
+
+    private void StartAnimation()
+    {
+        if (_animating) return;
+        var top = TopLevel.GetTopLevel(this);
+        if (top is null)
+        {
+            Array.Copy(_targets, _levels, _targets.Length);
+            InvalidateVisual();
+            return;
+        }
+        _animating = true;
+        top.RequestAnimationFrame(Tick);
+    }
+
+    private void Tick(TimeSpan _)
+    {
+        _animating = false;
+        if (_levels.Length != _targets.Length) return;
+
+        var moving = false;
+        for (var i = 0; i < _levels.Length; i++)
+        {
+            var delta = _targets[i] - _levels[i];
+            if (Math.Abs(delta) <= 0.004)
+            {
+                _levels[i] = _targets[i];
+            }
+            else
+            {
+                // 70ms-style ease: cur += (target - cur) * 0.35 per frame
+                _levels[i] += delta * 0.35;
+                moving = true;
+            }
         }
         InvalidateVisual();
+
+        if (moving)
+        {
+            var top = TopLevel.GetTopLevel(this);
+            if (top is not null)
+            {
+                _animating = true;
+                top.RequestAnimationFrame(Tick);
+            }
+        }
     }
 
     public override void Render(DrawingContext context)
     {
+        EnsurePalette();
         var n = _levels.Length;
         if (n == 0) return;
 
         var w = Bounds.Width;
         var h = Bounds.Height;
-        const double pad = AppTheme.Gap;
-        const double gap = AppTheme.Gap;
+        const double pad = AppTheme.MeterPad;
+        const double gap = AppTheme.MeterPad;
 
         if (Horizontal)
         {
