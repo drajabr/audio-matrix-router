@@ -291,33 +291,36 @@ public class RingBuffer
     }
 
     /// <summary>
-    /// Drops accumulated backlog so every consumer sits exactly <paramref name="keepFrames"/>
-    /// behind the write head. Consumers move together, so their phase relationship — and
-    /// therefore output sync — is preserved; only the shared delay shrinks. Skipped frames
-    /// are booked as force-advanced so the provider reconciles its timeline instead of
-    /// reading the jump as drift. Returns the frames discarded per consumer.
+    /// Latency resync: advances EVERY consumer by the same amount (at most
+    /// <paramref name="frames"/>, capped so no cursor passes the write head), discarding
+    /// that much shared backlog. Because the shift is identical for all consumers their
+    /// relative offsets — and therefore output-to-output phase — are untouched; only the
+    /// common delay shrinks. Deliberately NOT booked as force-advanced: that bucket makes
+    /// the provider pay the jump back by under-consuming, which would re-accumulate the
+    /// backlog and repeat audio (overflow trimming keeps that semantic; this must not).
     ///
     /// Counted separately from <see cref="TotalFramesDropped"/>: overflow drops mean the
     /// ring outran its capacity (a fault), whereas this is a deliberate latency resync —
     /// on an input nobody is routed to it discards audio no one would have heard.
     /// </summary>
-    public long TrimBacklogTo(int keepFrames)
+    public long TrimBacklogBy(int frames)
     {
-        if (keepFrames < 0) keepFrames = 0;
+        if (frames <= 0) return 0;
         lock (_cursorLock)
         {
-            long target = _writeFramePos - keepFrames;
-            long trimmed = 0;
+            long advance = frames;
             foreach (var c in _consumers.Values)
             {
-                if (c.ReadFramePos >= target) continue;
-                long advance = target - c.ReadFramePos;
-                c.ReadFramePos = target;
-                c.ForceAdvancedPending += advance;
-                if (advance > trimmed) trimmed = advance;
+                long available = _writeFramePos - c.ReadFramePos;
+                if (available < advance) advance = Math.Max(0, available);
             }
-            if (trimmed > 0) Interlocked.Add(ref _totalFramesResynced, trimmed);
-            return trimmed;
+            if (advance <= 0) return 0;
+            foreach (var c in _consumers.Values)
+            {
+                c.ReadFramePos += advance;
+            }
+            Interlocked.Add(ref _totalFramesResynced, advance);
+            return advance;
         }
     }
 

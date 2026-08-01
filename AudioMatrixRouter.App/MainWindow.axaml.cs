@@ -444,7 +444,14 @@ public partial class MainWindow : Window
         // Velopack reports percent only; derive bytes/sec from how fast the percentage
         // moves against the known package size, smoothed so the figure stays readable.
         var now = Environment.TickCount64;
-        if (_updateBytes > 0 && _lastProgressAt > 0 && now > _lastProgressAt)
+        if (_updatePercent < _lastProgressPercent)
+        {
+            // restarted/second download: re-baseline instead of freezing the estimate
+            _lastProgressPercent = _updatePercent;
+            _lastProgressAt = now;
+            _updateSpeedBps = 0;
+        }
+        else if (_updateBytes > 0 && _lastProgressAt > 0 && now > _lastProgressAt)
         {
             var deltaBytes = (_updatePercent - _lastProgressPercent) / 100.0 * _updateBytes;
             var deltaSec = (now - _lastProgressAt) / 1000.0;

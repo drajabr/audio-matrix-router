@@ -584,6 +584,10 @@ public class MixingSampleProvider : ISampleProvider
     private int _deviceDelayMs;
     private int _outputBufferMs;
     private long _underrunCount;
+    // Per-source write position at the previous callback: distinguishes a live producer
+    // that we outran (real underrun) from a paused one (idle loopback — not a fault).
+    // Grown in EnsureScratchSizes with the other per-source arrays.
+    private long[] _lastSourceWritePos;
     private readonly float[] _peakLevels;
     private readonly ConcurrentDictionary<string, long> _inputSyncDiscardedFramesByDevice = new(StringComparer.Ordinal);
 
@@ -614,6 +618,7 @@ public class MixingSampleProvider : ISampleProvider
         _deviceDelayMs = Math.Clamp(outputDelayMs, 0, 5000);
         _outputBufferMs = Math.Clamp(outputBufferMs, 10, 200);
         _pendingSkipPerSource = new long[Math.Max(1, sources.Count)];
+        _lastSourceWritePos = new long[Math.Max(1, sources.Count)];
         _syncCoordinator.RegisterConsumer(_consumerId, _sampleRate, _outputBufferMs);
         // Pin this consumer's cursor on every ring NOW (before captures produce data) so
         // all consumers share an identical zero reference.
@@ -837,8 +842,15 @@ public class MixingSampleProvider : ISampleProvider
 
             int deficit = sourceFramesNeeded - framesRead;
             int audibleDeficitThreshold = Math.Max(8, _engineSampleRate / 2000); // ~0.5 ms
+            // Only a LIVE producer that still can't cover the block is an underrun. A
+            // paused source (idle WASAPI loopback delivers nothing while its device is
+            // silent) has a frozen write position — starving on it is expected and
+            // inaudible, and counting it made the tile climb ~500/s on idle loopbacks.
+            long writePos = src.Buffer.GetWritePositionFrames();
+            bool producerAlive = writePos > _lastSourceWritePos[srcIdx];
+            _lastSourceWritePos[srcIdx] = writePos;
             if ((useAll || _sourceActiveMask[srcIdx]) && deficit >= audibleDeficitThreshold
-                && src.Buffer.GetWritePositionFrames() > 0)
+                && producerAlive)
             {
                 Interlocked.Increment(ref _underrunCount);
             }
@@ -980,6 +992,12 @@ public class MixingSampleProvider : ISampleProvider
             var grown = new long[Math.Max(sourceCount, _pendingSkipPerSource.Length * 2)];
             Array.Copy(_pendingSkipPerSource, grown, _pendingSkipPerSource.Length);
             _pendingSkipPerSource = grown;
+        }
+        if (_lastSourceWritePos.Length < sourceCount)
+        {
+            var grown = new long[Math.Max(sourceCount, _lastSourceWritePos.Length * 2)];
+            Array.Copy(_lastSourceWritePos, grown, _lastSourceWritePos.Length);
+            _lastSourceWritePos = grown;
         }
     }
 

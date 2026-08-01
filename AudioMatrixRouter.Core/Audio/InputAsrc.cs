@@ -90,13 +90,15 @@ public sealed class InputAsrc
     }
 
     /// <summary>
-    /// Surplus beyond which the servo stops easing and simply cuts. This sets the width
-    /// of the residual sawtooth, so it has to stay a fraction of the target: a third of
-    /// it, floored at ~6 ms. (A full target's worth let fill ride 45 ms above target on a
-    /// ring nothing was draining, which is exactly the "why is it still 100 ms" case.)
+    /// Surplus beyond which the servo stops easing and simply cuts. Ring fill naturally
+    /// sawtooths by roughly one render gulp above target (render drains in output-buffer
+    /// chunks while capture feeds 10 ms ones), so the threshold must sit safely OUTSIDE
+    /// that: a full extra target (≈1.5 output buffers), floored at ~20 ms. Tighter
+    /// settings put the trip point inside normal operation and the drain fires on every
+    /// callback — a permanent stutter loop, not a recovery.
     /// </summary>
     private static double HardDrainFrames(int targetFillFrames, int engineSampleRate) =>
-        Math.Max(targetFillFrames / 3.0, engineSampleRate * 6 / 1000.0);
+        Math.Max(targetFillFrames, engineSampleRate * 20 / 1000.0);
 
     public void SetFillConsumer(string consumerId)
     {
@@ -245,12 +247,12 @@ public sealed class InputAsrc
 
         // Hard drain. The ±2000 ppm trim removes surplus at 0.2%, so 50 ms of backlog
         // needs ~25 s of undisturbed running to clear — and a single underrun or restart
-        // re-injects more than that. Past a whole extra buffer of backlog the audio is
-        // already late by more than the user asked for, so cut it in one step: every
-        // consumer advances together, keeping outputs phase-locked to each other.
+        // re-injects more than that. Way past target the audio is already later than the
+        // user asked for, so cut the surplus in one step: every consumer advances by the
+        // SAME amount, so outputs stay phase-locked to each other.
         if (error > _hardDrainFrames)
         {
-            _ring.TrimBacklogTo(_targetFillFrames);
+            _ring.TrimBacklogBy((int)Math.Min(error, int.MaxValue));
             _integralFrames = 0;
             _trimPpm = 0;
             return; // re-measure next callback rather than servo off a stale fill
