@@ -491,8 +491,10 @@ public sealed class MatrixControl : Control
             {
                 ctx.DrawRectangle(on ? EdgeLightOnBrush : EdgeLightBrush, null,
                     new Rect(rect.X + AppTheme.RadiusTile, rect.Y + 1, rect.Width - 2 * AppTheme.RadiusTile, 1));
+                // Flush against the border — at Bottom-2 a bright 1px face sliver showed
+                // below the shade line, reading as an empty line at the tile's bottom.
                 ctx.DrawRectangle(EdgeShadeBrush, null,
-                    new Rect(rect.X + AppTheme.RadiusTile, rect.Bottom - 2, rect.Width - 2 * AppTheme.RadiusTile, 1));
+                    new Rect(rect.X + AppTheme.RadiusTile, rect.Bottom - 1.5, rect.Width - 2 * AppTheme.RadiusTile, 1));
             }
 
             if (blocked)
@@ -548,14 +550,11 @@ public sealed class MatrixControl : Control
 
         using (ctx.PushOpacity(opacity))
         {
-            if (master)
-                ctx.DrawRectangle(null, MasterGlowPen, new RoundedRect(card.Inflate(2), AppTheme.RadiusPanel + 2));
-
+            // Master = ONE bright border (plus the badge). The old outer glow ring +
+            // inner inset ring read as tram-lines/halos with light accent presets.
             var borderPen = isDragTarget ? DragTargetPen : master ? MasterRingPen : LinePen;
             var cardRR = new RoundedRect(card, AppTheme.RadiusPanel);
             ctx.DrawRectangle(CardFill, borderPen, cardRR);
-            if (master)
-                ctx.DrawRectangle(null, MasterRingInsetPen, new RoundedRect(card.Deflate(2), AppTheme.RadiusPanel - 2));
 
             using (ctx.PushClip(cardRR))
             {
@@ -627,14 +626,10 @@ public sealed class MatrixControl : Control
 
         using (ctx.PushOpacity(opacity))
         {
-            if (master)
-                ctx.DrawRectangle(null, MasterGlowPen, new RoundedRect(card.Inflate(2), AppTheme.RadiusPanel + 2));
-
+            // Single bright border for master (see col-header comment).
             var borderPen = isDragTarget ? DragTargetPen : master ? MasterRingPen : LinePen;
             var cardRR = new RoundedRect(card, AppTheme.RadiusPanel);
             ctx.DrawRectangle(CardFill, borderPen, cardRR);
-            if (master)
-                ctx.DrawRectangle(null, MasterRingInsetPen, new RoundedRect(card.Deflate(2), AppTheme.RadiusPanel - 2));
 
             using (ctx.PushClip(cardRR))
             {

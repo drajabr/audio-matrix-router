@@ -486,20 +486,21 @@ public partial class MainWindow : Window
             UpdateCornerVisuals();
         };
 
-        // reference shows "IN" over "10ms" — the unit rides in the value
-        InDrum.ValueFormatter = v => v.ToString("0") + "ms";
         OutDrum.ValueFormatter = v => v.ToString("0") + "ms";
         GainDrum.ValueFormatter = v => v.ToString("+0.0;-0.0;0.0");
         GainDrum.ShowGlow = true; // only the master gain wheel carries the accent glow
 
-        InDrum.ValueCommitted += (_, v) =>
-        {
-            try { _controller.SetInputBufferMs((int)Math.Round(v)); }
-            catch (Exception ex) { ShowBanner(ex.Message); }
-        };
+        // ONE buffer knob: OUT is the knob that actually governs stability/latency
+        // (render buffer + ASRC fill target + barrier); IN is derived — capture buffer
+        // adds latency but contributes little stability behind the ring/ASRC.
         OutDrum.ValueCommitted += (_, v) =>
         {
-            try { _controller.SetOutputBufferMs((int)Math.Round(v)); }
+            try
+            {
+                var outMs = (int)Math.Round(v);
+                _controller.SetOutputBufferMs(outMs);
+                _controller.SetInputBufferMs(Math.Clamp(outMs / 2, 10, 40));
+            }
             catch (Exception ex) { ShowBanner(ex.Message); }
         };
         GainDrum.ValueCommitted += (_, v) => OnMasterGainCommitted((float)v);
@@ -788,10 +789,8 @@ public partial class MainWindow : Window
 
     private void SyncFromSnapshot()
     {
-        // Drum values follow the authoritative config (skip while unchanged so a
+        // Drum value follows the authoritative config (skip while unchanged so a
         // mid-drag value is not stomped for no reason).
-        if (Math.Abs(InDrum.Value - _snapshot.InputBufferMs) >= 0.5)
-            InDrum.Value = _snapshot.InputBufferMs;
         if (Math.Abs(OutDrum.Value - _snapshot.OutputBufferMs) >= 0.5)
             OutDrum.Value = _snapshot.OutputBufferMs;
     }

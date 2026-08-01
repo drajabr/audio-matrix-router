@@ -448,14 +448,11 @@
                 Background="{StaticResource CornerBg}">
           <Grid Name="CornerGrid"
                 RowDefinitions="*,*,*,*" ColumnDefinitions="*,*,*,*">
-            <!-- row 1: power · IN drum · OUT drum · lock -->
+            <!-- row 1: power · single BUFFER drum (drives OUT; IN derived) · lock -->
             <Button Name="PowerBtn" Classes="key" Grid.Row="0" Grid.Column="0" Content="⏻" />
-            <controls:DrumControl Name="InDrum" Grid.Row="0" Grid.Column="1" Margin="2"
+            <controls:DrumControl Name="OutDrum" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Margin="2"
                                   Minimum="10" Maximum="200" Step="5" DefaultValue="40"
-                                  PxPerStep="10" Caption="IN" />
-            <controls:DrumControl Name="OutDrum" Grid.Row="0" Grid.Column="2" Margin="2"
-                                  Minimum="10" Maximum="200" Step="5" DefaultValue="40"
-                                  PxPerStep="10" Caption="OUT" />
+                                  PxPerStep="10" Caption="BUFFER" />
             <Button Name="LockBtn" Classes="key" Grid.Row="0" Grid.Column="3" Content="🔓" />
 
             <!-- row 2: reload · master gain drum (2×2, big value + small dB suffix) -->
