@@ -352,6 +352,18 @@ public partial class MainWindow : Window
         PickScaleBtn.Click += (_, _) => ShowPicker("scale", AppTheme.UiScaleOptions,
             () => _prefs.UiScaleKey, k => _prefs.UiScaleKey = k);
         UpdateQuickButtons();
+
+        // picker overlay dismissal + keep it pinned to the drawer on resize
+        PickerHost.PointerPressed += (_, _) => ClosePicker();
+        SizeChanged += (_, _) => PositionPickerPanel();
+        KeyDown += (_, e) =>
+        {
+            if (e.Key == Avalonia.Input.Key.Escape && _pickerCategory is not null)
+            {
+                ClosePicker();
+                e.Handled = true;
+            }
+        };
     }
 
     private async Task HandleUpdateClickAsync()
@@ -588,10 +600,8 @@ public partial class MainWindow : Window
     // theme preset picker (gear)
     // =====================================================================
 
-    private Flyout? _pickerFlyout;
     private string? _pickerCategory;
-    private string? _pickerDismissedCategory;
-    private int _pickerDismissedAt;
+    private Border? _pickerPanel;
 
     /// <summary>
     /// Category picker panel, faithful to the web `.quick-control-picker`: a dark
@@ -603,34 +613,10 @@ public partial class MainWindow : Window
     private void ShowPicker(string category, IReadOnlyList<AppTheme.PresetOption> options,
         Func<string> getCurrent, Action<string> setKey)
     {
-        // toggle: clicking the open category's button closes its panel. With
-        // dismiss pass-through the light-dismiss fires BEFORE this click handler,
-        // so "same category dismissed a moment ago" also means toggle-close.
-        if (_pickerFlyout is { IsOpen: true } open)
-        {
-            open.Hide();
-            if (_pickerCategory == category) { _pickerCategory = null; return; }
-        }
-        else if (_pickerDismissedCategory == category &&
-                 unchecked(Environment.TickCount - _pickerDismissedAt) < 400)
-        {
-            _pickerDismissedCategory = null;
-            return;
-        }
+        // toggle: clicking the open category's button closes its panel; clicking a
+        // different one switches the panel in place (no popup, no dismiss races).
+        if (_pickerCategory == category) { ClosePicker(); return; }
         _pickerCategory = category;
-
-        var flyout = new Flyout
-        {
-            Placement = PlacementMode.BottomEdgeAlignedRight,
-            OverlayDismissEventPassThrough = true, // click another drawer button = switch panel
-            VerticalOffset = -1, // overlap the drawer's bottom border: one connected chassis
-        };
-        flyout.FlyoutPresenterClasses.Add("bare");
-        _pickerFlyout = flyout;
-        // local (pre-zoom) units: the popup content gets the same UI-scale transform
-        // as the window root, so the panel's VISUAL width tracks the drawer exactly
-        // at every scale preset
-        var drawerWidth = Math.Max(QuickStrip.Bounds.Width, 170);
 
         // seamless pop: while open the drawer squares its bottom corners and takes
         // the panel's solid face, so drawer + menu read as one expanded chassis
@@ -699,7 +685,7 @@ public partial class MainWindow : Window
                 var wasActive = active;
                 row.Click += (_, _) =>
                 {
-                    if (wasActive) { flyout.Hide(); return; } // web: re-click active = close
+                    if (wasActive) { ClosePicker(); return; } // web: re-click active = close
                     setKey(key);
                     ApplyThemeLive();
                     Rebuild();
@@ -708,43 +694,60 @@ public partial class MainWindow : Window
             }
 
             // dark chassis panel (web .quick-control-picker: panel bg, line border,
-            // radius 8) spanning exactly the drawer's width; wrapped in the same
-            // UI-scale transform as the window root (popups live outside it)
-            flyout.Content = new LayoutTransformControl
+            // radius 8): lives INSIDE the window's visual tree, so it shares the
+            // root zoom transform and lines up with the drawer pixel-exact
+            var panel = new Border
             {
-                LayoutTransform = new ScaleTransform(AppTheme.UiScale, AppTheme.UiScale),
-                Child = new Border
+                Background = new SolidColorBrush(AppTheme.Panel),
+                BorderBrush = AppTheme.LineStrongBrush,
+                BorderThickness = new Thickness(1),
+                // square top corners: the menu reads as the drawer box extending downward
+                CornerRadius = new CornerRadius(0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel),
+                Padding = new Thickness(6),
+                BoxShadow = new BoxShadows(new BoxShadow
                 {
-                    Width = drawerWidth,
-                    Background = new SolidColorBrush(AppTheme.Panel),
-                    BorderBrush = AppTheme.LineStrongBrush,
-                    BorderThickness = new Thickness(1),
-                    // square top corners: the menu reads as the drawer box extending downward
-                    CornerRadius = new CornerRadius(0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel),
-                    Padding = new Thickness(6),
-                    BoxShadow = new BoxShadows(new BoxShadow
-                    {
-                        OffsetY = 10, Blur = 26, Color = AppTheme.WithAlpha(Colors.Black, 0.45),
-                    }),
-                    Child = list,
-                },
+                    OffsetY = 10, Blur = 26, Color = AppTheme.WithAlpha(Colors.Black, 0.45),
+                }),
+                Child = list,
             };
+            panel.PointerPressed += (_, e) => e.Handled = true; // don't reach the backdrop
+            _pickerPanel = panel;
+            PickerHost.Children.Clear();
+            PickerHost.Children.Add(panel);
+            PositionPickerPanel();
         }
 
+        // the backdrop starts below the header so the drawer buttons stay clickable
+        // (that's how switching categories works while a panel is open). Order
+        // matters: the host must be visible and laid out BEFORE the panel is
+        // pinned, so TranslatePoint sees real coordinates — hence the deferred
+        // positioning pass after this layout tick.
+        PickerHost.Margin = new Thickness(0, HeaderBar.Bounds.Height, 0, 0);
+        PickerHost.IsVisible = true;
         Rebuild();
-        flyout.Closed += (_, _) =>
-        {
-            _pickerDismissedCategory = category;
-            _pickerDismissedAt = Environment.TickCount;
-            if (_pickerFlyout == flyout)
-            {
-                _pickerCategory = null;
-                // restore the collapsed drawer chassis
-                QuickStrip.CornerRadius = new CornerRadius(AppTheme.RadiusPanel);
-                QuickStrip.Background = Brushes.Transparent;
-            }
-        };
-        flyout.ShowAt(QuickStrip);
+        Dispatcher.UIThread.Post(PositionPickerPanel, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>Pin the open panel to the drawer: left edges flush, 1px overlap
+    /// into the drawer's bottom border, width exactly the drawer's width.</summary>
+    private void PositionPickerPanel()
+    {
+        if (_pickerPanel is null) return;
+        var p = QuickStrip.TranslatePoint(new Point(0, QuickStrip.Bounds.Height - 1), PickerHost) ?? default;
+        Canvas.SetLeft(_pickerPanel, p.X);
+        Canvas.SetTop(_pickerPanel, p.Y);
+        _pickerPanel.Width = QuickStrip.Bounds.Width;
+    }
+
+    private void ClosePicker()
+    {
+        _pickerCategory = null;
+        _pickerPanel = null;
+        PickerHost.Children.Clear();
+        PickerHost.IsVisible = false;
+        // restore the collapsed drawer chassis
+        QuickStrip.CornerRadius = new CornerRadius(AppTheme.RadiusPanel);
+        QuickStrip.Background = Brushes.Transparent;
     }
 
     /// <summary>Refresh the header quick-button faces after a theme change.</summary>

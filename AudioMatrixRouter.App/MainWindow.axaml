@@ -254,6 +254,7 @@
 
     <!-- whole-UI zoom (the uiScale preset) applied in code as a LayoutTransform -->
     <LayoutTransformControl Name="RootScale">
+    <Panel>
     <DockPanel>
       <!-- ===== Header IS the title bar. Avalonia 12 element roles: TitleBar gives
            native drag + double-click-maximize; interactive children opt out with the
@@ -534,6 +535,13 @@
         </Border>
       </Panel>
     </DockPanel>
+
+    <!-- picker overlay: hosts the drawer's expanded menu INSIDE the window (same
+         visual tree, same zoom transform), so it attaches to the drawer chassis
+         pixel-exact at any scale. Sits below the header so the drawer buttons
+         stay clickable for switching categories; clicking the backdrop closes. -->
+    <Canvas Name="PickerHost" IsVisible="False" Background="Transparent" />
+    </Panel>
     </LayoutTransformControl>
   </Panel>
 </Window>
