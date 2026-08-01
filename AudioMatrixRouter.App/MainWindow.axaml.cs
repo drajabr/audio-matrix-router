@@ -58,12 +58,15 @@ public partial class MainWindow : Window
         VersionText.Text = "v" + (typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "0.0.0");
 
         _controller = new AppController(action => Dispatcher.UIThread.Post(action));
-        _controller.StateChanged += OnStateChanged;
         _controller.UpdateDownloadProgress += OnUpdateDownloadProgress;
+        // Initialize BEFORE subscribing StateChanged: it raises the event synchronously
+        // and the handler needs _prefs/_model, which don't exist yet at this point.
         _controller.Initialize();
 
         _prefs = new UiPreferences(_controller);
         ApplyPreferences();
+
+        _controller.StateChanged += OnStateChanged;
 
         _snapshot = _controller.GetSnapshot();
         SyncFromSnapshot();
