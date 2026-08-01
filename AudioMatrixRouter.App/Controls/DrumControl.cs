@@ -105,9 +105,11 @@ public sealed class DrumControl : Control
             }
         };
 
-        LedFill = new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Mix(AppTheme.AccentHl, Colors.White, 0.90), 0.85));
-        LedGlowInner = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.30)), 2);
-        LedGlowOuter = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.12)), 4);
+        // Subtle backlight strip, not a beacon — stroke "glow" reads far stronger than
+        // the CSS blur it mimics, so run well below the CSS alphas.
+        LedFill = new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Mix(AppTheme.AccentHl, Colors.White, 0.90), 0.50));
+        LedGlowInner = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.10)), 1.5);
+        LedGlowOuter = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.04)), 3);
 
         ValueShadowBrush = new SolidColorBrush(AppTheme.WithAlpha(Colors.Black, 0.85));
         CaptionBrush = new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Muted, 0.9));
