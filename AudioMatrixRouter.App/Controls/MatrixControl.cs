@@ -87,14 +87,15 @@ public sealed class MatrixControl : Control
 
         // soft accent glow: CSS `0 0 10px accent 45%` + `0 12px 20px accent 14%` approximated
         // with concentric strokes of decreasing alpha (a blurred-looking falloff)
+        // Toned down (was 2x this): strokes read stronger than the CSS blur they mimic.
         GlowPens = new IPen[]
         {
-            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.40)), 2),
-            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.22)), 3),
-            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.11)), 4),
-            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.05)), 5),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.20)), 2),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.11)), 3),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.055)), 4),
+            new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.025)), 5),
         };
-        GlowInflates = new[] { 1.0, 3.5, 7.0, 11.0 };
+        GlowInflates = new[] { 1.0, 3.0, 5.5, 8.5 };
 
         PhaseGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Phase, 0.30)), 2.5);
         PhaseStripePen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Phase, 0.18)), 4);
@@ -491,10 +492,10 @@ public sealed class MatrixControl : Control
             {
                 ctx.DrawRectangle(on ? EdgeLightOnBrush : EdgeLightBrush, null,
                     new Rect(rect.X + AppTheme.RadiusTile, rect.Y + 1, rect.Width - 2 * AppTheme.RadiusTile, 1));
-                // Flush against the border — at Bottom-2 a bright 1px face sliver showed
-                // below the shade line, reading as an empty line at the tile's bottom.
+                // Overlap the border stroke (0.25px past its inner edge): meeting it
+                // exactly still left an anti-aliased hairline between shade and border.
                 ctx.DrawRectangle(EdgeShadeBrush, null,
-                    new Rect(rect.X + AppTheme.RadiusTile, rect.Bottom - 1.5, rect.Width - 2 * AppTheme.RadiusTile, 1));
+                    new Rect(rect.X + AppTheme.RadiusTile, rect.Bottom - 1.75, rect.Width - 2 * AppTheme.RadiusTile, 1.5));
             }
 
             if (blocked)
@@ -599,7 +600,9 @@ public sealed class MatrixControl : Control
                 if (master)
                 {
                     // MASTER edge bar on the BOTTOM edge: bottom corners rounded, top square
-                    var badge = new Rect(card.X, card.Bottom - AppTheme.BadgeSize, card.Width, AppTheme.BadgeSize);
+                    // Overdraw 1px past the card edges — the rounded clip trims it flush,
+                    // killing the anti-aliased hairline gap against the card border.
+                    var badge = new Rect(card.X - 1, card.Bottom - AppTheme.BadgeSize, card.Width + 2, AppTheme.BadgeSize + 1);
                     DrawMasterBadge(ctx, badge, vertical: false,
                         RoundRect(badge, 0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel));
                 }
@@ -666,7 +669,8 @@ public sealed class MatrixControl : Control
                 if (master)
                 {
                     // MASTER edge bar on the LEFT edge: left corners rounded, right square
-                    var badge = new Rect(card.X, card.Y, AppTheme.BadgeSize, card.Height);
+                    // Overdraw 1px past the card edges (see col badge comment).
+                    var badge = new Rect(card.X - 1, card.Y - 1, AppTheme.BadgeSize + 1, card.Height + 2);
                     DrawMasterBadge(ctx, badge, vertical: true,
                         RoundRect(badge, AppTheme.RadiusPanel, 0, 0, AppTheme.RadiusPanel));
                 }
