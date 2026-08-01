@@ -490,6 +490,7 @@ public partial class MainWindow : Window
         InDrum.ValueFormatter = v => v.ToString("0") + "ms";
         OutDrum.ValueFormatter = v => v.ToString("0") + "ms";
         GainDrum.ValueFormatter = v => v.ToString("+0.0;-0.0;0.0");
+        GainDrum.ShowGlow = true; // only the master gain wheel carries the accent glow
 
         InDrum.ValueCommitted += (_, v) =>
         {

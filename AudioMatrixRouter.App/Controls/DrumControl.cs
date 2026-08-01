@@ -57,7 +57,7 @@ public sealed class DrumControl : Control
 
         HousingFill = new SolidColorBrush(Color.Parse("#050505"));
         HousingPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Line, Colors.Black, 0.5)), 1);
-        OuterGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.24)), 2);
+        OuterGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.14)), 2);
 
         // rib colors verbatim from the CSS repeating gradient:
         //   groove rgba(0,0,0,.90) · crest surface+10% white · body surface+32% black
@@ -143,6 +143,9 @@ public sealed class DrumControl : Control
 
     /// <summary>Small unit suffix drawn after the value at reduced size (e.g. "dB").</summary>
     public string? Suffix { get; set; }
+
+    /// <summary>Outer accent glow ring — only the master gain wheel has it in the design.</summary>
+    public bool ShowGlow { get; set; }
 
     /// <summary>Default: v => v.ToString("0.#").</summary>
     public Func<double, string>? ValueFormatter { get; set; }
@@ -235,8 +238,13 @@ public sealed class DrumControl : Control
         var housing = r.Deflate(0.5);
         var rr = new RoundedRect(housing, AppTheme.RadiusOverlay);
 
-        // recessed housing + idle accent glow around it
-        context.DrawRectangle(null, OuterGlowPen, new RoundedRect(housing.Inflate(1.5), AppTheme.RadiusOverlay + 1.5));
+        // Recessed housing. Outer accent glow ONLY when opted in — in the CSS just the
+        // master gain wheel has it; buffer drums are plain keys (with a light accent
+        // like white, an unconditional ring read as a weird halo on every drum).
+        if (ShowGlow)
+        {
+            context.DrawRectangle(null, OuterGlowPen, new RoundedRect(housing.Inflate(1.5), AppTheme.RadiusOverlay + 1.5));
+        }
         context.DrawRectangle(HousingFill, HousingPen, rr);
 
         var inner = housing.Deflate(1);

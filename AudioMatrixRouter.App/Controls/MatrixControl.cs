@@ -101,8 +101,10 @@ public sealed class MatrixControl : Control
         HatchPenA = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Mix(AppTheme.Surface, Colors.Black, 0.55), 0.85)), 4);
         MasterRingPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, Colors.White, 0.78)), 1);
         MasterRingInsetPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.45)), 1);
-        MasterGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.22)), 4);
-        BadgeGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.35)), 2);
+        // Subtle: with light accents (white preset) fat rings read as weird halos around
+        // the cards — the CSS master treatment is a bright border + faint ring, not a glow.
+        MasterGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.10)), 2.5);
+        BadgeGlowPen = new Pen(new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.16)), 1.5);
         DragTargetPen = new Pen(new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Line, 0.70)), 1.5);
 
         KeyFaceBrush = AppTheme.KeyFace();
