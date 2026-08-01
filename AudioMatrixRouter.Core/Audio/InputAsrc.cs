@@ -44,6 +44,7 @@ public sealed class InputAsrc
     private readonly double _fastErrorFrames; // |error| beyond this → fast slew
 
     private int _targetFillFrames;
+    private double _hardDrainFrames;
     private double _trimPpm;
     private double _integralFrames;
     private string _fillConsumerId = string.Empty;
@@ -71,6 +72,7 @@ public sealed class InputAsrc
         _engineSampleRate = Math.Max(1, engineSampleRate);
         _baseRatio = (double)engineSampleRate / Math.Max(1, captureSampleRate);
         _targetFillFrames = Math.Max(1, targetFillFrames);
+        _hardDrainFrames = HardDrainFrames(_targetFillFrames, _engineSampleRate);
         _fastErrorFrames = Math.Max(64, engineSampleRate / 100.0); // ~10 ms
         _lastFrame = new float[_channels];
     }
@@ -84,7 +86,17 @@ public sealed class InputAsrc
     public void SetTargetFillFrames(int frames)
     {
         _targetFillFrames = Math.Max(1, frames);
+        _hardDrainFrames = HardDrainFrames(_targetFillFrames, _engineSampleRate);
     }
+
+    /// <summary>
+    /// Surplus beyond which the servo stops easing and simply cuts. This sets the width
+    /// of the residual sawtooth, so it has to stay a fraction of the target: a third of
+    /// it, floored at ~6 ms. (A full target's worth let fill ride 45 ms above target on a
+    /// ring nothing was draining, which is exactly the "why is it still 100 ms" case.)
+    /// </summary>
+    private static double HardDrainFrames(int targetFillFrames, int engineSampleRate) =>
+        Math.Max(targetFillFrames / 3.0, engineSampleRate * 6 / 1000.0);
 
     public void SetFillConsumer(string consumerId)
     {
@@ -230,6 +242,19 @@ public sealed class InputAsrc
         }
 
         double error = fill - _targetFillFrames; // positive: ring too full → slow down (trim negative)
+
+        // Hard drain. The ±2000 ppm trim removes surplus at 0.2%, so 50 ms of backlog
+        // needs ~25 s of undisturbed running to clear — and a single underrun or restart
+        // re-injects more than that. Past a whole extra buffer of backlog the audio is
+        // already late by more than the user asked for, so cut it in one step: every
+        // consumer advances together, keeping outputs phase-locked to each other.
+        if (error > _hardDrainFrames)
+        {
+            _ring.TrimBacklogTo(_targetFillFrames);
+            _integralFrames = 0;
+            _trimPpm = 0;
+            return; // re-measure next callback rather than servo off a stale fill
+        }
 
         double absError = Math.Abs(error);
         double effError = absError <= DeadbandFrames ? 0 : (error > 0 ? error - DeadbandFrames : error + DeadbandFrames);

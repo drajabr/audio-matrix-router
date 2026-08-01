@@ -44,8 +44,12 @@ public class RingBuffer
     private readonly List<string> _trimKeysScratch = new();
     private string _preferredConsumerId = string.Empty;
     private long _totalFramesDropped;
+    private long _totalFramesResynced;
 
     public long TotalFramesDropped => Interlocked.Read(ref _totalFramesDropped);
+
+    /// <summary>Frames discarded by deliberate latency resyncs (not a fault).</summary>
+    public long TotalFramesResynced => Interlocked.Read(ref _totalFramesResynced);
     public int CapacityFrames => _capacityFrames;
 
     public RingBuffer(int frameCount, int channels)
@@ -283,6 +287,37 @@ public class RingBuffer
             int skip = (int)Math.Min(available, frameCount);
             if (skip > 0) c.ReadFramePos += skip;
             return skip;
+        }
+    }
+
+    /// <summary>
+    /// Drops accumulated backlog so every consumer sits exactly <paramref name="keepFrames"/>
+    /// behind the write head. Consumers move together, so their phase relationship — and
+    /// therefore output sync — is preserved; only the shared delay shrinks. Skipped frames
+    /// are booked as force-advanced so the provider reconciles its timeline instead of
+    /// reading the jump as drift. Returns the frames discarded per consumer.
+    ///
+    /// Counted separately from <see cref="TotalFramesDropped"/>: overflow drops mean the
+    /// ring outran its capacity (a fault), whereas this is a deliberate latency resync —
+    /// on an input nobody is routed to it discards audio no one would have heard.
+    /// </summary>
+    public long TrimBacklogTo(int keepFrames)
+    {
+        if (keepFrames < 0) keepFrames = 0;
+        lock (_cursorLock)
+        {
+            long target = _writeFramePos - keepFrames;
+            long trimmed = 0;
+            foreach (var c in _consumers.Values)
+            {
+                if (c.ReadFramePos >= target) continue;
+                long advance = target - c.ReadFramePos;
+                c.ReadFramePos = target;
+                c.ForceAdvancedPending += advance;
+                if (advance > trimmed) trimmed = advance;
+            }
+            if (trimmed > 0) Interlocked.Add(ref _totalFramesResynced, trimmed);
+            return trimmed;
         }
     }
 

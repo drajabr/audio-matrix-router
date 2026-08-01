@@ -52,8 +52,11 @@ public class AudioEngine : IDisposable
     private const int RingBufferCapacityMs = 400;
     private const int RenderPeriodMs = 10;
     // Input ASRC keeps ring fill at (output buffer + headroom) so render-side jitter
-    // never starves the ring in steady state.
-    private const int InputFillHeadroomMs = 30;
+    // never starves the ring in steady state. The headroom SCALES with the user's
+    // buffer setting instead of being a fixed slab — the knob owns the whole latency
+    // budget. (It used to be a flat 30 ms, which put a 60 ms floor under a 10 ms
+    // buffer and made the minimum setting almost meaningless.)
+    private const int MinInputFillHeadroomMs = 4;
 
     private readonly DeviceEnumerator _enumerator = new();
     private readonly List<ActiveDevice> _inputDevices = [];
@@ -1115,11 +1118,15 @@ public class AudioEngine : IDisposable
         }
     }
 
+    /// <summary>Headroom above one output buffer, derived from the buffer itself:
+    /// half a buffer covers the capture/render callback interleave at any setting.</summary>
+    private int InputFillHeadroomMs => Math.Max(MinInputFillHeadroomMs, _outputBufferMs / 2);
+
     private int CalculateInputFillTargetFrames()
     {
         // Keep ring fill at output-buffer + headroom so render jitter never starves the
         // ring, while staying well inside ring capacity (400 ms).
-        int targetMs = Math.Clamp(_outputBufferMs + InputFillHeadroomMs, 20, RingBufferCapacityMs * 3 / 4);
+        int targetMs = Math.Clamp(_outputBufferMs + InputFillHeadroomMs, 12, RingBufferCapacityMs * 3 / 4);
         return Math.Max(64, _engineSampleRate * targetMs / 1000);
     }
 
