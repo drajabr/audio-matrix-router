@@ -93,9 +93,9 @@ dotnet run --project AudioMatrixRouter
 
 ## Updates
 
-- The app checks for updates via the button next to the version pill (top-left).
-- Updates are downloaded from GitHub Releases and installed silently on restart (Velopack).
-- Installed builds live in %LocalAppData%\AudioMatrixRouter. Portable-zip builds cannot self-update; download the Setup.exe from Releases instead.
+- Install via the Setup.exe from GitHub Releases (installer/updater flow only — no portable zip).
+- The app checks for updates via the version pill (top-left); updates download from GitHub Releases and install silently on restart (Velopack, with delta packages).
+- Installed builds live in %LocalAppData%\AudioMatrixRouter.
 
 ## Configuration
 
@@ -113,7 +113,7 @@ Saved fields include:
 ## CI/CD
 
 - Build and release workflow: .github/workflows/ci.yml
-- Releases publish a Velopack Setup.exe + update packages plus the portable zip.
+- Releases publish a Velopack Setup.exe + update packages (installer/updater only).
 
 ## Troubleshooting
 

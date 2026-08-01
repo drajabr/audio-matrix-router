@@ -105,18 +105,6 @@ jobs:
           -p:Version=${{ needs.version.outputs.app_version_number }}
           -o artifacts/publish
 
-      - name: Package portable zip
-        shell: pwsh
-        run: |
-          Compress-Archive -Path artifacts/publish/* -DestinationPath artifacts/audio-router-matrix-win-x64-portable.zip -Force
-
-      - name: Upload portable artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: audio-router-matrix-win-x64-portable
-          path: artifacts/audio-router-matrix-win-x64-portable.zip
-          if-no-files-found: error
-
       - name: Install Velopack CLI
         run: dotnet tool install -g vpk
 
@@ -158,10 +146,9 @@ jobs:
             git push origin "$env:APP_VERSION"
           }
 
-      # ORDER MATTERS: vpk upload creates the published release with the Velopack assets
+      # Installer/updater flow only: the release carries the Velopack assets
       # (Setup.exe, *-full.nupkg, *-delta.nupkg, releases.win.json — what the in-app
-      # updater's GithubSource reads); softprops then finds that release by tag and
-      # appends the portable zip.
+      # updater's GithubSource reads). No portable zip.
       - name: Publish Velopack release to GitHub
         if: needs.version.outputs.release_requested == 'true'
         run: >-
@@ -171,12 +158,3 @@ jobs:
           --releaseName "${{ needs.version.outputs.app_version }}"
           --tag ${{ needs.version.outputs.app_version }}
           --token ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Attach portable zip to GitHub Release
-        if: needs.version.outputs.release_requested == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.version.outputs.app_version }}
-          name: ${{ needs.version.outputs.app_version }}
-          files: artifacts/audio-router-matrix-win-x64-portable.zip
-          generate_release_notes: true

@@ -144,14 +144,16 @@
     </Style>
 
     <!-- header pill: ONE control carrying version + update state -->
+    <!-- Square key-style pill: blends with the corner keys / metric tiles instead of
+         the web's rounded capsule. -->
     <Style Selector="Button.pill">
-      <Setter Property="MinWidth" Value="46" />
-      <Setter Property="MinHeight" Value="22" />
-      <Setter Property="Padding" Value="9,2" />
-      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="MinWidth" Value="52" />
+      <Setter Property="MinHeight" Value="26" />
+      <Setter Property="Padding" Value="9,4" />
+      <Setter Property="CornerRadius" Value="6" />
       <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="BorderBrush" Value="{StaticResource PillBorder}" />
-      <Setter Property="Background" Value="{StaticResource PillBg}" />
+      <Setter Property="BorderBrush" Value="{StaticResource LineStrong}" />
+      <Setter Property="Background" Value="{StaticResource KeyFace}" />
       <Setter Property="Foreground" Value="{StaticResource PillFg}" />
       <Setter Property="FontSize" Value="{DynamicResource FsPill}" />
       <Setter Property="FontWeight" Value="Bold" />
