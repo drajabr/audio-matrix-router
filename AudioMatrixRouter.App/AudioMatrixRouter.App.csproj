@@ -1,7 +1,7 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net9.0-windows</TargetFramework>
+    <TargetFramework>net10.0-windows</TargetFramework>
     <RootNamespace>AudioMatrixRouter.App</RootNamespace>
     <Platforms>x64</Platforms>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
@@ -9,9 +9,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>..\AudioMatrixRouter\app.ico</ApplicationIcon>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
-    <!-- Dev convenience: local machines may only have a newer runtime (release builds
-         publish self-contained, so this never affects shipping bits). -->
-    <RollForward>LatestMajor</RollForward>
     <Version Condition="'$(Version)' == ''">0.0.0</Version>
   </PropertyGroup>
 

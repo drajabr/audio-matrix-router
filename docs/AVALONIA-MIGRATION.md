@@ -55,8 +55,9 @@ scenarios (route survival, hotplug, boot retry, updater).
 
 ## Phase 2 — Avalonia UI, parity or bust (ships as v0.4.0)
 
-New project `AudioMatrixRouter.App` (Avalonia 11, CommunityToolkit.Mvvm), referencing
-Core. The WinForms project stays in the repo until exit criteria pass, then dies.
+New project `AudioMatrixRouter.App` (Avalonia 12.1.1, CommunityToolkit.Mvvm 8.4.2,
+net10.0-windows), referencing Core. The WinForms project stays in the repo until exit
+criteria pass, then dies.
 
 ### 2.1 Architecture
 - `MainViewModel` owns an `AppController`; engine events arrive already-marshaled via
