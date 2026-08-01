@@ -530,8 +530,10 @@ public sealed class MatrixControl : Control
         }
     }
 
+    // Always one decimal ("+1.0dB", not "+1dB") so the readout width doesn't jump
+    // while wheeling through 0.5dB steps.
     private static string FormatGain(double gainDb) =>
-        (gainDb >= 0 ? "+" : "") + gainDb.ToString("0.#", CultureInfo.InvariantCulture) + "dB";
+        (gainDb >= 0 ? "+" : "") + gainDb.ToString("0.0", CultureInfo.InvariantCulture) + "dB";
 
     // --------------------------------------------------------------------- column headers
 

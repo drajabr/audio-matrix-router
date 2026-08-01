@@ -148,17 +148,20 @@ public sealed class MatrixLayout
 
     // ===== rects (control coordinates, given the current scroll offsets) =====
 
+    // Cards start 1px inside the control edge: a 1px stroke centered on y=0 gets its
+    // top half clipped by the control bounds, which read as a "cut" top border.
     public Rect ColCardRect(MatrixAxisEntry e, double scrollX) =>
-        new(TilesOriginX + UnitPos(e.StartUnit) - scrollX, 0,
-            SpanSize(e.UnitSpan), LabelSquare - Theme.Gap - Theme.ChipShort);
+        new(TilesOriginX + UnitPos(e.StartUnit) - scrollX, 1,
+            SpanSize(e.UnitSpan), LabelSquare - Theme.Gap - Theme.ChipShort - 1);
 
     public Rect ColChipRect(MatrixAxisEntry e, int channel, double scrollX) =>
         new(TilesOriginX + UnitPos(e.StartUnit + channel) - scrollX, LabelSquare - Theme.ChipShort,
             Theme.Unit, Theme.ChipShort);
 
+    // Same 1px inset on the left edge (see ColCardRect).
     public Rect RowCardRect(MatrixAxisEntry e, double scrollY) =>
-        new(0, TilesOriginY + UnitPos(e.StartUnit) - scrollY,
-            LabelSquare - Theme.Gap - Theme.ChipShort, SpanSize(e.UnitSpan));
+        new(1, TilesOriginY + UnitPos(e.StartUnit) - scrollY,
+            LabelSquare - Theme.Gap - Theme.ChipShort - 1, SpanSize(e.UnitSpan));
 
     public Rect RowChipRect(MatrixAxisEntry e, int channel, double scrollY) =>
         new(LabelSquare - Theme.ChipShort, TilesOriginY + UnitPos(e.StartUnit + channel) - scrollY,
