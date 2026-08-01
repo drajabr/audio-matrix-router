@@ -211,9 +211,12 @@ public partial class MainWindow : Window
             aurora.GradientStops[1].Color = AppTheme.WithAlpha(AppTheme.Accent, 0);
         }
 
-        // whole-UI zoom (uiScale preset) — like the web's zoom on the app root
-        if (Math.Abs(AppTheme.UiScale - 1.0) > 0.001)
-            RootScale.LayoutTransform = new ScaleTransform(AppTheme.UiScale, AppTheme.UiScale);
+        // whole-UI zoom (uiScale preset) — like the web's zoom on the app root.
+        // ALWAYS assign: returning to MD (1.0) must clear the previous transform,
+        // otherwise switching back to MD does nothing.
+        RootScale.LayoutTransform = Math.Abs(AppTheme.UiScale - 1.0) < 0.001
+            ? null
+            : new ScaleTransform(AppTheme.UiScale, AppTheme.UiScale);
     }
 
     private void SetBrush(string key, Color color)
@@ -624,7 +627,15 @@ public partial class MainWindow : Window
         };
         flyout.FlyoutPresenterClasses.Add("bare");
         _pickerFlyout = flyout;
+        // local (pre-zoom) units: the popup content gets the same UI-scale transform
+        // as the window root, so the panel's VISUAL width tracks the drawer exactly
+        // at every scale preset
         var drawerWidth = Math.Max(QuickStrip.Bounds.Width, 170);
+
+        // seamless pop: while open the drawer squares its bottom corners and takes
+        // the panel's solid face, so drawer + menu read as one expanded chassis
+        QuickStrip.CornerRadius = new CornerRadius(AppTheme.RadiusPanel, AppTheme.RadiusPanel, 0, 0);
+        QuickStrip.Background = new SolidColorBrush(AppTheme.Panel);
 
         void Rebuild()
         {
@@ -697,21 +708,26 @@ public partial class MainWindow : Window
             }
 
             // dark chassis panel (web .quick-control-picker: panel bg, line border,
-            // radius 8) spanning exactly the drawer's width
-            flyout.Content = new Border
+            // radius 8) spanning exactly the drawer's width; wrapped in the same
+            // UI-scale transform as the window root (popups live outside it)
+            flyout.Content = new LayoutTransformControl
             {
-                Width = drawerWidth,
-                Background = new SolidColorBrush(AppTheme.Panel),
-                BorderBrush = AppTheme.LineStrongBrush,
-                BorderThickness = new Thickness(1),
-                // square top corners: the menu reads as the drawer box extending downward
-                CornerRadius = new CornerRadius(0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel),
-                Padding = new Thickness(6),
-                BoxShadow = new BoxShadows(new BoxShadow
+                LayoutTransform = new ScaleTransform(AppTheme.UiScale, AppTheme.UiScale),
+                Child = new Border
                 {
-                    OffsetY = 10, Blur = 26, Color = AppTheme.WithAlpha(Colors.Black, 0.45),
-                }),
-                Child = list,
+                    Width = drawerWidth,
+                    Background = new SolidColorBrush(AppTheme.Panel),
+                    BorderBrush = AppTheme.LineStrongBrush,
+                    BorderThickness = new Thickness(1),
+                    // square top corners: the menu reads as the drawer box extending downward
+                    CornerRadius = new CornerRadius(0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel),
+                    Padding = new Thickness(6),
+                    BoxShadow = new BoxShadows(new BoxShadow
+                    {
+                        OffsetY = 10, Blur = 26, Color = AppTheme.WithAlpha(Colors.Black, 0.45),
+                    }),
+                    Child = list,
+                },
             };
         }
 
@@ -720,7 +736,13 @@ public partial class MainWindow : Window
         {
             _pickerDismissedCategory = category;
             _pickerDismissedAt = Environment.TickCount;
-            if (_pickerFlyout == flyout) _pickerCategory = null;
+            if (_pickerFlyout == flyout)
+            {
+                _pickerCategory = null;
+                // restore the collapsed drawer chassis
+                QuickStrip.CornerRadius = new CornerRadius(AppTheme.RadiusPanel);
+                QuickStrip.Background = Brushes.Transparent;
+            }
         };
         flyout.ShowAt(QuickStrip);
     }
@@ -1465,8 +1487,9 @@ public partial class MainWindow : Window
 
     private static void BuildChips(Grid panel, int channels)
     {
-        if (panel.Tag is int existing && existing == channels) return;
-        panel.Tag = channels;
+        // cache key includes the theme version so a live theme change re-tints them
+        if (panel.Tag is (int existing, int ver) && existing == channels && ver == AppTheme.Version) return;
+        panel.Tag = (channels, AppTheme.Version);
         panel.Children.Clear();
         panel.RowDefinitions.Clear();
 
@@ -1484,7 +1507,8 @@ public partial class MainWindow : Window
                 CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
                 BorderThickness = new Thickness(1),
                 BorderBrush = AppTheme.LineStrongBrush,
-                Background = AppTheme.KeyFace(0.08, 0.14),
+                // same key-face recipe as the matrix chip columns — one themed look
+                Background = AppTheme.KeyFace(),
                 Margin = new Thickness(0, 0, 0, i < channels - 1 ? 6 : 0),
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 VerticalAlignment = VerticalAlignment.Stretch,

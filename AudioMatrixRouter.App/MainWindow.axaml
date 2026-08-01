@@ -338,17 +338,16 @@
       </Border>
 
       <!-- ===== Dock (§3.6): metrics | source card | chips | route | dest card | chips | metrics ===== -->
-      <!-- transparent bar: the window background runs through header, matrix and
-           dock as one surface; only a hairline top border separates the dock -->
+      <!-- transparent, borderless bar: the window background runs through header,
+           matrix and dock as one surface; the items inside carry their own chrome -->
       <Border DockPanel.Dock="Bottom" Background="Transparent"
               Name="DockBar"
-              BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,1,0,0"
-              Padding="8" Height="131">
+              Padding="8" Height="130">
         <!-- Symmetry rule: dock content height = ONE device tile (2×54+6 = 114).
              Cards, chip columns, metric groups and the route square all fill it,
              tops and bottoms flush. Every gap between neighbours is exactly one
              8px spacer column (and 8px bar padding at the edges).
-             131 = 114 content + 8+8 padding + 1 top border. -->
+             130 = 114 content + 8+8 padding (no bar border). -->
         <Grid ColumnDefinitions="132,8,*,8,24,8,114,8,*,8,24,8,132">
 
           <!-- input-side metric tiles: the -3 margin cancels the tiles' own 3px
