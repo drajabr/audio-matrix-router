@@ -422,7 +422,7 @@
                badge (20px vertical bar, rotated text) shows ONLY when the device is master -->
           <Border Grid.Column="2" Name="SourceCard" CornerRadius="8"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
-                  Background="{StaticResource CardBg}" ClipToBounds="True">
+                  Background="Transparent" ClipToBounds="True">
             <Panel>
               <controls:MeterBars Name="SourceMeters" Horizontal="True" Margin="4" />
               <Border Name="SourceMasterBadge" Classes="masterBadge" IsVisible="False">
@@ -465,7 +465,7 @@
           <!-- destination card -->
           <Border Grid.Column="8" Name="DestCard" CornerRadius="8"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
-                  Background="{StaticResource CardBg}" ClipToBounds="True">
+                  Background="Transparent" ClipToBounds="True">
             <Panel>
               <controls:MeterBars Name="DestMeters" Horizontal="True" Margin="4" />
               <Border Name="DestMasterBadge" Classes="masterBadge" IsVisible="False">

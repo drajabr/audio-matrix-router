@@ -353,8 +353,14 @@ public partial class MainWindow : Window
             () => _prefs.UiScaleKey, k => _prefs.UiScaleKey = k);
         UpdateQuickButtons();
 
-        // the floating drawer tracks the slot reserved for it in the header
-        LayoutUpdated += (_, _) => PositionQuickDrawer();
+        // the floating drawer tracks the slot reserved for it in the header, and the
+        // matrix gets scroll room for however much of it the floating dock covers
+        LayoutUpdated += (_, _) =>
+        {
+            PositionQuickDrawer();
+            if (DockBar.TranslatePoint(new Point(0, 0), Matrix) is { } dockTop)
+                Matrix.BottomInset = Math.Max(0, Matrix.Bounds.Height - dockTop.Y);
+        };
         PickerBackdrop.PointerPressed += (_, _) => ClosePicker();
         KeyDown += (_, e) =>
         {

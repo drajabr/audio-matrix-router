@@ -134,6 +134,7 @@ public sealed class MatrixControl : Control
 
     private string? _hoverRowKey;
     private string? _hoverColKey;
+    private double _bottomInset;
 
     // label-square resize drag (web grid-resize-handles: both axes write ONE value)
     private static readonly Cursor ResizeCursor = new(StandardCursorType.SizeAll);
@@ -166,6 +167,19 @@ public sealed class MatrixControl : Control
             _model = value;
             _layout = value is null ? null : new MatrixLayout(value, _labelSquare);
             InvalidateMeasure();
+            InvalidateVisual();
+        }
+    }
+
+    /// <summary>Extra scrollable room below the content, so rows can be scrolled
+    /// clear of the dock that floats over the bottom of the matrix.</summary>
+    public double BottomInset
+    {
+        get => _bottomInset;
+        set
+        {
+            if (Math.Abs(_bottomInset - value) < 0.5) return;
+            _bottomInset = value;
             InvalidateVisual();
         }
     }
@@ -221,8 +235,10 @@ public sealed class MatrixControl : Control
 
     private void ClampScroll(MatrixLayout l)
     {
+        // BottomInset reserves scroll room for the floating dock: at full scroll the
+        // last row clears it, as if a line above the dock items bounded the matrix.
         var maxX = Math.Max(0, l.ContentWidth - Bounds.Width);
-        var maxY = Math.Max(0, l.ContentHeight - Bounds.Height);
+        var maxY = Math.Max(0, l.ContentHeight + _bottomInset - Bounds.Height);
         _scrollX = Math.Clamp(_scrollX, 0, maxX);
         _scrollY = Math.Clamp(_scrollY, 0, maxY);
         _targetScrollX = Math.Clamp(_targetScrollX, 0, maxX);
