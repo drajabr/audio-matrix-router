@@ -25,24 +25,21 @@ It lets you route any input channel to any output channel using a live crosspoin
 
 ## Architecture
 
-- Desktop host: WinForms (.NET 9) with WebView2.
-- Audio engine: NAudio + WASAPI device enumeration and mixing.
-- UI: React + Vite.
-- Config persistence: JSON file beside the executable.
+- Desktop host: Avalonia 12 (.NET 10), single process, custom-drawn matrix UI.
+- Audio engine: NAudio + WASAPI device enumeration and mixing (UI-agnostic Core project).
+- Config persistence: %APPDATA%\AudioMatrixRouter\config.json.
 
 Core project folders:
 
-- AudioMatrixRouter/Audio: audio engine, routing matrix, mixing, ring buffer.
-- AudioMatrixRouter/WebUI: React frontend.
-- AudioMatrixRouter/Models: config models and serialization.
-- .github/workflows: CI, Pages, and release automation.
+- AudioMatrixRouter.Core: audio engine, routing matrix, mixing, ring buffer, app controller, config models.
+- AudioMatrixRouter.App: Avalonia UI (custom controls: matrix, drums, meters), tray, updater.
+- docs/: design reference (with screenshots) and migration notes.
+- .github/workflows: CI and release automation.
 
 ## Requirements
 
 - Windows 10/11.
-- .NET 9 SDK for building from source.
-- Node.js 20+ and npm for WebUI builds.
-- WebView2 Runtime installed (normally present on modern Windows).
+- .NET 10 SDK for building from source (no Node.js required).
 
 ## Quick Start (Build And Run)
 
@@ -50,27 +47,15 @@ Core project folders:
 git clone https://github.com/drajabr/audio-matrix-router.git
 cd audio-matrix-router
 ./build.ps1
-./build/desktop/AudioMatrixRouter.exe
+./build/desktop/AudioMatrixRouter.App.exe
 ```
 
-The build script outputs:
-
-- build/desktop: desktop app publish output (WinForms host + bundled WebView2 UI).
+(`build.cmd` is a double-clickable elevated wrapper for the same script.)
 
 ## Run In Development
 
-Frontend only:
-
 ```powershell
-cd AudioMatrixRouter/WebUI
-npm ci
-npm run dev
-```
-
-Desktop app with local build output:
-
-```powershell
-dotnet run --project AudioMatrixRouter
+dotnet run --project AudioMatrixRouter.App
 ```
 
 ## How Routing Works
@@ -117,17 +102,12 @@ Saved fields include:
 
 ## Troubleshooting
 
-- Git add fails with Cookies permission denied:
-	- Close the running app first so WebView2 file locks are released.
-	- The build output folders should be ignored by git.
-
-- Pages site loads but JS/CSS 404 or wrong MIME type:
-	- This means the built base path does not match the repository Pages path.
-	- Re-run the Pages workflow after the latest workflow and Vite config updates.
-
 - No audio after device changes:
-	- Refresh devices from the UI.
+	- Refresh devices from the UI (↻ in the corner block).
 	- Re-check active crosspoints and gain values.
+
+- Underruns counting up:
+	- Raise the BUFFER drum (40ms is a safe default); very small buffers are aggressive for shared-mode WASAPI.
 
 ## Links
 

@@ -92,10 +92,6 @@ jobs:
           -p:Version=${{ needs.version.outputs.app_version_number }}
           -o artifacts/publish
 
-      - name: Copy tray icon beside exe
-        shell: pwsh
-        run: Copy-Item AudioMatrixRouter/app.ico artifacts/publish/
-
       - name: Install Velopack CLI
         run: dotnet tool install -g vpk
 
@@ -114,7 +110,7 @@ jobs:
           --packDir artifacts/publish
           --mainExe AudioMatrixRouter.App.exe
           --packTitle "Audio Matrix Router"
-          --icon AudioMatrixRouter/app.ico
+          --icon AudioMatrixRouter.App/app.ico
           --noPortable
 
       - name: Upload Velopack setup artifact

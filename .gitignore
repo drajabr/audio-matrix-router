@@ -9,5 +9,6 @@ Releases/
 *.user
 *.suo
 config.json
-AudioMatrixRouter/WebUI/node_modules/
-AudioMatrixRouter/WebUI/dist/
+.preview.pid
+node_modules/
+dist/
