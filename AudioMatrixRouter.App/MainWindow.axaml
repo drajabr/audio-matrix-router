@@ -360,9 +360,10 @@
             </Panel>
           </Border>
 
-          <!-- detached source chip column (one bordered mini-key per channel) -->
-          <StackPanel Grid.Column="2" Name="SourceChipsPanel" Spacing="6"
-                      HorizontalAlignment="Center" VerticalAlignment="Center" />
+          <!-- detached source chip column: one bordered mini-key per channel, together
+               filling the card's full height (each chip = one channel lane) -->
+          <Grid Grid.Column="2" Name="SourceChipsPanel" Width="24"
+                HorizontalAlignment="Center" VerticalAlignment="Stretch" />
 
           <!-- route indicator: large rounded key, just the arrow (🡢 active / ⏸ none) -->
           <Border Grid.Column="3" Name="RouteBox" Width="100" Height="100" CornerRadius="8"
@@ -402,9 +403,9 @@
             </Panel>
           </Border>
 
-          <!-- detached destination chip column -->
-          <StackPanel Grid.Column="5" Name="DestChipsPanel" Spacing="6"
-                      HorizontalAlignment="Center" VerticalAlignment="Center" />
+          <!-- detached destination chip column (full card height, one lane per channel) -->
+          <Grid Grid.Column="5" Name="DestChipsPanel" Width="24"
+                HorizontalAlignment="Center" VerticalAlignment="Stretch" />
 
           <!-- output-side metric tiles -->
           <UniformGrid Grid.Column="6" Columns="2" Rows="2">

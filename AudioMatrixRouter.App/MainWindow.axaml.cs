@@ -1237,28 +1237,31 @@ public partial class MainWindow : Window
     private static MatrixDeviceInfo? FindInfo(List<MatrixDeviceInfo>? infos, string? id) =>
         id is null ? null : infos?.FirstOrDefault(d => d.Id == id);
 
-    private static void BuildChips(StackPanel panel, int channels)
+    private static void BuildChips(Grid panel, int channels)
     {
         if (panel.Tag is int existing && existing == channels) return;
         panel.Tag = channels;
         panel.Children.Clear();
+        panel.RowDefinitions.Clear();
 
-        // small key-face squares with visible borders (reference dock L/R chips)
+        // Chips fill the card's FULL height — one stretched lane per channel (the
+        // "chip long side = one channel lane" rule, same as the matrix chip columns).
         var chipText = new SolidColorBrush(AppTheme.Mix(AppTheme.AccentHl, AppTheme.Text, 0.76));
         for (var i = 0; i < channels; i++)
         {
+            panel.RowDefinitions.Add(new RowDefinition(1, GridUnitType.Star));
             var label = channels == 1 ? "M"
                 : channels == 2 ? (i == 0 ? "L" : "R")
                 : (i + 1).ToString();
-            panel.Children.Add(new Border
+            var chip = new Border
             {
-                Width = AppTheme.ChipShort - 4,
-                Height = AppTheme.ChipShort - 4,
                 CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
                 BorderThickness = new Thickness(1),
                 BorderBrush = AppTheme.LineStrongBrush,
                 Background = AppTheme.KeyFace(0.08, 0.14),
-                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, i < channels - 1 ? 6 : 0),
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                VerticalAlignment = VerticalAlignment.Stretch,
                 Child = new TextBlock
                 {
                     Text = label,
@@ -1268,9 +1271,10 @@ public partial class MainWindow : Window
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
                 },
-            });
+            };
+            Grid.SetRow(chip, i);
+            panel.Children.Add(chip);
         }
-        panel.VerticalAlignment = VerticalAlignment.Center;
     }
 
     // =====================================================================
