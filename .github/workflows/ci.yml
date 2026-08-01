@@ -115,6 +115,7 @@ jobs:
           --mainExe AudioMatrixRouter.App.exe
           --packTitle "Audio Matrix Router"
           --icon AudioMatrixRouter/app.ico
+          --noPortable
 
       - name: Upload Velopack setup artifact
         uses: actions/upload-artifact@v4
