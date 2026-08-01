@@ -353,9 +353,9 @@ public partial class MainWindow : Window
             () => _prefs.UiScaleKey, k => _prefs.UiScaleKey = k);
         UpdateQuickButtons();
 
-        // picker overlay dismissal + keep it pinned to the drawer on resize
-        PickerHost.PointerPressed += (_, _) => ClosePicker();
-        SizeChanged += (_, _) => PositionPickerPanel();
+        // the floating drawer tracks the slot reserved for it in the header
+        LayoutUpdated += (_, _) => PositionQuickDrawer();
+        PickerBackdrop.PointerPressed += (_, _) => ClosePicker();
         KeyDown += (_, e) =>
         {
             if (e.Key == Avalonia.Input.Key.Escape && _pickerCategory is not null)
@@ -601,7 +601,6 @@ public partial class MainWindow : Window
     // =====================================================================
 
     private string? _pickerCategory;
-    private Border? _pickerPanel;
 
     /// <summary>
     /// Category picker panel, faithful to the web `.quick-control-picker`: a dark
@@ -613,15 +612,14 @@ public partial class MainWindow : Window
     private void ShowPicker(string category, IReadOnlyList<AppTheme.PresetOption> options,
         Func<string> getCurrent, Action<string> setKey)
     {
-        // toggle: clicking the open category's button closes its panel; clicking a
-        // different one switches the panel in place (no popup, no dismiss races).
+        // toggle: clicking the open category's button collapses the drawer; clicking
+        // a different one swaps the list in place (no popup, no dismiss races).
         if (_pickerCategory == category) { ClosePicker(); return; }
         _pickerCategory = category;
 
-        // seamless pop: while open the drawer squares its bottom corners and takes
-        // the panel's solid face, so drawer + menu read as one expanded chassis
-        QuickStrip.CornerRadius = new CornerRadius(AppTheme.RadiusPanel, AppTheme.RadiusPanel, 0, 0);
-        QuickStrip.Background = new SolidColorBrush(AppTheme.Panel);
+        // pin the collapsed width so growing the list never widens the box
+        if (double.IsNaN(QuickStrip.Width) && QuickStrip.Bounds.Width > 0)
+            QuickStrip.Width = QuickStrip.Bounds.Width;
 
         void Rebuild()
         {
@@ -676,6 +674,7 @@ public partial class MainWindow : Window
                                 FontWeight = active ? FontWeight.Bold : FontWeight.SemiBold,
                                 Foreground = active ? AppTheme.TextStrongBrush : AppTheme.MutedBrush,
                                 VerticalAlignment = VerticalAlignment.Center,
+                                TextTrimming = TextTrimming.CharacterEllipsis,
                             },
                         }
                     },
@@ -693,61 +692,53 @@ public partial class MainWindow : Window
                 list.Children.Add(row);
             }
 
-            // dark chassis panel (web .quick-control-picker: panel bg, line border,
-            // radius 8): lives INSIDE the window's visual tree, so it shares the
-            // root zoom transform and lines up with the drawer pixel-exact
-            var panel = new Border
+            // the options go INSIDE the drawer box, under a hairline separator —
+            // the drawer literally grows to show them (web .quick-control-picker)
+            QuickList.Children.Clear();
+            QuickList.Children.Add(new Border
             {
-                Background = new SolidColorBrush(AppTheme.Panel),
-                BorderBrush = AppTheme.LineStrongBrush,
-                BorderThickness = new Thickness(1),
-                // square top corners: the menu reads as the drawer box extending downward
-                CornerRadius = new CornerRadius(0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel),
-                Padding = new Thickness(6),
-                BoxShadow = new BoxShadows(new BoxShadow
-                {
-                    OffsetY = 10, Blur = 26, Color = AppTheme.WithAlpha(Colors.Black, 0.45),
-                }),
-                Child = list,
-            };
-            panel.PointerPressed += (_, e) => e.Handled = true; // don't reach the backdrop
-            _pickerPanel = panel;
-            PickerHost.Children.Clear();
-            PickerHost.Children.Add(panel);
-            PositionPickerPanel();
+                Height = 1,
+                Margin = new Thickness(2, 5, 2, 0),
+                Background = new SolidColorBrush(AppTheme.Line),
+            });
+            QuickList.Children.Add(list);
+            QuickList.IsVisible = true;
+            QuickStrip.Background = new SolidColorBrush(AppTheme.Panel);
         }
 
-        // the backdrop starts below the header so the drawer buttons stay clickable
-        // (that's how switching categories works while a panel is open). Order
-        // matters: the host must be visible and laid out BEFORE the panel is
-        // pinned, so TranslatePoint sees real coordinates — hence the deferred
-        // positioning pass after this layout tick.
-        PickerHost.Margin = new Thickness(0, HeaderBar.Bounds.Height, 0, 0);
-        PickerHost.IsVisible = true;
         Rebuild();
-        Dispatcher.UIThread.Post(PositionPickerPanel, DispatcherPriority.Loaded);
+        PickerBackdrop.IsVisible = true;
     }
 
-    /// <summary>Pin the open panel to the drawer: left edges flush, 1px overlap
-    /// into the drawer's bottom border, width exactly the drawer's width.</summary>
-    private void PositionPickerPanel()
+    /// <summary>Keep the floating drawer over the footprint reserved for it in the
+    /// header, and keep that footprint matching the drawer's collapsed size.</summary>
+    private void PositionQuickDrawer()
     {
-        if (_pickerPanel is null) return;
-        var p = QuickStrip.TranslatePoint(new Point(0, QuickStrip.Bounds.Height - 1), PickerHost) ?? default;
-        Canvas.SetLeft(_pickerPanel, p.X);
-        Canvas.SetTop(_pickerPanel, p.Y);
-        _pickerPanel.Width = QuickStrip.Bounds.Width;
+        var chrome = QuickStrip.Padding.Left + QuickStrip.Padding.Right +
+                     QuickStrip.BorderThickness.Left + QuickStrip.BorderThickness.Right;
+        if (QuickButtons.Bounds.Width > 0)
+        {
+            var w = QuickButtons.Bounds.Width + chrome;
+            var h = QuickButtons.Bounds.Height + chrome;
+            if (Math.Abs(QuickSlot.Width - w) > 0.5) QuickSlot.Width = w;
+            if (Math.Abs(QuickSlot.Height - h) > 0.5) QuickSlot.Height = h;
+        }
+
+        if (QuickSlot.TranslatePoint(new Point(0, 0), OverlayHost) is not { } p) return;
+        var curLeft = Canvas.GetLeft(QuickStrip);
+        var curTop = Canvas.GetTop(QuickStrip);
+        if (double.IsNaN(curLeft) || Math.Abs(curLeft - p.X) > 0.5) Canvas.SetLeft(QuickStrip, p.X);
+        if (double.IsNaN(curTop) || Math.Abs(curTop - p.Y) > 0.5) Canvas.SetTop(QuickStrip, p.Y);
     }
 
     private void ClosePicker()
     {
         _pickerCategory = null;
-        _pickerPanel = null;
-        PickerHost.Children.Clear();
-        PickerHost.IsVisible = false;
-        // restore the collapsed drawer chassis
-        QuickStrip.CornerRadius = new CornerRadius(AppTheme.RadiusPanel);
+        QuickList.Children.Clear();
+        QuickList.IsVisible = false;
+        QuickStrip.Width = double.NaN; // back to auto (the button row's width)
         QuickStrip.Background = Brushes.Transparent;
+        PickerBackdrop.IsVisible = false;
     }
 
     /// <summary>Refresh the header quick-button faces after a theme change.</summary>

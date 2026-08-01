@@ -306,27 +306,12 @@
           <!-- empty space = drag region (TitleBar role on HeaderBar) -->
           <Border Grid.Column="1" Background="Transparent" Name="DragRegion" />
 
-          <!-- quick style controls: always-visible button drawer (web .ui-quick-controls);
-               each opens its category's picker panel below it -->
-          <!-- the drawer is a bordered chassis box; the category menus expand from
-               its exact width right beneath it, so drawer + menu read as one unit -->
-          <Border Name="QuickStrip" Grid.Column="2" Margin="0,0,6,0" VerticalAlignment="Center"
-                  BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
-                  CornerRadius="8" Padding="4" Background="Transparent"
-                  chrome:WindowDecorationProperties.ElementRole="User">
-            <StackPanel Orientation="Horizontal" Spacing="6">
-              <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
-                <Border Name="PickBgSwatch" Width="14" Height="14" CornerRadius="3"
-                        BorderBrush="{StaticResource LineStrong}" BorderThickness="1" />
-              </Button>
-              <Button Name="PickAccentBtn" Classes="quick" ToolTip.Tip="Accent color">
-                <Border Name="PickAccentSwatch" Width="12" Height="12" CornerRadius="999" />
-              </Button>
-              <Button Name="PickFontBtn" Classes="quick" ToolTip.Tip="Font" Content="C" />
-              <Button Name="PickSizeBtn" Classes="quick" ToolTip.Tip="Font size" Content="5" />
-              <Button Name="PickScaleBtn" Classes="quick" ToolTip.Tip="UI scale" Content="MD" FontSize="9" />
-            </StackPanel>
-          </Border>
+          <!-- quick style controls (web .ui-quick-controls). The drawer BOX itself
+               lives in the overlay layer below so it can grow downward without
+               resizing the header; this slot only reserves its footprint here. -->
+          <Border Name="QuickSlot" Grid.Column="2" Margin="0,0,6,0" VerticalAlignment="Center"
+                  Width="204" Height="44"
+                  chrome:WindowDecorationProperties.ElementRole="User" />
 
           <!-- caption buttons: ✕ hides to tray, real quit lives in the tray menu -->
           <StackPanel Grid.Column="3" Orientation="Horizontal"
@@ -536,11 +521,36 @@
       </Panel>
     </DockPanel>
 
-    <!-- picker overlay: hosts the drawer's expanded menu INSIDE the window (same
-         visual tree, same zoom transform), so it attaches to the drawer chassis
-         pixel-exact at any scale. Sits below the header so the drawer buttons
-         stay clickable for switching categories; clicking the backdrop closes. -->
-    <Canvas Name="PickerHost" IsVisible="False" Background="Transparent" />
+    <!-- click-anywhere backdrop that collapses the drawer again -->
+    <Border Name="PickerBackdrop" IsVisible="False" Background="Transparent"
+            chrome:WindowDecorationProperties.ElementRole="User" />
+
+    <!-- The quick-controls drawer. It floats here (not in the header) so opening a
+         category can EXPAND THE BOX ITSELF downward over the matrix: one bordered
+         chassis holding the button row and, beneath it, the option list. The Canvas
+         has no background, so clicks pass through everywhere else. -->
+    <Canvas Name="OverlayHost">
+      <Border Name="QuickStrip" CornerRadius="8" Padding="4"
+              BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
+              Background="Transparent"
+              chrome:WindowDecorationProperties.ElementRole="User">
+        <StackPanel>
+          <StackPanel Name="QuickButtons" Orientation="Horizontal" Spacing="6">
+            <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
+              <Border Name="PickBgSwatch" Width="14" Height="14" CornerRadius="3"
+                      BorderBrush="{StaticResource LineStrong}" BorderThickness="1" />
+            </Button>
+            <Button Name="PickAccentBtn" Classes="quick" ToolTip.Tip="Accent color">
+              <Border Name="PickAccentSwatch" Width="12" Height="12" CornerRadius="999" />
+            </Button>
+            <Button Name="PickFontBtn" Classes="quick" ToolTip.Tip="Font" Content="C" />
+            <Button Name="PickSizeBtn" Classes="quick" ToolTip.Tip="Font size" Content="5" />
+            <Button Name="PickScaleBtn" Classes="quick" ToolTip.Tip="UI scale" Content="MD" FontSize="9" />
+          </StackPanel>
+          <StackPanel Name="QuickList" IsVisible="False" />
+        </StackPanel>
+      </Border>
+    </Canvas>
     </Panel>
     </LayoutTransformControl>
   </Panel>
