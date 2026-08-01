@@ -307,20 +307,25 @@
 
           <!-- quick style controls: always-visible button drawer (web .ui-quick-controls);
                each opens its category's picker panel below it -->
-          <StackPanel Name="QuickStrip" Grid.Column="2" Orientation="Horizontal" Spacing="6"
-                      Margin="0,0,6,0" VerticalAlignment="Center"
-                      chrome:WindowDecorationProperties.ElementRole="User">
-            <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
-              <Border Name="PickBgSwatch" Width="14" Height="14" CornerRadius="3"
-                      BorderBrush="{StaticResource LineStrong}" BorderThickness="1" />
-            </Button>
-            <Button Name="PickAccentBtn" Classes="quick" ToolTip.Tip="Accent color">
-              <Border Name="PickAccentSwatch" Width="12" Height="12" CornerRadius="999" />
-            </Button>
-            <Button Name="PickFontBtn" Classes="quick" ToolTip.Tip="Font" Content="C" />
-            <Button Name="PickSizeBtn" Classes="quick" ToolTip.Tip="Font size" Content="5" />
-            <Button Name="PickScaleBtn" Classes="quick" ToolTip.Tip="UI scale" Content="MD" FontSize="9" />
-          </StackPanel>
+          <!-- the drawer is a bordered chassis box; the category menus expand from
+               its exact width right beneath it, so drawer + menu read as one unit -->
+          <Border Name="QuickStrip" Grid.Column="2" Margin="0,0,6,0" VerticalAlignment="Center"
+                  BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
+                  CornerRadius="8" Padding="4" Background="Transparent"
+                  chrome:WindowDecorationProperties.ElementRole="User">
+            <StackPanel Orientation="Horizontal" Spacing="6">
+              <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
+                <Border Name="PickBgSwatch" Width="14" Height="14" CornerRadius="3"
+                        BorderBrush="{StaticResource LineStrong}" BorderThickness="1" />
+              </Button>
+              <Button Name="PickAccentBtn" Classes="quick" ToolTip.Tip="Accent color">
+                <Border Name="PickAccentSwatch" Width="12" Height="12" CornerRadius="999" />
+              </Button>
+              <Button Name="PickFontBtn" Classes="quick" ToolTip.Tip="Font" Content="C" />
+              <Button Name="PickSizeBtn" Classes="quick" ToolTip.Tip="Font size" Content="5" />
+              <Button Name="PickScaleBtn" Classes="quick" ToolTip.Tip="UI scale" Content="MD" FontSize="9" />
+            </StackPanel>
+          </Border>
 
           <!-- caption buttons: ✕ hides to tray, real quit lives in the tray menu -->
           <StackPanel Grid.Column="3" Orientation="Horizontal"
@@ -333,7 +338,9 @@
       </Border>
 
       <!-- ===== Dock (§3.6): metrics | source card | chips | route | dest card | chips | metrics ===== -->
-      <Border DockPanel.Dock="Bottom" Background="{StaticResource Panel}"
+      <!-- transparent bar: the window background runs through header, matrix and
+           dock as one surface; only a hairline top border separates the dock -->
+      <Border DockPanel.Dock="Bottom" Background="Transparent"
               Name="DockBar"
               BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,1,0,0"
               Padding="8" Height="131">
@@ -342,7 +349,7 @@
              tops and bottoms flush. Every gap between neighbours is exactly one
              8px spacer column (and 8px bar padding at the edges).
              131 = 114 content + 8+8 padding + 1 top border. -->
-        <Grid ColumnDefinitions="132,8,*,8,24,8,114,8,24,8,*,8,132">
+        <Grid ColumnDefinitions="132,8,*,8,24,8,114,8,*,8,24,8,132">
 
           <!-- input-side metric tiles: the -3 margin cancels the tiles' own 3px
                margin at the group's outside edges, so the 2×2 block sits flush
@@ -512,7 +519,7 @@
             <!-- row 4: show-all · transient mute (wide) · view toggle -->
             <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
             <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
-                    Grid.ColumnSpan="2" Content="🔈" FontSize="{DynamicResource FsMd}" />
+                    Grid.ColumnSpan="2" Content="🔊" FontSize="{DynamicResource FsMd}" />
             <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
           </Grid>
         </Border>

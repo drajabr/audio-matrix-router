@@ -535,7 +535,8 @@ public partial class MainWindow : Window
         ViewBtn.Classes.Set("active", _viewMode == "channel");
         ToolTip.SetTip(ViewBtn, _viewMode == "channel" ? "Switch to Device View" : "Switch to Channel View");
         MuteBtn.Classes.Set("danger", _mutedAll);
-        MuteBtn.Content = _mutedAll ? "🔇" : "🔈";
+        // speaker-with-wave ↔ muted speaker: near-identical glyph widths, no jump
+        MuteBtn.Content = _mutedAll ? "🔇" : "🔊";
         ToolTip.SetTip(MuteBtn, _mutedAll ? "Unmute all outputs" : "Mute all outputs (transient)");
         InputModeBtn.Content = _snapshot.InputDeviceMode switch
         {
@@ -619,6 +620,7 @@ public partial class MainWindow : Window
         {
             Placement = PlacementMode.BottomEdgeAlignedRight,
             OverlayDismissEventPassThrough = true, // click another drawer button = switch panel
+            VerticalOffset = -1, // overlap the drawer's bottom border: one connected chassis
         };
         flyout.FlyoutPresenterClasses.Add("bare");
         _pickerFlyout = flyout;
@@ -700,9 +702,10 @@ public partial class MainWindow : Window
             {
                 Width = drawerWidth,
                 Background = new SolidColorBrush(AppTheme.Panel),
-                BorderBrush = new SolidColorBrush(AppTheme.Line),
+                BorderBrush = AppTheme.LineStrongBrush,
                 BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(AppTheme.RadiusPanel),
+                // square top corners: the menu reads as the drawer box extending downward
+                CornerRadius = new CornerRadius(0, 0, AppTheme.RadiusPanel, AppTheme.RadiusPanel),
                 Padding = new Thickness(6),
                 BoxShadow = new BoxShadows(new BoxShadow
                 {
