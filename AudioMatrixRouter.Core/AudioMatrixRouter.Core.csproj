@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <!-- Same root namespace as the host apps: the engine moved here verbatim
+         (AudioMatrixRouter.Audio / AudioMatrixRouter.Models) with zero code churn. -->
+    <RootNamespace>AudioMatrixRouter</RootNamespace>
+    <Platforms>x64</Platforms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>NU1701;CS0618</NoWarn>
+    <Version Condition="'$(Version)' == ''">0.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+</Project>

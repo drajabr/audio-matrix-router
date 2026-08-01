@@ -3,6 +3,13 @@
 Two phases. Design ground truth lives in [DESIGN-REFERENCE.md](DESIGN-REFERENCE.md) —
 treat it as the acceptance spec, not inspiration.
 
+## Branch workflow
+
+All migration work happens on the **`avalonia-migration`** branch (started 2026-08-01,
+Avalonia **12.1.1**). `main` holds the shipping WebView2 app. Merge/push to `main`
+only when local builds are mature (parity checklist green + the §2.3 acceptance pass).
+CI keeps building `main` untouched until then.
+
 ## Non-negotiable design constraints (decided up front)
 
 1. **Square law.** One constant `UNIT = 54` (logical px). Channel cell = 1×1 unit,
@@ -94,6 +101,66 @@ screenshot review against `docs/design/*.png` for every component.
 - Keep a `v0.3-webview` branch for one release as the rollback path.
 - Delete WinForms project + WebUI + npm from CI; publish shrinks to
   `dotnet publish` + `vpk pack`.
+
+### 2.5 Complete scope inventory (nothing ports by accident)
+
+Everything the current app does, with its source of truth. Each item is either ported,
+consciously dropped, or replaced — no third state.
+
+**Window & shell** (`MainForm.cs`, `Program.cs`)
+- Custom chrome per constraint #3; dark caption DWM P/Invoke **dropped** (obsolete).
+- Window placement save/restore (`WindowConfig` X/Y/W/H, start-minimized final-close rule).
+- Tray icon + styled menu (Show/Quit), minimize-to-tray on ✕, balloon tip, Explorer-restart
+  re-registration (`WM_TASKBARCREATED` → Avalonia `TrayIcon` re-init).
+- Single instance: mutex `AudioMatrixRouter.SingleInstance` + `ShowWindow` EventWaitHandle
+  foregrounding — reuse verbatim in App `Program.Main`.
+- `--startup` / `--minimized` args; startup-at-boot Startup-folder shortcut (WScript COM).
+- `timeBeginPeriod(1)`, High process priority, `SustainedLowLatency` GC — copy as-is.
+
+**Engine lifecycle** (`MainForm.cs` → `AppController` in Phase 1)
+- Config load → `ApplyToEngine` → `TryAutoStart`; startup retry backoff {2,4,8,15,30,60}s.
+- Hotplug: `DevicesChanged` marshal + 250ms debounce; `SyncDevicesWithSystem` +
+  `ApplyKnownDeviceSettings`; save debounce 350ms; in-memory `_lastSavedConfig`.
+- `setCrosspoints` orchestration: device batch, channel resolution + `routeErrors`,
+  suppress-push window, rev stamping; user device removal semantics (dormant + KnownDevices
+  pruning); `clearRoutes`; lock gate on every mutation.
+- Metrics: 100ms tick → `MetricsState` (destructive peak sampling ONLY here).
+- Updater: Velopack check/download(progress)/apply + `AMR_UPDATE_URL` override;
+  `VelopackApp.Build().Run()` first in Main.
+
+**UI behaviors** (`App.jsx` — keep the file as executable documentation until parity)
+- Matrix: device/channel view; square law; optimistic toggle + authoritative revert;
+  hover path highlight + selection dimming; wheel gain ±0.5dB; middle-click gain reset;
+  right-click phase invert; blocked loopback-self tiles; drag-scroll with click
+  suppression; smooth wheel scroll; gain readout ≥0.5dB.
+- Headers: labels (merge-with-saved), drag reorder (mergeOrder semantics), double-click
+  set master, MASTER edge bars occupying footprint, meters full-lane rounded, detached
+  channel chips (half-tile rule), inactive dimming.
+- Corner: power, lock, mute (transient, works when locked), show-all, reload,
+  input-mode cycle, view toggle, IN/OUT drums (5ms steps, middle-click reset),
+  master gain drum (0.5dB steps, ±60/+12 clamp).
+- Dock: metric tiles (fixed width), source/destination cards per §3.6, route indicator
+  (🡢/⮆/⏸), hovered-route fallback to master pair.
+- Topbar: brand, version pill, update pill state machine, status line, quick pickers
+  (background/accent/font/size/scale/startup), collapse behavior, Escape handling.
+- Meters: 10Hz, 250ms staleness zeroing, auto-scale tracker (floor/peak per device),
+  `shapeMeterLevel` pow(0.72) curve — port `autoScaleLevels` math exactly.
+- Latency/jitter display smoothing: EMA α=0.1, 1.2ms step threshold, 900ms min update,
+  6s null grace — port `updateLatencyDisplay`/`updateJitterDisplay` exactly.
+- Error banner (transient 4s), lock hides editing affordances everywhere.
+- Persistence: `UiPreferencesJson` — SAME keys (backgroundKey, accentKey, fontKey,
+  fontSizeKey, uiScaleKey, inputBufferMs, outputBufferMs, masterGainDb,
+  controlsCollapsed, showAllDevices, inputDeviceMode, powerOn, locked, inputLabels,
+  outputLabels, inputMasterId, outputMasterId, viewMode, labelSizing, matrixByView,
+  inputOrder, outputOrder) so users' setups survive the swap; localStorage fallback
+  **dropped** (native has the config file).
+
+**Consciously dropped:** WebView2 env flags, virtual host + cache busting, bridge
+protocol + rev gating (single-process now), `__nativeBridgeInvoke` timeouts, React
+StrictMode workarounds, web-audio fallback mode (`AudioMatrixManager`), npm/vite.
+
+**CI (on merge):** remove Node/npm steps; `dotnet publish AudioMatrixRouter.App` +
+same `vpk pack` (same packId!); portable zip keeps its asset name.
 
 ### Risk register
 | Risk | Mitigation |
