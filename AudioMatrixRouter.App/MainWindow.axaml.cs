@@ -534,8 +534,17 @@ public partial class MainWindow : Window
 
         ReloadBtn.Click += (_, _) =>
         {
-            try { _controller.RefreshDevices(); }
+            // Light the key while the restart runs so the press is visibly acknowledged —
+            // a silent no-feedback button is indistinguishable from a broken one.
+            ReloadBtn.Classes.Set("active", true);
+            try
+            {
+                _controller.ReloadEngine();
+                RefreshSnapshotAndRebuild();
+            }
             catch (Exception ex) { ShowBanner(ex.Message); }
+            DispatcherTimer.RunOnce(() => ReloadBtn.Classes.Set("active", false),
+                TimeSpan.FromMilliseconds(450));
         };
 
         InputModeBtn.Click += (_, _) =>

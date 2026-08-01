@@ -377,7 +377,7 @@
          layout space, so the matrix keeps its full height and simply scrolls
          clear of the dock (MatrixControl.BottomInset). The bar itself is a solid
          surface again so matrix rows never show through the readouts. -->
-    <Border Name="DockBar" VerticalAlignment="Bottom" Background="{StaticResource Panel}"
+    <Border Name="DockBar" VerticalAlignment="Bottom" Background="{StaticResource Bg}"
             Padding="8" Height="130">
         <!-- Symmetry rule: dock content height = ONE device tile (2×54+6 = 114).
              Cards, chip columns, metric groups and the route square all fill it,

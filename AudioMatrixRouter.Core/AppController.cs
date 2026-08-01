@@ -337,6 +337,31 @@ public sealed class AppController : IDisposable
         RaiseStateChanged();
     }
 
+    /// <summary>
+    /// The reload key: re-enumerate devices, re-apply their saved settings, and bounce
+    /// the audio path. <see cref="RefreshDevices"/> alone only reacts to devices coming
+    /// and going — with the engine already running it starts nothing and stops nothing,
+    /// so pressing reload had no observable effect. This always restarts a running
+    /// engine, which is the point of the button: recover a wedged audio path.
+    /// </summary>
+    public void ReloadEngine()
+    {
+        _availableDevicesDirty = true;
+        _suppressConfigSave = true;
+        try
+        {
+            SyncDevicesWithSystem();
+        }
+        finally
+        {
+            _suppressConfigSave = false;
+        }
+
+        if (Engine.IsRunning) Engine.Stop();
+        TryAutoStart();
+        RaiseStateChanged();
+    }
+
     // ---------------------------------------------------------------- config
 
     private void ScheduleSave()
