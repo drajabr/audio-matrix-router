@@ -1,0 +1,1873 @@
+using System.Text.Json;
+using System.Threading;
+using System.Runtime.InteropServices;
+using AudioMatrixRouter.Audio;
+using AudioMatrixRouter.Models;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+using NAudio.CoreAudioApi;
+
+namespace AudioMatrixRouter;
+
+public sealed class MainForm : Form
+{
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20 = 19;
+    private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+    private const int DWMWA_CAPTION_COLOR = 35;
+    private const int DWMWA_TEXT_COLOR = 36;
+    private static readonly Color AppBackgroundColor = ColorTranslator.FromHtml("#101113");
+    private static readonly Color AppPanelColor = ColorTranslator.FromHtml("#1a1d22");
+    private static readonly Color AppLineColor = ColorTranslator.FromHtml("#39404d");
+    private static readonly Color AppTextColor = ColorTranslator.FromHtml("#dbe0e8");
+    private static readonly Color AppAccentColor = ColorTranslator.FromHtml("#2dd4bf");
+
+    // COLORREF format: 0x00bbggrr
+    private const int DARK_CAPTION_COLOR = 0x001d1a17;
+    private const int LIGHT_TEXT_COLOR = 0x00f0f0f0;
+
+    private readonly AudioEngine _engine = new();
+    private readonly WebView2 _webView = new() { Dock = DockStyle.Fill };
+    private readonly System.Windows.Forms.Timer _saveTimer = new() { Interval = 350 };
+    private readonly System.Windows.Forms.Timer _deviceRefreshTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer _metricsPushTimer = new() { Interval = 100 };
+    // Boot resilience: at Windows startup WASAPI endpoints appear late (audio service,
+    // USB/Bluetooth/HDMI drivers still initialising), so the first enumeration often
+    // misses devices and the engine never starts. Retry with backoff until it does.
+    private readonly System.Windows.Forms.Timer _startupRetryTimer = new();
+    private static readonly int[] StartupRetryDelaysMs = [2000, 4000, 8000, 15000, 30000, 60000];
+    private int _startupRetryStage;
+    private readonly SemaphoreSlim _webMessageGate = new(1, 1);
+    private readonly NotifyIcon _trayIcon = new();
+    private readonly ContextMenuStrip _trayMenu = new();
+    private readonly Icon _trayAppIcon;
+    private readonly Icon _windowAppIcon;
+    private readonly Icon _windowSmallAppIcon;
+
+    private bool _locked;
+    private bool _allowRealClose;
+    private readonly bool _forceStartMinimized;
+    private bool _startMinimizedFromConfig;
+    private bool _startupAtBoot;
+    private string _uiPreferencesJson = "";
+    private bool _suppressConfigSave;
+    // Suppresses intermediate state pushes while a multi-step engine operation is in
+    // progress, so the renderer never sees half-applied route state that would overwrite
+    // an optimistic UI update. The operation emits one final push when done.
+    private bool _suppressStatePush;
+    // Monotonic build counter stamped into every UiState. The renderer ignores any state
+    // whose rev is not newer than the last one it applied, which makes stale/racing
+    // pushes harmless by construction.
+    private long _stateRev;
+    // In-memory canonical copy of the last saved config. Saves no longer re-read the file
+    // from disk (a transient read failure used to silently drop every dormant route).
+    private AppConfig? _lastSavedConfig;
+    private const string StartupShortcutName = "AudioMatrixRouter.lnk";
+
+    // In-app updater (Velopack against the GitHub releases of drajabr/audio-matrix-router).
+    private Velopack.UpdateManager? _updateManager;
+    private Velopack.UpdateInfo? _pendingUpdate;
+    private volatile bool _updateDownloaded;
+    private int _updateBusy;
+
+    private Velopack.UpdateManager GetUpdateManager()
+    {
+        if (_updateManager != null) return _updateManager;
+
+        // AMR_UPDATE_URL overrides the update feed with a local folder or plain URL —
+        // lets the whole check/download/apply cycle be tested against a local `vpk pack`
+        // output without publishing a GitHub release.
+        var overrideUrl = Environment.GetEnvironmentVariable("AMR_UPDATE_URL");
+        _updateManager = !string.IsNullOrWhiteSpace(overrideUrl)
+            ? new Velopack.UpdateManager(overrideUrl)
+            : new Velopack.UpdateManager(
+                new Velopack.Sources.GithubSource("https://github.com/drajabr/audio-matrix-router", null, false));
+        return _updateManager;
+    }
+
+    private static string AppVersionString =>
+        typeof(MainForm).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+
+    // Cached enumeration of system devices. WASAPI device enumeration + AudioClient.MixFormat
+    // queries are slow (COM activation per endpoint); refresh only on hot-plug events,
+    // not every metrics tick.
+    private List<DeviceInfo> _cachedAvailableInputs = new();
+    private List<DeviceInfo> _cachedAvailableOutputs = new();
+    private bool _availableDevicesDirty = true;
+    private string _inputDeviceMode = "both";
+    // Whether to include the bulky available-device list in the next push. Hot metric
+    // pushes (peaks/latency) skip it to keep the JSON small and React work cheap.
+    private bool _pendingFullStatePush = true;
+    private bool _webViewReady;
+    private bool _finalizingClose;
+
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
+    public MainForm(bool forceStartMinimized = false)
+    {
+        _forceStartMinimized = forceStartMinimized;
+        Text = "Audio Router Matrix";
+        StartPosition = FormStartPosition.CenterScreen;
+        MinimumSize = new System.Drawing.Size(1100, 750);
+        Size = new System.Drawing.Size(1600, 1000);
+        BackColor = AppBackgroundColor;
+        ForeColor = AppTextColor;
+        _webView.BackColor = AppBackgroundColor;
+        _trayAppIcon = LoadAppIcon();
+        _windowAppIcon = new Icon(_trayAppIcon, SystemInformation.IconSize);
+        _windowSmallAppIcon = new Icon(_trayAppIcon, SystemInformation.SmallIconSize);
+        try
+        {
+            Icon = _windowAppIcon;
+        }
+        catch
+        {
+            // Keep default icon if extraction fails.
+        }
+
+        InitializeTrayIcon();
+        Controls.Add(_webView);
+
+        _saveTimer.Tick += (_, _) =>
+        {
+            _saveTimer.Stop();
+            SaveConfig();
+        };
+
+        _deviceRefreshTimer.Tick += (_, _) =>
+        {
+            _deviceRefreshTimer.Stop();
+            _availableDevicesDirty = true;
+            _pendingFullStatePush = true;
+            _suppressConfigSave = true;
+            try
+            {
+                SyncDevicesWithSystem();
+            }
+            finally
+            {
+                _suppressConfigSave = false;
+            }
+            TryAutoStart();
+            PushStateToUi();
+        };
+
+        _startupRetryTimer.Tick += (_, _) =>
+        {
+            _startupRetryTimer.Stop();
+            _suppressConfigSave = true;
+            try
+            {
+                SyncDevicesWithSystem();
+            }
+            finally
+            {
+                _suppressConfigSave = false;
+            }
+            TryAutoStart();
+            PushStateToUi();
+
+            bool stillWaiting = !_engine.IsRunning
+                && (_engine.DormantRoutes.Count > 0 || _engine.RoutingMatrix.HasAnyCrosspoints());
+            if (stillWaiting && _startupRetryStage < StartupRetryDelaysMs.Length - 1)
+            {
+                _startupRetryStage++;
+                _startupRetryTimer.Interval = StartupRetryDelaysMs[_startupRetryStage];
+                _startupRetryTimer.Start();
+            }
+        };
+
+        // Force handle creation BEFORE the engine subscribes to WASAPI notifications.
+        // Without a handle, InvokeRequired is false on the MTA COM callback thread and a
+        // WinForms timer started there never ticks — hotplug detection would silently die
+        // for the whole session (most likely at Windows boot, when endpoint notifications
+        // storm in during startup).
+        _ = Handle;
+
+        _engine.Init();
+        _engine.DevicesChanged += () =>
+        {
+            if (IsDisposed) return;
+            _availableDevicesDirty = true;
+            _pendingFullStatePush = true;
+            try
+            {
+                // Always marshal: this callback arrives on an MTA COM thread. Stop+Start
+                // restarts the debounce window so a burst of hotplug events coalesces.
+                BeginInvoke(() =>
+                {
+                    _deviceRefreshTimer.Stop();
+                    _deviceRefreshTimer.Start();
+                });
+            }
+            catch (InvalidOperationException) { } // form torn down mid-callback (covers ObjectDisposedException)
+        };
+        _engine.StateChanged += () =>
+        {
+            if (IsDisposed) return;
+            _pendingFullStatePush = true;
+            if (InvokeRequired)
+            {
+                try { BeginInvoke(HandleEngineStateChanged); }
+                catch (InvalidOperationException) { } // form torn down mid-callback
+            }
+            else
+            {
+                HandleEngineStateChanged();
+            }
+        };
+        _metricsPushTimer.Tick += (_, _) =>
+        {
+            // Metrics only (peaks/latency/counters) — never routes or device lists, so a
+            // periodic push can never overwrite an in-flight route edit in the renderer.
+            PushMetricsToUi();
+        };
+        _metricsPushTimer.Start();
+
+        LoadConfigAndDevices();
+
+        Shown += async (_, _) =>
+        {
+            ApplyDarkTitleBar();
+            _trayIcon.Visible = true;
+            await InitializeWebViewAsync();
+            PushStateToUi();
+
+            if (_forceStartMinimized || _startMinimizedFromConfig)
+            {
+                BeginInvoke(() => MinimizeToTray(showBalloon: false));
+            }
+        };
+    }
+
+    private void HandleEngineStateChanged()
+    {
+        if (!_suppressConfigSave)
+        {
+            ScheduleSave();
+        }
+        if (!_suppressStatePush)
+        {
+            PushStateToUi();
+        }
+    }
+
+    private void TryAutoStart()
+    {
+        if (_engine.IsRunning) return;
+        if (_engine.InputDevices.Count == 0 || _engine.OutputDevices.Count == 0) return;
+        if (!_engine.RoutingMatrix.HasAnyCrosspoints()) return;
+        _engine.Start();
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplyDarkTitleBar();
+        try
+        {
+            if (_windowSmallAppIcon.Handle != IntPtr.Zero)
+            {
+                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_SMALL, _windowSmallAppIcon.Handle);
+            }
+            if (_windowAppIcon.Handle != IntPtr.Zero)
+            {
+                SendMessage(Handle, WM_SETICON, (IntPtr)ICON_BIG, _windowAppIcon.Handle);
+            }
+        }
+        catch
+        {
+            // Keep running if explicit window icon assignment fails.
+        }
+
+        EnsureTrayIconVisible();
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_TASKBARCREATED)
+        {
+            // Explorer restart drops notification area icons. Re-register ours.
+            EnsureTrayIconVisible();
+        }
+
+        base.WndProc(ref m);
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        if (!_allowRealClose && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            MinimizeToTray(showBalloon: true);
+            SaveConfig();
+            return;
+        }
+
+        if (!_allowRealClose && !_finalizingClose && e.CloseReason != CloseReason.WindowsShutDown)
+        {
+            e.Cancel = true;
+            _finalizingClose = true;
+            _ = FinalizeAndCloseAsync();
+            return;
+        }
+
+        _saveTimer.Stop();
+        _startupRetryTimer.Stop();
+        // Final close: record whether the window was minimized/hidden so the next launch
+        // can restore that state. Background saves never touch this (see SaveConfig).
+        _startMinimizedFromConfig = WindowState == FormWindowState.Minimized || !Visible || !ShowInTaskbar;
+        SaveConfig();
+        _engine.Stop();
+        _engine.Dispose();
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
+        _trayMenu.Dispose();
+        _windowSmallAppIcon.Dispose();
+        _windowAppIcon.Dispose();
+        _trayAppIcon.Dispose();
+        base.OnFormClosing(e);
+    }
+
+    private async Task FinalizeAndCloseAsync()
+    {
+        try
+        {
+            await FlushUiPreferencesFromWebViewAsync();
+        }
+        catch
+        {
+            // Non-fatal: best-effort sync before final save.
+        }
+
+        _saveTimer.Stop();
+        SaveConfig();
+        _allowRealClose = true;
+
+        if (!IsDisposed)
+        {
+            BeginInvoke(Close);
+        }
+    }
+
+    private async Task FlushUiPreferencesFromWebViewAsync()
+    {
+        if (!_webViewReady || _webView.CoreWebView2 == null)
+        {
+            return;
+        }
+
+        const string script = "(() => { try { return localStorage.getItem('audio-router-matrix-v3') || ''; } catch { return ''; } })();";
+        var raw = await _webView.CoreWebView2.ExecuteScriptAsync(script);
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return;
+        }
+
+        string? persisted = null;
+        try
+        {
+            persisted = JsonSerializer.Deserialize<string>(raw);
+        }
+        catch
+        {
+            // Ignore malformed JS result.
+        }
+
+        if (!string.IsNullOrWhiteSpace(persisted))
+        {
+            _uiPreferencesJson = persisted;
+        }
+    }
+
+    private static Icon LoadAppIcon()
+    {
+        try
+        {
+            using var iconStream = typeof(MainForm).Assembly.GetManifestResourceStream("AudioMatrixRouter.app.ico");
+            if (iconStream != null)
+            {
+                return new Icon(iconStream);
+            }
+        }
+        catch
+        {
+            // Fall back below.
+        }
+
+        try
+        {
+            var extracted = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            if (extracted != null)
+            {
+                return (Icon)extracted.Clone();
+            }
+        }
+        catch
+        {
+            // Fall back below.
+        }
+
+        return (Icon)SystemIcons.Application.Clone();
+    }
+
+    private void InitializeTrayIcon()
+    {
+        _trayMenu.ShowImageMargin = false;
+        _trayMenu.Renderer = new TrayMenuRenderer();
+        _trayMenu.BackColor = AppPanelColor;
+        _trayMenu.ForeColor = AppTextColor;
+        _trayMenu.Padding = new Padding(4, 4, 4, 4);
+        _trayMenu.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular, GraphicsUnit.Point);
+
+        _trayMenu.Opened += (_, _) =>
+        {
+            // Apply rounded corners to the popup window itself via DWM (Win 11+)
+            // and also via Region clip for older Windows.
+            const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+            int roundPref = 2; // DWMWCP_ROUND
+            try { DwmSetWindowAttribute(_trayMenu.Handle, DWMWA_WINDOW_CORNER_PREFERENCE, ref roundPref, sizeof(int)); }
+            catch { /* Windows 10 or DWM unavailable – fall through to Region */ }
+
+            const int r = 8;
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            int d = r * 2;
+            int w = _trayMenu.Width, h = _trayMenu.Height;
+            path.AddArc(0, 0, d, d, 180, 90);
+            path.AddArc(w - d, 0, d, d, 270, 90);
+            path.AddArc(w - d, h - d, d, d, 0, 90);
+            path.AddArc(0, h - d, d, d, 90, 90);
+            path.CloseFigure();
+            _trayMenu.Region = new Region(path);
+        };
+
+        var showItem = new ToolStripMenuItem("Show");
+        showItem.Click += (_, _) => RestoreFromTray();
+        showItem.Font = new Font("Segoe UI", 9.5f, FontStyle.Bold, GraphicsUnit.Point);
+        showItem.BackColor = AppPanelColor;
+        showItem.ForeColor = AppTextColor;
+
+        var quitItem = new ToolStripMenuItem("Quit");
+        quitItem.Click += (_, _) => QuitFromTray();
+        quitItem.BackColor = AppPanelColor;
+        quitItem.ForeColor = Color.FromArgb(190, 190, 200);
+
+        _trayMenu.Items.Add(showItem);
+        _trayMenu.Items.Add(new ToolStripSeparator());
+        _trayMenu.Items.Add(quitItem);
+
+        _trayIcon.Text = "Audio Router Matrix";
+        _trayIcon.Icon = _trayAppIcon;
+        _trayIcon.Visible = true;
+        _trayIcon.ContextMenuStrip = _trayMenu;
+        _trayIcon.DoubleClick += (_, _) => RestoreFromTray();
+    }
+
+    private void EnsureTrayIconVisible()
+    {
+        try
+        {
+            _trayIcon.Icon = _trayAppIcon;
+            _trayIcon.Visible = false;
+            _trayIcon.Visible = true;
+        }
+        catch
+        {
+            // Keep running if Windows rejects a transient tray refresh.
+        }
+    }
+
+    private void RestoreFromTray()
+    {
+        _trayIcon.Visible = true;
+        Show();
+        ShowInTaskbar = true;
+        WindowState = FormWindowState.Normal;
+        Activate();
+        ScheduleSave();
+    }
+
+    public void ShowFromSecondInstance()
+    {
+        _trayIcon.Visible = true;
+        Show();
+        ShowInTaskbar = true;
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = FormWindowState.Normal;
+        Activate();
+        NativeMethods.SetForegroundWindow(Handle);
+    }
+
+    private void MinimizeToTray(bool showBalloon)
+    {
+        Hide();
+        ShowInTaskbar = false;
+
+        if (showBalloon && _trayIcon.Visible)
+        {
+            _trayIcon.BalloonTipTitle = "Audio Router Matrix";
+            _trayIcon.BalloonTipText = "Still running in system tray.";
+            _trayIcon.ShowBalloonTip(1200);
+        }
+    }
+
+    private void QuitFromTray()
+    {
+        _allowRealClose = true;
+        Close();
+    }
+
+    private async Task InitializeWebViewAsync()
+    {
+        var envOptions = new CoreWebView2EnvironmentOptions
+        {
+            AdditionalBrowserArguments = string.Join(" ",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--enable-gpu-rasterization",
+                "--enable-zero-copy")
+        };
+
+        var webViewEnv = await CoreWebView2Environment.CreateAsync(options: envOptions);
+        await _webView.EnsureCoreWebView2Async(webViewEnv);
+        _webView.DefaultBackgroundColor = AppBackgroundColor;
+
+        _webView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
+        _webView.CoreWebView2.Settings.AreDevToolsEnabled = true;
+        _webView.CoreWebView2.Settings.IsStatusBarEnabled = false;
+        _webView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+        _webViewReady = true;
+
+        _webView.CoreWebView2.NavigationStarting += (s, e) =>
+        {
+            System.Diagnostics.Debug.WriteLine($"[WebView] Navigation starting: {e.Uri}");
+            if (e.Uri.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+            {
+                e.Cancel = true;
+                var cacheBuster = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                _webView.Source = new Uri($"https://appassets.local/index.html?v={cacheBuster}");
+                System.Diagnostics.Debug.WriteLine("[WebView] Blocked file:// navigation and redirected to virtual host");
+            }
+        };
+
+        _webView.CoreWebView2.NavigationCompleted += (s, e) =>
+        {
+            System.Diagnostics.Debug.WriteLine($"[WebView] Navigation completed: IsSuccess={e.IsSuccess}");
+            if (!e.IsSuccess)
+            {
+                System.Diagnostics.Debug.WriteLine($"[WebView] Navigation error: {e.WebErrorStatus}");
+            }
+        };
+
+        var uiDistPath = ResolveUiDistPath();
+        if (uiDistPath == null)
+        {
+            var errorHtml = "<html><body style='background:#111;color:#eee;font-family:Segoe UI;padding:16px;'><h2>Web UI Not Found</h2><p>Expected WebUI/dist beside executable or in project path.</p></body></html>";
+            _webView.CoreWebView2.NavigateToString(errorHtml);
+            return;
+        }
+
+        _webView.CoreWebView2.SetVirtualHostNameToFolderMapping(
+            "appassets.local",
+            uiDistPath,
+            CoreWebView2HostResourceAccessKind.Allow);
+
+        var startupCacheBuster = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _webView.Source = new Uri($"https://appassets.local/index.html?v={startupCacheBuster}");
+        System.Diagnostics.Debug.WriteLine("[WebView] Navigating to https://appassets.local/index.html?v=<ts>");
+    }
+
+    private static string? ResolveUiDistPath()
+    {
+        var candidatePaths = new[]
+        {
+            Path.Combine(AppContext.BaseDirectory, "WebUI", "dist"),
+            Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "WebUI", "dist"))
+        };
+
+        foreach (var path in candidatePaths)
+        {
+            if (Directory.Exists(path) && File.Exists(Path.Combine(path, "index.html")))
+            {
+                return path;
+            }
+        }
+
+        return null;
+    }
+
+    private sealed class TrayMenuRenderer : ToolStripProfessionalRenderer
+    {
+        private static readonly Color BgColor      = AppPanelColor;
+        private static readonly Color HoverBg      = Color.FromArgb(28, 45, 61, 84);   // very subtle tinted panel
+        private static readonly Color HoverBorder  = Color.FromArgb(90, AppAccentColor.R, AppAccentColor.G, AppAccentColor.B);
+        private static readonly Color AccentBar    = AppAccentColor;
+        private static readonly Color BorderColor  = AppLineColor;
+        private static readonly Color SepColor     = Color.FromArgb(100, AppLineColor.R, AppLineColor.G, AppLineColor.B);
+        private const int ItemHeight   = 34;
+        private const int ItemPadH     = 14;
+        private const int AccentBarW   = 3;
+        private const int Radius       = 5;
+
+        public TrayMenuRenderer() : base(new TrayMenuColorTable()) { RoundedEdges = false; }
+
+        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+        {
+            using var brush = new SolidBrush(BgColor);
+            e.Graphics.FillRectangle(brush, e.AffectedBounds);
+        }
+
+        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+        {
+            using var pen = new Pen(BorderColor);
+            var r = new Rectangle(0, 0, e.ToolStrip.Width - 1, e.ToolStrip.Height - 1);
+            e.Graphics.DrawRectangle(pen, r);
+        }
+
+        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
+        {
+            using var brush = new SolidBrush(BgColor);
+            e.Graphics.FillRectangle(brush, e.AffectedBounds);
+        }
+
+        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+        {
+            int y = e.Item.Height / 2;
+            using var pen = new Pen(SepColor);
+            e.Graphics.DrawLine(pen, ItemPadH, y, e.Item.Width - ItemPadH, y);
+        }
+
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (!e.Item.Selected || e.Item is ToolStripSeparator) return;
+
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            var bounds = new Rectangle(5, 2, e.Item.Width - 10, e.Item.Height - 4);
+
+            // Rounded hover background
+            using (var bgBrush = new SolidBrush(Color.FromArgb(38, AppAccentColor.R, AppAccentColor.G, AppAccentColor.B)))
+            using (var path = RoundedRect(bounds, Radius))
+            {
+                g.FillPath(bgBrush, path);
+            }
+
+            // Rounded hover border
+            using (var borderPen = new Pen(HoverBorder))
+            using (var path = RoundedRect(bounds, Radius))
+            {
+                g.DrawPath(borderPen, path);
+            }
+
+            // Accent left bar (only for the "Show" bold item)
+            if (e.Item.Font.Bold)
+            {
+                using var accentBrush = new SolidBrush(AccentBar);
+                g.FillRectangle(accentBrush, new Rectangle(bounds.X + 1, bounds.Y + 4, AccentBarW, bounds.Height - 8));
+            }
+
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.Default;
+        }
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            if (e.Item is ToolStripSeparator) return;
+            e.TextColor = e.Item.ForeColor;
+            // Indent text past the accent bar zone
+            var oldRect = e.TextRectangle;
+            e.TextRectangle = new Rectangle(oldRect.X + 8, oldRect.Y, oldRect.Width - 8, oldRect.Height);
+            base.OnRenderItemText(e);
+        }
+
+        private static System.Drawing.Drawing2D.GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            var path = new System.Drawing.Drawing2D.GraphicsPath();
+            int d = radius * 2;
+            path.AddArc(r.X, r.Y, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        private sealed class TrayMenuColorTable : ProfessionalColorTable
+        {
+            public override Color ToolStripDropDownBackground        => AppPanelColor;
+            public override Color MenuBorder                         => AppLineColor;
+            public override Color MenuItemBorder                     => Color.Transparent;
+            public override Color MenuItemSelected                   => Color.Transparent;
+            public override Color MenuItemSelectedGradientBegin      => Color.Transparent;
+            public override Color MenuItemSelectedGradientEnd        => Color.Transparent;
+            public override Color MenuItemPressedGradientBegin       => Color.Transparent;
+            public override Color MenuItemPressedGradientMiddle      => Color.Transparent;
+            public override Color MenuItemPressedGradientEnd         => Color.Transparent;
+            public override Color ImageMarginGradientBegin           => AppPanelColor;
+            public override Color ImageMarginGradientMiddle          => AppPanelColor;
+            public override Color ImageMarginGradientEnd             => AppPanelColor;
+            public override Color SeparatorDark                      => AppLineColor;
+            public override Color SeparatorLight                     => Color.Transparent;
+        }
+    }
+
+    private void LoadConfigAndDevices()
+    {
+        _suppressConfigSave = true;
+        try
+        {
+        var loadedConfig = AppConfig.Load();
+        _lastSavedConfig = loadedConfig;
+        if (loadedConfig != null)
+        {
+            loadedConfig.ApplyToEngine(_engine);
+            _locked = loadedConfig.Locked;
+            _uiPreferencesJson = loadedConfig.UiPreferencesJson ?? "";
+            _startupAtBoot = loadedConfig.StartupAtBoot;
+            _inputDeviceMode = loadedConfig.InputDeviceMode is "input" or "loopback" or "both"
+                ? loadedConfig.InputDeviceMode
+                : "both";
+
+            if (loadedConfig.Window.Width > 0 && loadedConfig.Window.Height > 0)
+            {
+                Size = new System.Drawing.Size(loadedConfig.Window.Width, loadedConfig.Window.Height);
+                if (loadedConfig.Window.X >= 0)
+                {
+                    Location = new System.Drawing.Point(loadedConfig.Window.X, loadedConfig.Window.Y);
+                }
+            }
+
+            _startMinimizedFromConfig = loadedConfig.Window.StartMinimized;
+            _startupAtBoot = ApplyStartupAtBoot(_startupAtBoot) ? _startupAtBoot : false;
+
+            SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+            TryAutoStart();
+
+            // Some (or all) devices may simply not be ready yet — common right after
+            // Windows boot. Keep retrying with backoff instead of requiring a manual
+            // reload; each retry re-enumerates, re-attaches and auto-starts.
+            if (!_engine.IsRunning
+                && (_engine.DormantRoutes.Count > 0 || _engine.RoutingMatrix.HasAnyCrosspoints()))
+            {
+                _startupRetryStage = 0;
+                _startupRetryTimer.Interval = StartupRetryDelaysMs[0];
+                _startupRetryTimer.Start();
+            }
+
+            return;
+        }
+
+        SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+        }
+        finally
+        {
+            _suppressConfigSave = false;
+        }
+    }
+
+    private void SyncDevicesWithSystem(bool addAllAvailableIfEmpty = false)
+    {
+        _availableDevicesDirty = true;
+        _engine.RefreshDevices();
+        ApplyKnownDeviceSettings();
+
+        // Note: capture endpoints are exposed to the UI via
+        // GetAvailableInputDevices(includeCapture, includeLoopback) — they are NOT
+        // auto-added as active inputs here. Auto-adding every endpoint would spin up
+        // a WasapiCapture per device on Start(), which pegs CPU and hangs the engine.
+        var captureDevices = _engine.GetAvailableDevices(DataFlow.Capture);
+        var renderDevices = _engine.GetAvailableDevices(DataFlow.Render);
+
+        if (addAllAvailableIfEmpty && _engine.InputDevices.Count == 0)
+        {
+            foreach (var device in captureDevices)
+            {
+                _engine.AddInputDevice(device.Id);
+            }
+        }
+
+        if (addAllAvailableIfEmpty && _engine.OutputDevices.Count == 0)
+        {
+            foreach (var device in renderDevices)
+            {
+                _engine.AddOutputDevice(device.Id);
+            }
+        }
+    }
+
+    private void SaveConfig()
+    {
+        var bounds = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            bounds = Bounds;
+        }
+
+        // "Start minimized" is a preference loaded from config; only the final close
+        // records the live window state. A background save while the app sits in the
+        // tray must not silently flip the preference to "always start minimized".
+        var startMinimized = _startMinimizedFromConfig;
+
+        var config = AppConfig.FromEngine(_engine, bounds.X, bounds.Y, bounds.Width, bounds.Height, _locked, startMinimized, _startupAtBoot, _uiPreferencesJson, _inputDeviceMode, _lastSavedConfig);
+        config.Save();
+        _lastSavedConfig = config;
+    }
+
+    private void ScheduleSave()
+    {
+        _saveTimer.Stop();
+        _saveTimer.Start();
+    }
+
+    /// <summary>
+    /// Re-applies persisted per-device settings (currently the output delay) to devices
+    /// that just (re)attached. A freshly added ActiveDevice starts with defaults; without
+    /// this, replugging a device silently loses its configured delay until app restart.
+    /// </summary>
+    private void ApplyKnownDeviceSettings()
+    {
+        var known = _lastSavedConfig?.KnownDevices;
+        if (known == null || known.Count == 0) return;
+
+        foreach (var k in known)
+        {
+            if (k.IsInput || k.OutputDelayMs <= 0) continue;
+            var dev = _engine.OutputDevices.FirstOrDefault(d => d.Info.Id == k.Id);
+            if (dev != null && dev.OutputDelayMs == 0)
+            {
+                _engine.SetOutputDelayMs(k.Id, k.OutputDelayMs);
+            }
+        }
+    }
+
+    private void ApplyDarkTitleBar()
+    {
+        if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 17763) || !IsHandleCreated)
+        {
+            return;
+        }
+
+        try
+        {
+            var darkModeEnabled =
+                TrySetDwmIntAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE, 1) ||
+                TrySetDwmIntAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE_BEFORE_20, 1);
+
+            if (darkModeEnabled)
+            {
+                TrySetDwmIntAttribute(DWMWA_CAPTION_COLOR, DARK_CAPTION_COLOR);
+                TrySetDwmIntAttribute(DWMWA_TEXT_COLOR, LIGHT_TEXT_COLOR);
+            }
+        }
+        catch
+        {
+            // Leave default title bar rendering if the DWM attribute is unavailable.
+        }
+    }
+
+    private bool TrySetDwmIntAttribute(int attribute, int value)
+    {
+        var attributeValue = value;
+        return DwmSetWindowAttribute(Handle, attribute, ref attributeValue, sizeof(int)) == 0;
+    }
+
+    private async void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
+    {
+        if (_webView.CoreWebView2 == null) return;
+
+        await _webMessageGate.WaitAsync();
+
+        UiRequest? request = null;
+        try
+        {
+            var payload = e.TryGetWebMessageAsString();
+            request = JsonSerializer.Deserialize<UiRequest>(payload, JsonOptions);
+            if (request == null || string.IsNullOrWhiteSpace(request.Id) || string.IsNullOrWhiteSpace(request.Method))
+            {
+                return;
+            }
+
+            switch (request.Method)
+            {
+                case "getState":
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "refreshDevices":
+                    _availableDevicesDirty = true;
+                    _pendingFullStatePush = true;
+                    _suppressConfigSave = true;
+                    try
+                    {
+                        SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+                    }
+                    finally
+                    {
+                        _suppressConfigSave = false;
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "reloadEngine":
+                {
+                    bool wasRunning = _engine.IsRunning;
+                    if (wasRunning) _engine.Stop();
+                    _availableDevicesDirty = true;
+                    _pendingFullStatePush = true;
+                    SyncDevicesWithSystem(addAllAvailableIfEmpty: false);
+                    // Re-start if the engine was running and has active routes.
+                    // SyncDevicesWithSystem calls RefreshDevices() which saw wasRunning=false
+                    // (we stopped above), so it won't auto-restart — we do it explicitly.
+                    if (wasRunning && !_engine.IsRunning
+                        && _engine.InputDevices.Count > 0
+                        && _engine.OutputDevices.Count > 0
+                        && _engine.RoutingMatrix.HasAnyCrosspoints())
+                    {
+                        _engine.Start();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+                }
+
+                case "addInputDevice":
+                    if (request.Params.TryGetProperty("deviceId", out var addInputId))
+                    {
+                        _engine.AddInputDevice(addInputId.GetString() ?? string.Empty);
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "addOutputDevice":
+                    if (request.Params.TryGetProperty("deviceId", out var addOutputId))
+                    {
+                        _engine.AddOutputDevice(addOutputId.GetString() ?? string.Empty);
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "removeInputDevice":
+                    if (request.Params.TryGetProperty("deviceId", out var removeInputId))
+                    {
+                        var id = removeInputId.GetString() ?? string.Empty;
+                        // Explicit user removal: forget the device entirely — dormant
+                        // routes (RemoveInputDevice re-captures them, so prune after)
+                        // and its KnownDevices entry, or it would resurrect on restart.
+                        _engine.RemoveInputDevice(id);
+                        _engine.RemoveDormantRoutesFor(id);
+                        _lastSavedConfig?.KnownDevices.RemoveAll(k => k.Id == id && k.IsInput);
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "removeOutputDevice":
+                    if (request.Params.TryGetProperty("deviceId", out var removeOutputId))
+                    {
+                        var id = removeOutputId.GetString() ?? string.Empty;
+                        _engine.RemoveOutputDevice(id);
+                        _engine.RemoveDormantRoutesFor(id);
+                        _lastSavedConfig?.KnownDevices.RemoveAll(k => k.Id == id && !k.IsInput);
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "startEngine":
+                    _engine.Start();
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "stopEngine":
+                    _engine.Stop();
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setLocked":
+                    _locked = request.Params.TryGetProperty("locked", out var lockValue) && lockValue.GetBoolean();
+                    ScheduleSave();
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setTransientMuteAll":
+                    // No lock check — mute must work even when UI is locked.
+                    // Not persisted — transient only.
+                    _engine.RoutingMatrix.TransientMuteAll =
+                        request.Params.TryGetProperty("muted", out var muteValue) && muteValue.GetBoolean();
+                    await SendResultAsync(request.Id, true);
+                    return;
+
+                case "getUiPreferences":
+                    await SendResultAsync(request.Id, _uiPreferencesJson);
+                    return;
+
+                case "setUiPreferences":
+                    _uiPreferencesJson = request.Params.TryGetProperty("json", out var uiJsonValue)
+                        ? uiJsonValue.GetString() ?? string.Empty
+                        : string.Empty;
+                    ScheduleSave();
+                    await SendResultAsync(request.Id, true);
+                    return;
+
+                case "clearRoutes":
+                    if (!_locked)
+                    {
+                        _engine.ClearCrosspoints();
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setCrosspoint":
+                {
+                    int inCh = request.Params.TryGetProperty("inCh", out var inElem) ? inElem.GetInt32() : -1;
+                    int outCh = request.Params.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
+                    bool active = request.Params.TryGetProperty("active", out var activeElem) && activeElem.GetBoolean();
+                    float gainDb = request.Params.TryGetProperty("gainDb", out var gainElem) ? gainElem.GetSingle() : 0f;
+                    bool phaseInverted = request.Params.TryGetProperty("phaseInverted", out var phaseElem) && phaseElem.GetBoolean();
+
+                    if (!_locked)
+                    {
+                        _engine.SetCrosspoint(inCh, outCh, active, gainDb, phaseInverted);
+
+                        if (active && !_engine.IsRunning)
+                        {
+                            _engine.Start();
+                        }
+                        else if (!active && _engine.IsRunning && !_engine.RoutingMatrix.HasAnyCrosspoints())
+                        {
+                            _engine.Stop();
+                        }
+
+                        ScheduleSave();
+                    }
+
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+                }
+
+                case "setCrosspoints":
+                {
+                    var routeErrors = new List<string>();
+                    if (!_locked && request.Params.TryGetProperty("routes", out var routesElem) && routesElem.ValueKind == JsonValueKind.Array)
+                    {
+                        // Two payload shapes are accepted:
+                        //  (a) legacy: { inCh, outCh, active, gainDb } — pre-resolved global channel indices.
+                        //  (b) deviceId form: { inDeviceId, inChannel, outDeviceId, outChannel, active, gainDb }.
+                        // Form (b) auto-adds the referenced devices to the engine if they aren't already
+                        // active, then resolves the global channel index. This is how user-selected
+                        // devices end up in the engine — there is no separate "addInputDevice" step.
+                        bool devicesChanged = false;
+                        // Suppress intermediate pushes: device adds fire StateChanged with
+                        // the OLD route state, which would overwrite the optimistic toggle
+                        // in the renderer. One authoritative push goes out at the end.
+                        _suppressStatePush = true;
+                        try
+                        {
+                            // Device batch: at most ONE engine restart for the whole
+                            // operation instead of one per added device plus one extra.
+                            using (_engine.BeginDeviceBatch())
+                            {
+                                var pending = new List<(string? InId, int InCh, string? OutId, int OutCh, bool Active, float GainDb, bool PhaseInverted, int LegacyIn, int LegacyOut)>();
+                                foreach (var route in routesElem.EnumerateArray())
+                                {
+                                    string? inDeviceId = route.TryGetProperty("inDeviceId", out var inIdElem) ? inIdElem.GetString() : null;
+                                    string? outDeviceId = route.TryGetProperty("outDeviceId", out var outIdElem) ? outIdElem.GetString() : null;
+                                    int inChannel = route.TryGetProperty("inChannel", out var inChElem) ? inChElem.GetInt32() : 0;
+                                    int outChannel = route.TryGetProperty("outChannel", out var outChElem) ? outChElem.GetInt32() : 0;
+                                    int legacyIn = route.TryGetProperty("inCh", out var inElem) ? inElem.GetInt32() : -1;
+                                    int legacyOut = route.TryGetProperty("outCh", out var outElem) ? outElem.GetInt32() : -1;
+                                    bool active = route.TryGetProperty("active", out var activeElem) && activeElem.GetBoolean();
+                                    float gainDb = route.TryGetProperty("gainDb", out var gainElem) ? gainElem.GetSingle() : 0f;
+                                    bool phaseInverted = route.TryGetProperty("phaseInverted", out var phaseElem) && phaseElem.GetBoolean();
+
+                                    if (!string.IsNullOrEmpty(inDeviceId) && active)
+                                    {
+                                        if (_engine.AddInputDevice(inDeviceId)) devicesChanged = true;
+                                    }
+                                    if (!string.IsNullOrEmpty(outDeviceId) && active)
+                                    {
+                                        if (_engine.AddOutputDevice(outDeviceId)) devicesChanged = true;
+                                    }
+
+                                    pending.Add((inDeviceId, inChannel, outDeviceId, outChannel, active, gainDb, phaseInverted, legacyIn, legacyOut));
+                                }
+
+                                var updates = new List<(int InCh, int OutCh, bool Active, float GainDb, bool PhaseInverted)>();
+                                foreach (var p in pending)
+                                {
+                                    int inGlobal = p.LegacyIn;
+                                    int outGlobal = p.LegacyOut;
+                                    if (!string.IsNullOrEmpty(p.InId))
+                                    {
+                                        var inDev = _engine.InputDevices.FirstOrDefault(d => d.Info.Id == p.InId);
+                                        if (inDev != null && p.InCh >= 0 && p.InCh < inDev.Info.Channels)
+                                        {
+                                            inGlobal = inDev.GlobalChannelOffset + p.InCh;
+                                        }
+                                        else if (p.Active)
+                                        {
+                                            // Do NOT fall back to a stale UI-supplied global index —
+                                            // that writes the crosspoint somewhere wrong. Report it.
+                                            routeErrors.Add($"Input '{p.InId}' channel {p.InCh + 1} is not available");
+                                            continue;
+                                        }
+                                        else
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    if (!string.IsNullOrEmpty(p.OutId))
+                                    {
+                                        var outDev = _engine.OutputDevices.FirstOrDefault(d => d.Info.Id == p.OutId);
+                                        if (outDev != null && p.OutCh >= 0 && p.OutCh < outDev.Info.Channels)
+                                        {
+                                            outGlobal = outDev.GlobalChannelOffset + p.OutCh;
+                                        }
+                                        else if (p.Active)
+                                        {
+                                            routeErrors.Add($"Output '{p.OutId}' channel {p.OutCh + 1} is not available");
+                                            continue;
+                                        }
+                                        else
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    if (inGlobal < 0 || outGlobal < 0) continue;
+                                    updates.Add((inGlobal, outGlobal, p.Active, p.GainDb, p.PhaseInverted));
+                                }
+
+                                var (changed, skipped) = _engine.SetCrosspoints(updates);
+                                if (skipped > 0)
+                                {
+                                    routeErrors.Add($"{skipped} route(s) were out of range and skipped");
+                                }
+                                if (changed > 0 || devicesChanged)
+                                {
+                                    ScheduleSave();
+                                }
+                            } // batch dispose: restarts once if a device add stopped the engine
+
+                            if (_engine.RoutingMatrix.HasAnyCrosspoints())
+                            {
+                                if (!_engine.IsRunning)
+                                {
+                                    _engine.Start();
+                                }
+                            }
+                            else if (_engine.IsRunning)
+                            {
+                                _engine.Stop();
+                            }
+                        }
+                        finally
+                        {
+                            _suppressStatePush = false;
+                        }
+
+                        _pendingFullStatePush = true;
+                        PushStateToUi();
+                    }
+
+                    var replyState = BuildUiState(true);
+                    replyState.RouteErrors = routeErrors.Count > 0 ? routeErrors : null;
+                    await SendResultAsync(request.Id, replyState);
+                    return;
+                }
+
+                case "setInputMasterDevice":
+                    if (request.Params.TryGetProperty("deviceId", out var inputMasterId))
+                    {
+                        _engine.SetInputMasterDevice(inputMasterId.GetString() ?? string.Empty);
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setOutputMasterDevice":
+                    if (request.Params.TryGetProperty("deviceId", out var outputMasterId))
+                    {
+                        _engine.SetOutputMasterDevice(outputMasterId.GetString() ?? string.Empty);
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setOutputDelayMs":
+                    if (request.Params.TryGetProperty("deviceId", out var outputDelayDeviceId) &&
+                        request.Params.TryGetProperty("delayMs", out var outputDelayMs))
+                    {
+                        _engine.SetOutputDelayMs(outputDelayDeviceId.GetString() ?? string.Empty, outputDelayMs.GetInt32());
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setInputBufferMs":
+                    if (request.Params.TryGetProperty("bufferMs", out var inputBufferMs))
+                    {
+                        _engine.SetInputBufferMs(inputBufferMs.GetInt32());
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setOutputBufferMs":
+                    if (request.Params.TryGetProperty("bufferMs", out var outputBufferMs))
+                    {
+                        _engine.SetOutputBufferMs(outputBufferMs.GetInt32());
+                        ScheduleSave();
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "setInputDeviceMode":
+                    if (request.Params.TryGetProperty("mode", out var inputModeValue))
+                    {
+                        var mode = inputModeValue.GetString() ?? "input";
+                        if (mode == "input" || mode == "loopback" || mode == "both")
+                        {
+                            _inputDeviceMode = mode;
+                            _availableDevicesDirty = true;
+                            _pendingFullStatePush = true;
+                            ScheduleSave();
+                        }
+                    }
+                    await SendResultAsync(request.Id, BuildUiState(true));
+                    return;
+
+                case "getStartupAtBoot":
+                    await SendResultAsync(request.Id, IsStartupAtBootEnabled());
+                    return;
+
+                case "setStartupAtBoot":
+                {
+                    var enabled = request.Params.TryGetProperty("enabled", out var startupEnabled) && startupEnabled.GetBoolean();
+                    var applied = SetStartupAtBoot(enabled);
+                    await SendResultAsync(request.Id, applied && _startupAtBoot);
+                    return;
+                }
+
+                case "updateCheck":
+                {
+                    var reqId = request.Id;
+                    // Network work runs on a background task so the message gate (and the
+                    // UI thread) is released immediately; WebView2 calls marshal back.
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var mgr = GetUpdateManager();
+                            if (!mgr.IsInstalled)
+                            {
+                                // Portable/dev run — Velopack can't update in place.
+                                BeginInvoke(() => _ = SendResultAsync(reqId, new
+                                {
+                                    currentVersion = AppVersionString,
+                                    availableVersion = (string?)null,
+                                    portable = true
+                                }));
+                                return;
+                            }
+
+                            var info = await mgr.CheckForUpdatesAsync();
+                            _pendingUpdate = info;
+                            _updateDownloaded = false;
+                            BeginInvoke(() => _ = SendResultAsync(reqId, new
+                            {
+                                currentVersion = mgr.CurrentVersion?.ToString() ?? AppVersionString,
+                                availableVersion = info?.TargetFullRelease?.Version?.ToString(),
+                                portable = false
+                            }));
+                        }
+                        catch (Exception ex)
+                        {
+                            try { BeginInvoke(() => _ = SendErrorAsync(reqId, "Update check failed: " + ex.Message)); }
+                            catch (InvalidOperationException) { }
+                        }
+                    });
+                    return;
+                }
+
+                case "updateDownload":
+                {
+                    var reqId = request.Id;
+                    var info = _pendingUpdate;
+                    if (info == null)
+                    {
+                        await SendErrorAsync(reqId, "No update pending — check for updates first");
+                        return;
+                    }
+                    if (Interlocked.Exchange(ref _updateBusy, 1) == 1)
+                    {
+                        await SendErrorAsync(reqId, "An update download is already in progress");
+                        return;
+                    }
+
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            int lastPercent = -1;
+                            await GetUpdateManager().DownloadUpdatesAsync(info, percent =>
+                            {
+                                if (percent == lastPercent) return;
+                                lastPercent = percent;
+                                try
+                                {
+                                    BeginInvoke(() =>
+                                    {
+                                        try
+                                        {
+                                            _webView.CoreWebView2?.PostWebMessageAsJson(
+                                                "{\"kind\":\"update-progress\",\"percent\":" + percent + "}");
+                                        }
+                                        catch { }
+                                    });
+                                }
+                                catch (InvalidOperationException) { }
+                            });
+                            _updateDownloaded = true;
+                            BeginInvoke(() => _ = SendResultAsync(reqId, new { downloaded = true }));
+                        }
+                        catch (Exception ex)
+                        {
+                            try { BeginInvoke(() => _ = SendErrorAsync(reqId, "Update download failed: " + ex.Message)); }
+                            catch (InvalidOperationException) { }
+                        }
+                        finally
+                        {
+                            Interlocked.Exchange(ref _updateBusy, 0);
+                        }
+                    });
+                    return;
+                }
+
+                case "updateApply":
+                {
+                    if (_pendingUpdate == null || !_updateDownloaded)
+                    {
+                        await SendErrorAsync(request.Id, "Update not downloaded yet");
+                        return;
+                    }
+
+                    await SendResultAsync(request.Id, true);
+                    // Waits for OUR process to exit, applies silently, then relaunches.
+                    GetUpdateManager().WaitExitThenApplyUpdates(_pendingUpdate, silent: true, restart: true);
+                    BeginInvoke(() =>
+                    {
+                        // Same graceful path as tray Exit: config save, engine stop, tray cleanup.
+                        _allowRealClose = true;
+                        Close();
+                    });
+                    return;
+                }
+
+                case "quitApplication":
+                    await SendResultAsync(request.Id, true);
+                    BeginInvoke(() =>
+                    {
+                        _allowRealClose = true;
+                        Close();
+                    });
+                    return;
+
+                default:
+                    await SendErrorAsync(request.Id, $"Unknown method: {request.Method}");
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            // Reply with the ORIGINAL request id so the renderer's pending promise settles.
+            // (A fresh GUID here used to leave the promise hanging forever on any handler
+            // exception, wedging the UI's route sync.)
+            if (!string.IsNullOrWhiteSpace(request?.Id))
+            {
+                await SendErrorAsync(request!.Id, ex.Message);
+            }
+        }
+        finally
+        {
+            _webMessageGate.Release();
+        }
+    }
+
+    private void EnsureAvailableDevicesCached()
+    {
+        if (!_availableDevicesDirty) return;
+        try
+        {
+            bool includeCapture = _inputDeviceMode != "loopback";
+            bool includeLoopback = _inputDeviceMode != "input";
+            _cachedAvailableInputs = _engine.GetAvailableInputDevices(includeCapture, includeLoopback);
+            _cachedAvailableOutputs = _engine.GetAvailableDevices(DataFlow.Render);
+        }
+        catch
+        {
+            // Fall back to whatever is currently cached.
+        }
+        _availableDevicesDirty = false;
+    }
+
+    private UiState BuildUiState(bool includeAvailableDevices)
+    {
+        var routes = new List<RouteState>();
+        var matrix = _engine.RoutingMatrix;
+        for (int inCh = 0; inCh < matrix.InputChannels; inCh++)
+        {
+            for (int outCh = 0; outCh < matrix.OutputChannels; outCh++)
+            {
+                var cp = matrix.GetCrosspoint(inCh, outCh);
+                if (!cp.Active) continue;
+
+                routes.Add(new RouteState
+                {
+                    InCh = inCh,
+                    OutCh = outCh,
+                    GainDb = matrix.GetGainDb(inCh, outCh),
+                    // Working latency is time-varying telemetry; it rides the metrics
+                    // channel (routeLatencies) instead of touching audio-path ring locks
+                    // on every state build.
+                    WorkingLatencyMs = null,
+                    PhaseInverted = cp.PhaseInverted
+                });
+            }
+        }
+
+        List<DeviceState>? availableInputs = null;
+        List<DeviceState>? availableOutputs = null;
+        if (includeAvailableDevices)
+        {
+            EnsureAvailableDevicesCached();
+            availableInputs = _cachedAvailableInputs.Select(d => new DeviceState
+            {
+                DeviceId = d.Id,
+                Label = d.Name,
+                Channels = d.Channels,
+                Offset = 0,
+                IsMaster = false,
+                DelayMs = 0,
+                IsLoopback = d.Id.StartsWith("loop:", StringComparison.Ordinal)
+            }).ToList();
+            availableOutputs = _cachedAvailableOutputs.Select(d => new DeviceState
+            {
+                DeviceId = d.Id,
+                Label = d.Name,
+                Channels = d.Channels,
+                Offset = 0,
+                IsMaster = false,
+                DelayMs = 0,
+            }).ToList();
+        }
+
+        return new UiState
+        {
+            // Build-order stamp: the renderer only applies a state whose rev is newer
+            // than the last one it applied, so stale pushes can never win.
+            Rev = Interlocked.Increment(ref _stateRev),
+            Running = _engine.IsRunning,
+            Locked = _locked,
+            StartupAtBoot = _startupAtBoot,
+            InputBufferMs = _engine.InputBufferMs,
+            OutputBufferMs = _engine.OutputBufferMs,
+            InputDeviceMode = _inputDeviceMode,
+            HasFullDeviceLists = includeAvailableDevices,
+            AvailableInputs = availableInputs,
+            AvailableOutputs = availableOutputs,
+            Inputs = _engine.InputDevices.Select(d => new DeviceState
+            {
+                DeviceId = d.Info.Id,
+                Label = d.Info.Name,
+                Channels = d.Info.Channels,
+                Offset = d.GlobalChannelOffset,
+                IsMaster = d.IsMasterDevice,
+                DelayMs = 0,
+                SampleRate = d.Info.SampleRate,
+                DriverLatencyMs = d.CaptureLatencyMs,
+                IsLoopback = d.IsLoopback
+            }).ToList(),
+            Outputs = _engine.OutputDevices.Select(d => new DeviceState
+            {
+                DeviceId = d.Info.Id,
+                Label = d.Info.Name,
+                Channels = d.Info.Channels,
+                Offset = d.GlobalChannelOffset,
+                IsMaster = d.IsMasterDevice,
+                DelayMs = d.OutputDelayMs,
+                SampleRate = d.Info.SampleRate,
+                DriverLatencyMs = d.RenderLatencyMs,
+                LatencyMs = d.RenderLatencyMs > 0
+                    ? Math.Round((double)d.RenderLatencyMs + d.OutputDelayMs, 1)
+                    : (double?)null
+            }).ToList(),
+            Routes = routes
+        };
+    }
+
+    /// <summary>
+    /// Lightweight time-varying telemetry pushed at 10 Hz: peaks, latencies, jitter and
+    /// per-device counters. Deliberately carries NO routes or device lists, so a metrics
+    /// tick can never overwrite route state in the renderer. Peak sampling is destructive
+    /// (sample-and-reset), which is why it lives only here and never in BuildUiState —
+    /// RPC replies used to steal peak samples and make the meters dip.
+    /// </summary>
+    private MetricsState BuildMetrics()
+    {
+        var masterOutput = _engine.GetOutputMasterDevice();
+        var preferredConsumerId = string.IsNullOrWhiteSpace(masterOutput?.ConsumerId)
+            ? (masterOutput?.Info.Id ?? string.Empty)
+            : masterOutput!.ConsumerId;
+
+        // Per-input sync-correction totals in one pass (no LINQ per input per tick).
+        var syncCorrectionsByInput = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var outDev in _engine.OutputDevices)
+        {
+            if (outDev.MixProvider == null) continue;
+            foreach (var inDev in _engine.InputDevices)
+            {
+                long count = outDev.MixProvider.GetInputSyncCorrectionCount(inDev.Info.Id);
+                if (count == 0) continue;
+                syncCorrectionsByInput[inDev.Info.Id] =
+                    syncCorrectionsByInput.GetValueOrDefault(inDev.Info.Id) + count;
+            }
+        }
+
+        double? maxWorkingLatencyMs = null;
+        var routeLatencies = new List<RouteLatencyMetric>();
+        foreach (var (inCh, outCh, latencyMs) in _engine.GetActiveRouteLatencies())
+        {
+            var rounded = Math.Round(latencyMs, 1);
+            maxWorkingLatencyMs = maxWorkingLatencyMs.HasValue
+                ? Math.Max(maxWorkingLatencyMs.Value, rounded)
+                : rounded;
+            routeLatencies.Add(new RouteLatencyMetric { InCh = inCh, OutCh = outCh, WorkingLatencyMs = rounded });
+        }
+
+        return new MetricsState
+        {
+            Rev = Interlocked.Read(ref _stateRev),
+            Running = _engine.IsRunning,
+            TotalLatencyMs = maxWorkingLatencyMs,
+            InputLatencyMs = _engine.TryGetInputPathLatencyMs(out var inputPathLatency)
+                ? Math.Round(inputPathLatency, 1)
+                : (double?)null,
+            OutputLatencyMs = _engine.TryGetOutputPathLatencyMs(out var outputPathLatency)
+                ? Math.Round(outputPathLatency, 1)
+                : (double?)null,
+            InputJitterMs = _engine.TryGetInputJitterMs(out var inputJitter)
+                ? Math.Round(inputJitter, 1)
+                : (double?)null,
+            Inputs = _engine.InputDevices.Select(d => new InputMetrics
+            {
+                DeviceId = d.Info.Id,
+                PeakLevels = SampleAndResetPeaks(d.PeakLevels),
+                Overflows = Interlocked.Read(ref d.InputOverflowCount),
+                DroppedFrames = !string.IsNullOrWhiteSpace(preferredConsumerId)
+                    ? (d.RingBuffer?.GetDroppedFramesForConsumer(preferredConsumerId) ?? 0)
+                    : (d.RingBuffer?.TotalFramesDropped ?? 0),
+                SyncCorrections = syncCorrectionsByInput.GetValueOrDefault(d.Info.Id)
+            }).ToList(),
+            Outputs = _engine.OutputDevices.Select(d => new OutputMetrics
+            {
+                DeviceId = d.Info.Id,
+                PeakLevels = d.MixProvider?.SamplePeakLevels() ?? Array.Empty<float>(),
+                Underruns = d.MixProvider?.UnderrunCount ?? 0,
+                DroppedFrames = d.MixProvider?.DroppedFrames ?? 0,
+                LatencyMs = d.RenderLatencyMs > 0
+                    ? Math.Round((double)d.RenderLatencyMs + d.OutputDelayMs, 1)
+                    : (double?)null,
+                VariationRangeMs = d.MixProvider?.OutputVariationRangeMs,
+                VariationOffsetMs = d.MixProvider?.OutputVariationOffsetMs,
+                SyncErrorMs = d.MixProvider?.OutputSyncErrorMs,
+                SyncIntegralMs = d.MixProvider?.OutputSyncIntegralMs,
+                AppliedPpm = d.MixProvider?.OutputAppliedPpm,
+                FastCatchUpActive = d.MixProvider?.FastCatchUpActive ?? false,
+                FastCatchUpDutyPercent = d.MixProvider?.FastCatchUpDutyPercent ?? 0,
+                PostRecoveryUnderruns = d.MixProvider?.PostRecoveryUnderruns ?? 0
+            }).ToList(),
+            RouteLatencies = routeLatencies
+        };
+    }
+
+    private static float[] SampleAndResetPeaks(float[]? peaks)
+    {
+        if (peaks == null || peaks.Length == 0) return Array.Empty<float>();
+        var snapshot = new float[peaks.Length];
+        for (int i = 0; i < peaks.Length; i++)
+        {
+            snapshot[i] = peaks[i];
+            peaks[i] = 0f;
+        }
+        return snapshot;
+    }
+
+    private bool IsStartupAtBootEnabled()
+    {
+        return _startupAtBoot;
+    }
+
+    private bool SetStartupAtBoot(bool enabled)
+    {
+        if (!ApplyStartupAtBoot(enabled)) return false;
+        _startupAtBoot = enabled;
+        ScheduleSave();
+        return true;
+    }
+
+    private static string GetStartupShortcutPath()
+    {
+        var startupDir = Environment.GetFolderPath(Environment.SpecialFolder.Startup);
+        return Path.Combine(startupDir, StartupShortcutName);
+    }
+
+    private static bool ApplyStartupAtBoot(bool enabled)
+    {
+        try
+        {
+            var shortcutPath = GetStartupShortcutPath();
+            if (enabled)
+            {
+                CreateStartupShortcut(shortcutPath);
+            }
+            else if (File.Exists(shortcutPath))
+            {
+                File.Delete(shortcutPath);
+            }
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void CreateStartupShortcut(string shortcutPath)
+    {
+        // Use WScript.Shell COM object to create shortcut
+        var shellType = Type.GetTypeFromProgID("WScript.Shell");
+        if (shellType == null)
+            throw new InvalidOperationException("WScript.Shell COM object not available");
+
+        dynamic shell = Activator.CreateInstance(shellType)!;
+        dynamic shortcut = shell.CreateShortcut(shortcutPath);
+        
+        shortcut.TargetPath = Application.ExecutablePath;
+        shortcut.Arguments = "--startup";
+        shortcut.WorkingDirectory = Path.GetDirectoryName(Application.ExecutablePath);
+        shortcut.Description = "Audio Matrix Router";
+        
+        shortcut.Save();
+        
+        Marshal.FinalReleaseComObject(shortcut);
+        Marshal.FinalReleaseComObject(shell);
+    }
+
+    private void PushStateToUi()
+    {
+        if (!_webViewReady || _webView.CoreWebView2 == null) return;
+
+        try
+        {
+            bool full = _pendingFullStatePush;
+            _pendingFullStatePush = false;
+
+            var stateJson = JsonSerializer.Serialize(BuildUiState(full), JsonOptions);
+            _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"state\",\"state\":" + stateJson + "}");
+        }
+        catch
+        {
+            // WebView may have torn down between checks.
+        }
+    }
+
+    private void PushMetricsToUi()
+    {
+        if (!_webViewReady || _webView.CoreWebView2 == null) return;
+
+        try
+        {
+            var metricsJson = JsonSerializer.Serialize(BuildMetrics(), JsonOptions);
+            _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"metrics\",\"metrics\":" + metricsJson + "}");
+        }
+        catch
+        {
+            // WebView may have torn down between checks.
+        }
+    }
+
+    // Replies go over the same PostWebMessageAsJson channel as pushes: it's far cheaper
+    // than ExecuteScriptAsync (no script compile / V8 round-trip while holding the message
+    // gate) and, critically, messages on this channel are ordered relative to each other,
+    // so a reply can never race a state push.
+    private Task SendResultAsync(string requestId, object result)
+    {
+        if (_webView.CoreWebView2 == null) return Task.CompletedTask;
+
+        try
+        {
+            var idJson = JsonSerializer.Serialize(requestId);
+            var resultJson = JsonSerializer.Serialize(result, JsonOptions);
+            _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"reply\",\"id\":" + idJson + ",\"result\":" + resultJson + ",\"error\":null}");
+        }
+        catch
+        {
+            // WebView torn down mid-send.
+        }
+        return Task.CompletedTask;
+    }
+
+    private Task SendErrorAsync(string requestId, string message)
+    {
+        if (_webView.CoreWebView2 == null) return Task.CompletedTask;
+
+        try
+        {
+            var idJson = JsonSerializer.Serialize(requestId);
+            var errorJson = JsonSerializer.Serialize(message);
+            _webView.CoreWebView2.PostWebMessageAsJson("{\"kind\":\"reply\",\"id\":" + idJson + ",\"result\":null,\"error\":" + errorJson + "}");
+        }
+        catch
+        {
+            // WebView torn down mid-send.
+        }
+        return Task.CompletedTask;
+    }
+
+    private sealed class UiRequest
+    {
+        public string Id { get; set; } = string.Empty;
+        public string Method { get; set; } = string.Empty;
+        public JsonElement Params { get; set; }
+    }
+
+    private sealed class DeviceState
+    {
+        public string DeviceId { get; set; } = string.Empty;
+        public string Label { get; set; } = string.Empty;
+        public int Channels { get; set; }
+        public int Offset { get; set; }
+        public bool IsMaster { get; set; }
+        public int DelayMs { get; set; }
+        public int SampleRate { get; set; }
+        public int DriverLatencyMs { get; set; }
+        public double? LatencyMs { get; set; }
+        public long Underruns { get; set; }
+        public double? VariationRangeMs { get; set; }
+        public double? VariationOffsetMs { get; set; }
+        public double? SyncErrorMs { get; set; }
+        public double? SyncIntegralMs { get; set; }
+        public double? AppliedPpm { get; set; }
+        public double? JitterMs { get; set; }
+        public long SyncCorrections { get; set; }
+        public bool FastCatchUpActive { get; set; }
+        public double FastCatchUpDutyPercent { get; set; }
+        public long PostRecoveryUnderruns { get; set; }
+        public long Overflows { get; set; }
+        public long DroppedFrames { get; set; }
+        public bool IsLoopback { get; set; }
+        public float[] PeakLevels { get; set; } = Array.Empty<float>();
+    }
+
+    private sealed class RouteState
+    {
+        public int InCh { get; set; }
+        public int OutCh { get; set; }
+        public float GainDb { get; set; }
+        public double? WorkingLatencyMs { get; set; }
+        public bool PhaseInverted { get; set; }
+    }
+
+    private sealed class UiState
+    {
+        public long Rev { get; set; }
+        public bool Running { get; set; }
+        public bool Locked { get; set; }
+        public bool StartupAtBoot { get; set; }
+        public int InputBufferMs { get; set; }
+        public int OutputBufferMs { get; set; }
+        public string InputDeviceMode { get; set; } = "both";
+        public bool HasFullDeviceLists { get; set; }
+        public List<DeviceState>? AvailableInputs { get; set; }
+        public List<DeviceState>? AvailableOutputs { get; set; }
+        public List<DeviceState> Inputs { get; set; } = [];
+        public List<DeviceState> Outputs { get; set; } = [];
+        public List<RouteState> Routes { get; set; } = [];
+        public List<string>? RouteErrors { get; set; }
+    }
+
+    private sealed class InputMetrics
+    {
+        public string DeviceId { get; set; } = string.Empty;
+        public float[] PeakLevels { get; set; } = Array.Empty<float>();
+        public long Overflows { get; set; }
+        public long DroppedFrames { get; set; }
+        public long SyncCorrections { get; set; }
+    }
+
+    private sealed class OutputMetrics
+    {
+        public string DeviceId { get; set; } = string.Empty;
+        public float[] PeakLevels { get; set; } = Array.Empty<float>();
+        public long Underruns { get; set; }
+        public long DroppedFrames { get; set; }
+        public double? LatencyMs { get; set; }
+        public double? VariationRangeMs { get; set; }
+        public double? VariationOffsetMs { get; set; }
+        public double? SyncErrorMs { get; set; }
+        public double? SyncIntegralMs { get; set; }
+        public double? AppliedPpm { get; set; }
+        public bool FastCatchUpActive { get; set; }
+        public double FastCatchUpDutyPercent { get; set; }
+        public long PostRecoveryUnderruns { get; set; }
+    }
+
+    private sealed class RouteLatencyMetric
+    {
+        public int InCh { get; set; }
+        public int OutCh { get; set; }
+        public double WorkingLatencyMs { get; set; }
+    }
+
+    private sealed class MetricsState
+    {
+        public long Rev { get; set; }
+        public bool Running { get; set; }
+        public double? TotalLatencyMs { get; set; }
+        public double? InputLatencyMs { get; set; }
+        public double? OutputLatencyMs { get; set; }
+        public double? InputJitterMs { get; set; }
+        public List<InputMetrics> Inputs { get; set; } = [];
+        public List<OutputMetrics> Outputs { get; set; } = [];
+        public List<RouteLatencyMetric> RouteLatencies { get; set; } = [];
+    }
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int valueSize);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int RegisterWindowMessage(string lpString);
+
+    private const int WM_SETICON = 0x0080;
+    private const int ICON_SMALL = 0;
+    private const int ICON_BIG = 1;
+    private static readonly int WM_TASKBARCREATED = RegisterWindowMessage("TaskbarCreated");
+
+    private static class NativeMethods
+    {
+        [DllImport("user32.dll")]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        internal static extern bool SetForegroundWindow(IntPtr hWnd);
+    }
+
+}

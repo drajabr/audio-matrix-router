@@ -1,0 +1,182 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Create a GitHub Release and increment the patch version
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: Resolve Version
+    runs-on: ubuntu-latest
+
+    outputs:
+      app_version: ${{ steps.resolve.outputs.app_version }}
+      app_version_number: ${{ steps.resolve.outputs.app_version_number }}
+      release_requested: ${{ steps.resolve.outputs.release_requested }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: resolve
+        shell: bash
+        run: |
+          current_version="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$current_version" =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "VERSION must be in v0.1 or v0.1.9 format"
+            exit 1
+          fi
+
+          release_requested=false
+          app_version="$current_version"
+
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
+            changed_files="$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}")"
+            if echo "$changed_files" | grep -qx "VERSION"; then
+              release_requested=true
+            fi
+          fi
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.release }}" == "true" ]]; then
+            release_requested=true
+          fi
+
+          echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
+          echo "app_version_number=${app_version#v}" >> "$GITHUB_OUTPUT"
+          echo "release_requested=$release_requested" >> "$GITHUB_OUTPUT"
+
+  windows-portable:
+    name: Build Windows Portable
+    runs-on: windows-latest
+    needs: version
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: AudioMatrixRouter/WebUI/package-lock.json
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Install web dependencies
+        working-directory: AudioMatrixRouter/WebUI
+        run: npm ci
+
+      - name: Build web UI
+        working-directory: AudioMatrixRouter/WebUI
+        env:
+          VITE_APP_VERSION: ${{ needs.version.outputs.app_version }}
+        run: npm run build
+
+      - name: Restore .NET dependencies
+        run: dotnet restore AudioMatrixRouter/AudioMatrixRouter.csproj
+
+      - name: Publish binary
+        run: >-
+          dotnet publish AudioMatrixRouter/AudioMatrixRouter.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishTrimmed=false
+          -p:Platform=x64
+          -p:Version=${{ needs.version.outputs.app_version_number }}
+          -o artifacts/publish
+
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          Compress-Archive -Path artifacts/publish/* -DestinationPath artifacts/audio-router-matrix-win-x64-portable.zip -Force
+
+      - name: Upload portable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-router-matrix-win-x64-portable
+          path: artifacts/audio-router-matrix-win-x64-portable.zip
+          if-no-files-found: error
+
+      - name: Install Velopack CLI
+        run: dotnet tool install -g vpk
+
+      # Delta baseline: pulls the previous release's Velopack assets so vpk can produce
+      # a delta package. Fails harmlessly on the first Velopack release.
+      - name: Download previous Velopack release assets
+        if: needs.version.outputs.release_requested == 'true'
+        continue-on-error: true
+        run: vpk download github --repoUrl https://github.com/${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Velopack pack
+        run: >-
+          vpk pack
+          --packId AudioMatrixRouter
+          --packVersion ${{ needs.version.outputs.app_version_number }}
+          --packDir artifacts/publish
+          --mainExe AudioMatrixRouter.exe
+          --packTitle "Audio Matrix Router"
+          --icon AudioMatrixRouter/app.ico
+
+      - name: Upload Velopack setup artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: audio-matrix-router-setup
+          path: Releases/*.exe
+          if-no-files-found: error
+
+      - name: Create tag
+        if: needs.version.outputs.release_requested == 'true'
+        env:
+          APP_VERSION: ${{ needs.version.outputs.app_version }}
+        shell: pwsh
+        run: |
+          $existingTag = git ls-remote --tags origin "refs/tags/$env:APP_VERSION"
+          if ([string]::IsNullOrWhiteSpace($existingTag)) {
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag "$env:APP_VERSION"
+            git push origin "$env:APP_VERSION"
+          }
+
+      # ORDER MATTERS: vpk upload creates the published release with the Velopack assets
+      # (Setup.exe, *-full.nupkg, *-delta.nupkg, releases.win.json — what the in-app
+      # updater's GithubSource reads); softprops then finds that release by tag and
+      # appends the portable zip.
+      - name: Publish Velopack release to GitHub
+        if: needs.version.outputs.release_requested == 'true'
+        run: >-
+          vpk upload github
+          --repoUrl https://github.com/${{ github.repository }}
+          --publish
+          --releaseName "${{ needs.version.outputs.app_version }}"
+          --tag ${{ needs.version.outputs.app_version }}
+          --token ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach portable zip to GitHub Release
+        if: needs.version.outputs.release_requested == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.app_version }}
+          name: ${{ needs.version.outputs.app_version }}
+          files: artifacts/audio-router-matrix-win-x64-portable.zip
+          generate_release_notes: true
