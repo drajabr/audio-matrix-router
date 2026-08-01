@@ -135,6 +135,14 @@ public sealed class MatrixControl : Control
     private string? _hoverRowKey;
     private string? _hoverColKey;
 
+    // label-square resize drag (web grid-resize-handles: both axes write ONE value)
+    private static readonly Cursor ResizeCursor = new(StandardCursorType.SizeAll);
+    private const double ResizeGrip = 5;
+    private bool _resizingSquare;
+    private bool _resizeAxisX;
+    private Point _resizeStart;
+    private double _resizeStartSquare;
+
     // pan-scroll drag state (tile region)
     private bool _panActive;
     private bool _panning;
@@ -174,6 +182,10 @@ public sealed class MatrixControl : Control
             InvalidateVisual();
         }
     }
+
+    /// <summary>Raised live while dragging the label-square resize handles (the value
+    /// is the shared column-width == header-height, clamped to the theme limits).</summary>
+    public event EventHandler<double>? LabelSquareChanged;
 
     public event EventHandler<MatrixCellEvent>? CellToggled;
     public event EventHandler<MatrixCellGainEvent>? CellGainDelta;
@@ -365,9 +377,15 @@ public sealed class MatrixControl : Control
         ClampScroll(l);
         ComputeActiveDevices(m);
 
+        // The clip guards the header strips on the left/top only; on the right/bottom
+        // it extends past the control so the ON-tile glow (up to ~9px of soft rings)
+        // fades out naturally into the surrounding margin instead of being cut flat
+        // at the viewport edge.
+        const double GlowBleed = 10;
         var tileClip = new Rect(
             l.TilesOriginX, l.TilesOriginY,
-            Math.Max(0, size.Width - l.TilesOriginX), Math.Max(0, size.Height - l.TilesOriginY));
+            Math.Max(0, size.Width - l.TilesOriginX + GlowBleed),
+            Math.Max(0, size.Height - l.TilesOriginY + GlowBleed));
         if (tileClip.Width > 0 && tileClip.Height > 0)
         {
             using (context.PushClip(tileClip))
@@ -755,6 +773,24 @@ public sealed class MatrixControl : Control
         _pressPos = p;
         _suppressClick = false;
 
+        // label-square resize grips: the seams at x == LabelSquare and y == LabelSquare
+        // (both axes write the one shared value, web parity)
+        if (pt.Properties.IsLeftButtonPressed)
+        {
+            var nearX = Math.Abs(p.X - _labelSquare) <= ResizeGrip;
+            var nearY = Math.Abs(p.Y - _labelSquare) <= ResizeGrip;
+            if (nearX || nearY)
+            {
+                _resizingSquare = true;
+                _resizeAxisX = nearX;
+                _resizeStart = p;
+                _resizeStartSquare = _labelSquare;
+                e.Pointer.Capture(this);
+                e.Handled = true;
+                return;
+            }
+        }
+
         if (pt.Properties.IsMiddleButtonPressed)
         {
             if (hit.Kind == MatrixHitKind.Tile && !m.Locked &&
@@ -825,6 +861,22 @@ public sealed class MatrixControl : Control
 
         var p = e.GetCurrentPoint(this).Position;
 
+        if (_resizingSquare)
+        {
+            var d = _resizeAxisX ? p.X - _resizeStart.X : p.Y - _resizeStart.Y;
+            var next = Math.Clamp(_resizeStartSquare + d, AppTheme.LabelSquareMin, AppTheme.LabelSquareMax);
+            if (Math.Abs(next - _labelSquare) >= 0.5)
+            {
+                LabelSquare = next;
+                LabelSquareChanged?.Invoke(this, next);
+            }
+            return;
+        }
+
+        if (!_panActive && _headerDrag is null)
+            Cursor = (Math.Abs(p.X - _labelSquare) <= ResizeGrip || Math.Abs(p.Y - _labelSquare) <= ResizeGrip)
+                ? ResizeCursor : null;
+
         if (_panActive)
         {
             var delta = p - _pressPos;
@@ -879,6 +931,13 @@ public sealed class MatrixControl : Control
         base.OnPointerReleased(e);
         var m = _model;
         var l = _layout;
+
+        if (_resizingSquare)
+        {
+            _resizingSquare = false;
+            e.Pointer.Capture(null);
+            return;
+        }
 
         if (_headerDrag is { } hd)
         {
@@ -959,6 +1018,7 @@ public sealed class MatrixControl : Control
     protected override void OnPointerCaptureLost(PointerCaptureLostEventArgs e)
     {
         base.OnPointerCaptureLost(e);
+        _resizingSquare = false;
         _panActive = false;
         _panning = false;
         _headerDrag = null;

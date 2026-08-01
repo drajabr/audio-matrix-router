@@ -307,7 +307,7 @@
 
           <!-- quick style controls: always-visible button drawer (web .ui-quick-controls);
                each opens its category's picker panel below it -->
-          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6"
+          <StackPanel Name="QuickStrip" Grid.Column="2" Orientation="Horizontal" Spacing="6"
                       Margin="0,0,6,0" VerticalAlignment="Center"
                       chrome:WindowDecorationProperties.ElementRole="User">
             <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
@@ -336,14 +336,18 @@
       <Border DockPanel.Dock="Bottom" Background="{StaticResource Panel}"
               Name="DockBar"
               BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,1,0,0"
-              Padding="10,8" Height="131">
+              Padding="8" Height="131">
         <!-- Symmetry rule: dock content height = ONE device tile (2×54+6 = 114).
-             Cards, chip columns, metric groups and the route square all fill it.
+             Cards, chip columns, metric groups and the route square all fill it,
+             tops and bottoms flush. Every gap between neighbours is exactly one
+             8px spacer column (and 8px bar padding at the edges).
              131 = 114 content + 8+8 padding + 1 top border. -->
-        <Grid ColumnDefinitions="132,*,26,114,*,26,132">
+        <Grid ColumnDefinitions="132,8,*,8,24,8,114,8,24,8,*,8,132">
 
-          <!-- input-side metric tiles -->
-          <UniformGrid Grid.Column="0" Columns="2" Rows="2">
+          <!-- input-side metric tiles: the -3 margin cancels the tiles' own 3px
+               margin at the group's outside edges, so the 2×2 block sits flush
+               on the 132×114 cell while keeping 6px internal gaps -->
+          <UniformGrid Grid.Column="0" Columns="2" Rows="2" Margin="-3">
             <Border Classes="metric">
               <StackPanel>
                 <TextBlock Classes="metricLabel" Text="LATENCY" />
@@ -372,7 +376,7 @@
 
           <!-- source card: name/sub top-left over full-lane horizontal meters; the MASTER
                badge (20px vertical bar, rotated text) shows ONLY when the device is master -->
-          <Border Grid.Column="1" Name="SourceCard" Margin="8,0,4,0" CornerRadius="8"
+          <Border Grid.Column="2" Name="SourceCard" CornerRadius="8"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
                   Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
@@ -401,11 +405,11 @@
 
           <!-- detached source chip column: one bordered mini-key per channel, together
                filling the card's full height (each chip = one channel lane) -->
-          <Grid Grid.Column="2" Name="SourceChipsPanel" Width="24"
+          <Grid Grid.Column="4" Name="SourceChipsPanel" Width="24"
                 HorizontalAlignment="Center" VerticalAlignment="Stretch" />
 
           <!-- route indicator: device-tile-sized square key (114×114, the dock height) -->
-          <Border Grid.Column="3" Name="RouteBox" Width="114" CornerRadius="8"
+          <Border Grid.Column="6" Name="RouteBox" Width="114" CornerRadius="8"
                   HorizontalAlignment="Center" VerticalAlignment="Stretch"
                   BorderBrush="{StaticResource LineStrong}" BorderThickness="2"
                   Background="Transparent">
@@ -415,7 +419,7 @@
           </Border>
 
           <!-- destination card -->
-          <Border Grid.Column="4" Name="DestCard" Margin="4,0,8,0" CornerRadius="8"
+          <Border Grid.Column="8" Name="DestCard" CornerRadius="8"
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
                   Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
@@ -443,11 +447,11 @@
           </Border>
 
           <!-- detached destination chip column (full card height, one lane per channel) -->
-          <Grid Grid.Column="5" Name="DestChipsPanel" Width="24"
+          <Grid Grid.Column="10" Name="DestChipsPanel" Width="24"
                 HorizontalAlignment="Center" VerticalAlignment="Stretch" />
 
-          <!-- output-side metric tiles -->
-          <UniformGrid Grid.Column="6" Columns="2" Rows="2">
+          <!-- output-side metric tiles (same flush-edge trick as the input side) -->
+          <UniformGrid Grid.Column="12" Columns="2" Rows="2" Margin="-3">
             <Border Classes="metric">
               <StackPanel>
                 <TextBlock Classes="metricLabel" Text="LATENCY" />
@@ -501,14 +505,14 @@
                                   Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"
                                   PxPerStep="24" Suffix="dB" />
 
-            <!-- row 3: input-mode cycle -->
+            <!-- row 3: input-mode cycle (icon-only: 🎤 input · 🔊 loopback · ⇄ both) -->
             <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
-                    Content="BOTH" FontSize="{DynamicResource Fs2xs}" />
+                    Content="⇄" FontSize="{DynamicResource FsMd}" />
 
             <!-- row 4: show-all · transient mute (wide) · view toggle -->
             <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
             <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
-                    Grid.ColumnSpan="2" Content="🔈 MUTE" FontSize="{DynamicResource FsSm}" />
+                    Grid.ColumnSpan="2" Content="🔈" FontSize="{DynamicResource FsMd}" />
             <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
           </Grid>
         </Border>

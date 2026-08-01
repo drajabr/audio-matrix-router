@@ -241,7 +241,6 @@ public partial class MainWindow : Window
         _powerOn = _prefs.PowerOn;
         _labelSquare = Math.Clamp(_prefs.LabelSquare, AppTheme.LabelSquareMin, AppTheme.LabelSquareMax);
 
-        // TODO: label-square drag-resize — fixed from prefs for now.
         CornerBox.Width = _labelSquare;
         CornerBox.Height = _labelSquare;
         Matrix.LabelSquare = _labelSquare;
@@ -339,15 +338,15 @@ public partial class MainWindow : Window
         UpdateBtn.Click += async (_, _) => await HandleUpdateClickAsync();
         SetUpdateState(UpdateState.Idle);
 
-        PickBgBtn.Click += (_, _) => ShowPicker(PickBgBtn, AppTheme.BackgroundOptions,
+        PickBgBtn.Click += (_, _) => ShowPicker("bg", AppTheme.BackgroundOptions,
             () => _prefs.BackgroundKey, k => _prefs.BackgroundKey = k);
-        PickAccentBtn.Click += (_, _) => ShowPicker(PickAccentBtn, AppTheme.AccentOptions,
+        PickAccentBtn.Click += (_, _) => ShowPicker("accent", AppTheme.AccentOptions,
             () => _prefs.AccentKey, k => _prefs.AccentKey = k);
-        PickFontBtn.Click += (_, _) => ShowPicker(PickFontBtn, AppTheme.FontOptions,
+        PickFontBtn.Click += (_, _) => ShowPicker("font", AppTheme.FontOptions,
             () => _prefs.FontKey, k => _prefs.FontKey = k);
-        PickSizeBtn.Click += (_, _) => ShowPicker(PickSizeBtn, AppTheme.FontSizeOptions,
+        PickSizeBtn.Click += (_, _) => ShowPicker("size", AppTheme.FontSizeOptions,
             () => _prefs.FontSizeKey, k => _prefs.FontSizeKey = k);
-        PickScaleBtn.Click += (_, _) => ShowPicker(PickScaleBtn, AppTheme.UiScaleOptions,
+        PickScaleBtn.Click += (_, _) => ShowPicker("scale", AppTheme.UiScaleOptions,
             () => _prefs.UiScaleKey, k => _prefs.UiScaleKey = k);
         UpdateQuickButtons();
     }
@@ -536,8 +535,14 @@ public partial class MainWindow : Window
         ViewBtn.Classes.Set("active", _viewMode == "channel");
         ToolTip.SetTip(ViewBtn, _viewMode == "channel" ? "Switch to Device View" : "Switch to Channel View");
         MuteBtn.Classes.Set("danger", _mutedAll);
-        MuteBtn.Content = _mutedAll ? "🔇 MUTED" : "🔈 MUTE";
-        InputModeBtn.Content = _snapshot.InputDeviceMode.ToUpperInvariant();
+        MuteBtn.Content = _mutedAll ? "🔇" : "🔈";
+        ToolTip.SetTip(MuteBtn, _mutedAll ? "Unmute all outputs" : "Mute all outputs (transient)");
+        InputModeBtn.Content = _snapshot.InputDeviceMode switch
+        {
+            "input" => "🎤",
+            "loopback" => "🔊",
+            _ => "⇄",
+        };
         InputModeBtn.Classes.Set("active", _snapshot.InputDeviceMode == "both");
         ToolTip.SetTip(InputModeBtn, $"Input device list mode: {_snapshot.InputDeviceMode} (click to cycle)");
     }
@@ -579,17 +584,45 @@ public partial class MainWindow : Window
     // theme preset picker (gear)
     // =====================================================================
 
+    private Flyout? _pickerFlyout;
+    private string? _pickerCategory;
+    private string? _pickerDismissedCategory;
+    private int _pickerDismissedAt;
+
     /// <summary>
     /// Category picker panel, faithful to the web `.quick-control-picker`: a dark
     /// chassis panel with VERTICAL option rows — colored swatch square (or letter)
-    /// + preset name — the active row accent-highlighted. One panel per category,
-    /// anchored under its header button.
+    /// + preset name — the active row accent-highlighted. The panel is anchored
+    /// under the WHOLE quick-controls drawer and spans exactly its width, so every
+    /// category expands from the same integrated drawer edge (web parity).
     /// </summary>
-    private void ShowPicker(Control anchor, IReadOnlyList<AppTheme.PresetOption> options,
+    private void ShowPicker(string category, IReadOnlyList<AppTheme.PresetOption> options,
         Func<string> getCurrent, Action<string> setKey)
     {
-        var flyout = new Flyout { Placement = PlacementMode.BottomEdgeAlignedRight };
+        // toggle: clicking the open category's button closes its panel. With
+        // dismiss pass-through the light-dismiss fires BEFORE this click handler,
+        // so "same category dismissed a moment ago" also means toggle-close.
+        if (_pickerFlyout is { IsOpen: true } open)
+        {
+            open.Hide();
+            if (_pickerCategory == category) { _pickerCategory = null; return; }
+        }
+        else if (_pickerDismissedCategory == category &&
+                 unchecked(Environment.TickCount - _pickerDismissedAt) < 400)
+        {
+            _pickerDismissedCategory = null;
+            return;
+        }
+        _pickerCategory = category;
+
+        var flyout = new Flyout
+        {
+            Placement = PlacementMode.BottomEdgeAlignedRight,
+            OverlayDismissEventPassThrough = true, // click another drawer button = switch panel
+        };
         flyout.FlyoutPresenterClasses.Add("bare");
+        _pickerFlyout = flyout;
+        var drawerWidth = Math.Max(QuickStrip.Bounds.Width, 170);
 
         void Rebuild()
         {
@@ -661,10 +694,11 @@ public partial class MainWindow : Window
                 list.Children.Add(row);
             }
 
-            // dark chassis panel (web .quick-control-picker: panel bg, line border, radius 8)
+            // dark chassis panel (web .quick-control-picker: panel bg, line border,
+            // radius 8) spanning exactly the drawer's width
             flyout.Content = new Border
             {
-                MinWidth = 170,
+                Width = drawerWidth,
                 Background = new SolidColorBrush(AppTheme.Panel),
                 BorderBrush = new SolidColorBrush(AppTheme.Line),
                 BorderThickness = new Thickness(1),
@@ -679,7 +713,13 @@ public partial class MainWindow : Window
         }
 
         Rebuild();
-        flyout.ShowAt(anchor);
+        flyout.Closed += (_, _) =>
+        {
+            _pickerDismissedCategory = category;
+            _pickerDismissedAt = Environment.TickCount;
+            if (_pickerFlyout == flyout) _pickerCategory = null;
+        };
+        flyout.ShowAt(QuickStrip);
     }
 
     /// <summary>Refresh the header quick-button faces after a theme change.</summary>
@@ -736,6 +776,15 @@ public partial class MainWindow : Window
             _hoverRowKey = e.RowKey;
             _hoverColKey = e.ColKey;
             UpdateDockCards();
+        };
+        Matrix.LabelSquareChanged += (_, v) =>
+        {
+            // drag-resize of the label square: the corner block follows live,
+            // one shared value persisted (input column width == output row height)
+            _labelSquare = v;
+            CornerBox.Width = v;
+            CornerBox.Height = v;
+            _prefs.LabelSquare = v;
         };
     }
 

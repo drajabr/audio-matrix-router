@@ -146,3 +146,21 @@ jobs:
           --releaseName "${{ needs.version.outputs.app_version }}"
           --tag ${{ needs.version.outputs.app_version }}
           --token ${{ secrets.GITHUB_TOKEN }}
+
+      # Versioned Setup asset name so repeated downloads don't stack as "(1) (2)".
+      # Renamed AFTER vpk upload (vpk locates the Setup by its conventional name);
+      # the updater + delta baseline only ever read the .nupkg assets and
+      # releases.win.json, so the Setup asset name is free to change.
+      - name: Version the Setup asset name
+        if: needs.version.outputs.release_requested == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.app_version }}
+          VER: ${{ needs.version.outputs.app_version_number }}
+        run: |
+          $release = gh api "repos/${{ github.repository }}/releases/tags/$env:TAG" | ConvertFrom-Json
+          $setup = $release.assets | Where-Object { $_.name -eq 'AudioMatrixRouter-win-Setup.exe' }
+          if ($null -eq $setup) { Write-Error 'Setup asset not found on release'; exit 1 }
+          gh api -X PATCH "repos/${{ github.repository }}/releases/assets/$($setup.id)" -f name="AudioMatrixRouter-$env:VER-Setup.exe" | Out-Null
+          Write-Host "Renamed Setup asset to AudioMatrixRouter-$env:VER-Setup.exe"
