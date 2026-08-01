@@ -24,6 +24,11 @@ public partial class MainWindow : Window
     private UiSnapshot _snapshot = new();
     private MatrixModel? _model;
     private readonly Dictionary<string, float[]> _peaksByDevice = new();
+    private readonly AutoScaleTracker _autoScale = new();
+    private readonly LatencySmoother _inLatencySmooth = new();
+    private readonly LatencySmoother _outLatencySmooth = new();
+    private readonly LatencySmoother _totalLatencySmooth = new();
+    private readonly JitterSmoother _jitterSmooth = new();
 
     // Cell state the snapshot cannot carry: gain/phase staged on cells that are
     // currently OFF (no route exists to derive them from).
@@ -65,6 +70,7 @@ public partial class MainWindow : Window
 
         _prefs = new UiPreferences(_controller);
         ApplyPreferences();
+        RestoreWindowPlacement();
 
         _controller.StateChanged += OnStateChanged;
 
@@ -162,6 +168,28 @@ public partial class MainWindow : Window
         catch { /* best-effort */ }
         try { _controller.Dispose(); }
         catch { /* best-effort */ }
+    }
+
+    private void RestoreWindowPlacement()
+    {
+        try
+        {
+            var (x, y, w, h, _) = _controller.GetWindowBounds();
+            if (w > 300 && h > 200)
+            {
+                Width = w;
+                Height = h;
+                if (x > int.MinValue && y > int.MinValue && x > -10000 && y > -10000 && (x != 0 || y != 0))
+                {
+                    WindowStartupLocation = WindowStartupLocation.Manual;
+                    Position = new PixelPoint(x, y);
+                }
+            }
+        }
+        catch
+        {
+            // Bad persisted geometry must never block startup.
+        }
     }
 
     private void KickBoundsSave()
@@ -894,54 +922,148 @@ public partial class MainWindow : Window
         try { metrics = _controller.GetMetrics(); }
         catch { return; }
 
-        // Peaks into the model arrays (display curve pow 0.72 — App.jsx shapeMeterLevel).
-        CopyPeaks(metrics.Inputs);
-        CopyPeaks(metrics.Outputs);
+        // Peaks into the model arrays: auto-scale per device, then the pow-0.72 display
+        // curve (App.jsx autoScaleLevels + shapeMeterLevel).
+        CopyPeaks(metrics.Inputs, "in");
+        CopyPeaks(metrics.Outputs, "out");
         Matrix.RefreshPeaks();
 
-        // TODO: latency/jitter EMA display smoothing (App.jsx updateLatencyDisplay,
-        // α=0.1 / 1.2ms threshold / 900ms min interval) — raw values for the shell.
-        MetricInLatency.Text = FormatMs(metrics.InputLatencyMs);
-        MetricInJitter.Text = FormatMs(metrics.InputJitterMs);
+        // Latency EMA display smoothing (App.jsx updateLatencyDisplay: α=0.1, 1.2ms step
+        // threshold, 900ms min update, 6s null grace) — kills digit flicker at 10Hz.
+        MetricInLatency.Text = _inLatencySmooth.Format(metrics.InputLatencyMs);
+        MetricInJitter.Text = _jitterSmooth.Format(metrics.InputJitterMs);
         MetricInOverflows.Text = metrics.Inputs.Sum(d => d.Overflows).ToString();
         MetricInDrops.Text = metrics.Inputs.Sum(d => d.DroppedFrames).ToString();
-        MetricOutLatency.Text = FormatMs(metrics.OutputLatencyMs);
+        MetricOutLatency.Text = _outLatencySmooth.Format(metrics.OutputLatencyMs);
         MetricOutSync.Text = metrics.Outputs.Sum(d => d.SyncCorrections).ToString();
         MetricOutUnderruns.Text = metrics.Outputs.Sum(d => d.Underruns).ToString();
         MetricOutDrops.Text = metrics.Outputs.Sum(d => d.DroppedFrames).ToString();
 
         StatusText.Text = metrics.Running
-            ? $"Running · {(metrics.TotalLatencyMs is { } total ? total.ToString("0.0") : "--")}ms"
+            ? $"Running · {_totalLatencySmooth.Format(metrics.TotalLatencyMs)}"
             : "Standby";
 
         // Dock card meters follow the detail pair.
         var (sourceId, destId) = ResolveDetailPair();
-        SourceMeters.SetLevels(ShapedLevels(metrics.Inputs, sourceId));
-        DestMeters.SetLevels(ShapedLevels(metrics.Outputs, destId));
+        SourceMeters.SetLevels(ShapedLevels(metrics.Inputs, sourceId, "in"));
+        DestMeters.SetLevels(ShapedLevels(metrics.Outputs, destId, "out"));
     }
 
-    private void CopyPeaks(List<DeviceMetrics> deviceMetrics)
+    private void CopyPeaks(List<DeviceMetrics> deviceMetrics, string prefix)
     {
         foreach (var dm in deviceMetrics)
         {
             if (!_peaksByDevice.TryGetValue(dm.DeviceId, out var target)) continue;
+            var raw = new float[target.Length];
+            for (var i = 0; i < raw.Length; i++)
+                raw[i] = i < dm.PeakLevels.Length ? dm.PeakLevels[i] : 0f;
+            _autoScale.Scale($"{prefix}:{dm.DeviceId}", raw);
             for (var i = 0; i < target.Length; i++)
-                target[i] = i < dm.PeakLevels.Length ? ShapeMeterLevel(dm.PeakLevels[i]) : 0f;
+                target[i] = ShapeMeterLevel(raw[i]);
         }
     }
 
     private static float ShapeMeterLevel(float value) =>
         (float)Math.Clamp(Math.Pow(Math.Clamp(value, 0f, 1f), 0.72), 0, 1);
 
-    private static IReadOnlyList<double> ShapedLevels(List<DeviceMetrics> metrics, string? deviceId)
+    private IReadOnlyList<double> ShapedLevels(List<DeviceMetrics> metrics, string? deviceId, string prefix)
     {
         if (deviceId is null) return [];
         var dm = metrics.FirstOrDefault(m => m.DeviceId == deviceId);
         if (dm is null) return [];
-        return dm.PeakLevels.Select(p => (double)ShapeMeterLevel(p)).ToList();
+        var raw = (float[])dm.PeakLevels.Clone();
+        _autoScale.Scale($"{prefix}-dock:{deviceId}", raw);
+        return raw.Select(p => (double)ShapeMeterLevel(p)).ToList();
     }
 
     private static string FormatMs(double? value) => value is { } v ? $"{v:0.0}ms" : "--";
+
+    /// <summary>App.jsx updateLatencyDisplay port: EMA α=0.1, shows a new value only when
+    /// it moved ≥1.2ms or 900ms elapsed; a missing value survives a 6s grace period.</summary>
+    private sealed class LatencySmoother
+    {
+        private double? _smooth;
+        private double? _shown;
+        private long _shownAt;
+        private long _missingSince;
+
+        public string Format(double? value)
+        {
+            var now = Environment.TickCount64;
+            if (value is not { } v)
+            {
+                if (_missingSince == 0) _missingSince = now;
+                if (now - _missingSince < 6000 && _shown is { } held) return $"{held:0.0}ms";
+                _smooth = null;
+                _shown = null;
+                return "--";
+            }
+
+            _missingSince = 0;
+            _smooth = _smooth is { } s ? s * 0.9 + v * 0.1 : v;
+            var display = Math.Round(_smooth.Value, 1);
+            if (_shown is not { } last || Math.Abs(display - last) >= 1.2 || now - _shownAt >= 900)
+            {
+                _shown = display;
+                _shownAt = now;
+            }
+            return $"{_shown:0.0}ms";
+        }
+    }
+
+    /// <summary>App.jsx updateJitterDisplay port: update on ≥0.4ms change or every 320ms.</summary>
+    private sealed class JitterSmoother
+    {
+        private double? _shown;
+        private long _shownAt;
+
+        public string Format(double? value)
+        {
+            if (value is not { } v)
+            {
+                _shown = null;
+                return "--";
+            }
+            var now = Environment.TickCount64;
+            var rounded = Math.Round(v, 1);
+            if (_shown is not { } last || Math.Abs(rounded - last) >= 0.4 || now - _shownAt >= 320)
+            {
+                _shown = rounded;
+                _shownAt = now;
+            }
+            return $"{_shown:0.0}ms";
+        }
+    }
+
+    /// <summary>App.jsx autoScaleLevels port: adaptive floor/peak tracker per device so
+    /// quiet sources still animate and loud ones don't pin the bars.</summary>
+    private sealed class AutoScaleTracker
+    {
+        private readonly Dictionary<string, (double Floor, double Peak)> _map = new();
+
+        public void Scale(string key, float[] levels)
+        {
+            if (levels.Length == 0) return;
+            var (floor, peak) = _map.TryGetValue(key, out var t) ? t : (0.003, 0.1);
+
+            double obsPeak = 0, obsFloor = 1;
+            foreach (var l in levels)
+            {
+                var c = Math.Clamp(l, 0f, 1f);
+                if (c > obsPeak) obsPeak = c;
+                if (c < obsFloor) obsFloor = c;
+            }
+
+            peak = obsPeak > peak ? peak + (obsPeak - peak) * 0.32 : Math.Max(obsPeak, peak * 0.975);
+            floor = obsFloor < floor ? floor + (obsFloor - floor) * 0.18 : Math.Min(obsFloor, floor * 1.015 + 0.0002);
+
+            var range = Math.Clamp(peak - floor, 0.035, 0.7);
+            _map[key] = (floor, floor + range);
+
+            for (var i = 0; i < levels.Length; i++)
+                levels[i] = (float)Math.Clamp((Math.Clamp(levels[i], 0f, 1f) - floor) / range, 0, 1);
+        }
+    }
 
     // =====================================================================
     // dock cards (hovered route, falling back to the master pair)

@@ -374,6 +374,11 @@ public sealed class AppController : IDisposable
         _startMinimized = startMinimized;
     }
 
+    /// <summary>Last persisted window geometry (seeded from config at Initialize) so the
+    /// host can restore its placement.</summary>
+    public (int X, int Y, int W, int H, bool StartMinimized) GetWindowBounds() =>
+        (_winX, _winY, _winW, _winH, _startMinimized);
+
     // ---------------------------------------------------------------- snapshots
 
     private void RaiseStateChanged()

@@ -2,6 +2,29 @@ $ErrorActionPreference = 'Stop'
 
 Set-Location $PSScriptRoot
 
+# Toolchain bootstrap: this machine keeps the .NET SDK in ~\.dotnet and Node.js in
+# Program Files; neither is necessarily on PATH in a fresh (or elevated) shell.
+# NOTE: a dotnet.exe on PATH is not enough — C:\Program Files\dotnet may be a
+# runtime-only install with zero SDKs, so probe for an actual SDK.
+$hasSdk = $false
+try {
+  $sdks = & dotnet --list-sdks 2>$null
+  $hasSdk = ($LASTEXITCODE -eq 0) -and $sdks
+} catch { $hasSdk = $false }
+if (-not $hasSdk) {
+  $userDotnet = Join-Path $env:USERPROFILE '.dotnet'
+  if (Test-Path (Join-Path $userDotnet 'dotnet.exe')) {
+    $env:Path = "$userDotnet;$env:Path"
+    $env:DOTNET_ROOT = $userDotnet
+  }
+}
+if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+  $nodeDir = Join-Path $env:ProgramFiles 'nodejs'
+  if (Test-Path (Join-Path $nodeDir 'npm.cmd')) {
+    $env:Path = "$nodeDir;$env:Path"
+  }
+}
+
 $buildRoot = Join-Path $PSScriptRoot 'build'
 $desktopOut = Join-Path $buildRoot 'desktop'
 $webUiPath = Join-Path $PSScriptRoot 'AudioMatrixRouter\WebUI'
@@ -10,7 +33,7 @@ $desktopConfigPath = Join-Path $desktopOut 'config.json'
 $preservedConfig = $null
 
 Write-Host 'Stopping running desktop processes...'
-$appPids = @((Get-Process AudioMatrixRouter -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id))
+$appPids = @((Get-Process AudioMatrixRouter, AudioMatrixRouter.App -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id))
 $processSnapshot = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
 $descendantPids = @()
 
@@ -73,7 +96,9 @@ Write-Host "App version: $appVersion"
 dotnet clean $desktopProject -c Release
 # NOTE: PublishSingleFile removed — Velopack packages the whole publish directory and
 # recommends a plain multi-file self-contained publish.
-dotnet publish $desktopProject -c Release -r win-x64 --self-contained true -o $desktopOut -p:PublishTrimmed=false -p:Platform=x64 -p:UseSharedCompilation=false -p:Version=$appVersion -t:Rebuild
+# (-t:Rebuild removed: it breaks publish target ordering with project references;
+#  the dotnet clean above already guarantees freshness.)
+dotnet publish $desktopProject -c Release -r win-x64 --self-contained true -o $desktopOut -p:PublishTrimmed=false -p:Platform=x64 -p:UseSharedCompilation=false -p:Version=$appVersion
 if ($LASTEXITCODE -ne 0) {
   Write-Host 'ERROR: dotnet publish failed.'
   exit 1
@@ -91,6 +116,22 @@ if ($null -ne $preservedConfig -and -not (Test-Path $desktopConfigPath)) {
 Write-Host 'Removing nested build trees from desktop output...'
 @('Release', 'Debug', 'x64') | ForEach-Object {
   $nested = Join-Path $desktopOut $_
+  if (Test-Path $nested) {
+    Remove-Item $nested -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+
+Write-Host 'Publishing Avalonia app...'
+$avaloniaOut = Join-Path $buildRoot 'avalonia'
+dotnet publish (Join-Path $PSScriptRoot 'AudioMatrixRouter.App\AudioMatrixRouter.App.csproj') -c Release -r win-x64 --self-contained true -o $avaloniaOut -p:PublishTrimmed=false -p:Platform=x64 -p:Version=$appVersion -p:UseSharedCompilation=false
+if ($LASTEXITCODE -ne 0) {
+  Write-Host 'ERROR: Avalonia publish failed.'
+  exit 1
+}
+# Tray icon looks for app.ico beside the exe.
+Copy-Item (Join-Path $PSScriptRoot 'AudioMatrixRouter\app.ico') $avaloniaOut -Force -ErrorAction SilentlyContinue
+@('Release', 'Debug', 'x64') | ForEach-Object {
+  $nested = Join-Path $avaloniaOut $_
   if (Test-Path $nested) {
     Remove-Item $nested -Recurse -Force -ErrorAction SilentlyContinue
   }
