@@ -323,12 +323,64 @@
         </Grid>
       </Border>
 
-      <!-- ===== Dock (§3.6): metrics | source card | chips | route | dest card | chips | metrics ===== -->
-      <!-- transparent, borderless bar: the window background runs through header,
-           matrix and dock as one surface; the items inside carry their own chrome -->
-      <Border DockPanel.Dock="Bottom" Background="Transparent"
-              Name="DockBar"
-              Padding="8" Height="130">
+      <!-- ===== Dock (§3.6) — see the floating overlay below the DockPanel; it is
+           NOT docked here, so it steals no layout space from the matrix. ===== -->
+
+
+      <!-- ===== Main area: the matrix, with the corner control block overlaid on its
+           label square (top-left, LabelSquare × LabelSquare, 4×4 map per §3.2). ===== -->
+      <Panel Name="MainArea" Margin="12">
+        <controls:MatrixControl Name="Matrix" />
+
+        <Border Name="CornerBox" HorizontalAlignment="Left" VerticalAlignment="Top"
+                Width="224" Height="224" CornerRadius="8" Padding="3"
+                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                Background="{StaticResource CornerBg}">
+          <Grid Name="CornerGrid"
+                RowDefinitions="*,*,*,*" ColumnDefinitions="*,*,*,*">
+            <!-- row 1: power · single BUFFER drum (drives OUT; IN derived) · lock -->
+            <Button Name="PowerBtn" Classes="key" Grid.Row="0" Grid.Column="0" Content="⏻" />
+            <controls:DrumControl Name="OutDrum" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Margin="2"
+                                  Minimum="10" Maximum="200" Step="5" DefaultValue="40"
+                                  PxPerStep="10" Caption="BUFFER" />
+            <Button Name="LockBtn" Classes="key" Grid.Row="0" Grid.Column="3" Content="🔓" />
+
+            <!-- row 2: reload · master gain drum (2×2, big value + small dB suffix) -->
+            <Button Name="ReloadBtn" Classes="key" Grid.Row="1" Grid.Column="0" Content="↻" />
+            <controls:DrumControl Name="GainDrum" Grid.Row="1" Grid.Column="1"
+                                  Grid.RowSpan="2" Grid.ColumnSpan="2" Margin="2"
+                                  Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"
+                                  PxPerStep="24" Suffix="dB" />
+
+            <!-- row 3: input-mode cycle (icon-only: 🎤 input · 🔊 loopback · ⇄ both) -->
+            <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
+                    Content="⇄" FontSize="{DynamicResource FsMd}" />
+
+            <!-- row 4: show-all · transient mute (wide) · view toggle -->
+            <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
+            <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
+                    Grid.ColumnSpan="2" Content="🔊" FontSize="{DynamicResource FsMd}" />
+            <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
+          </Grid>
+        </Border>
+
+        <!-- transient error banner (4s), fed by SetRoutes route errors etc. -->
+        <Border Name="Banner" IsVisible="False" HorizontalAlignment="Center"
+                VerticalAlignment="Top" Margin="0,10,0,0" CornerRadius="6"
+                Background="#F03C1111" BorderBrush="#EF4444" BorderThickness="1"
+                Padding="14,7" MaxWidth="720" ZIndex="10">
+          <TextBlock Name="BannerText" Foreground="#F6D9D9"
+                     FontSize="{DynamicResource FsXs}"
+                     TextWrapping="Wrap" />
+        </Border>
+      </Panel>
+    </DockPanel>
+
+    <!-- The dock FLOATS over the matrix instead of being docked: it reserves no
+         layout space, so tiles, headers and the corner block keep rendering
+         behind it and nothing at the bottom cuts the matrix off. -->
+    <Border Name="DockBar" VerticalAlignment="Bottom" Background="Transparent"
+            Padding="8" Height="130">
         <!-- Symmetry rule: dock content height = ONE device tile (2×54+6 = 114).
              Cards, chip columns, metric groups and the route square all fill it,
              tops and bottoms flush. Every gap between neighbours is exactly one
@@ -368,10 +420,9 @@
 
           <!-- source card: name/sub top-left over full-lane horizontal meters; the MASTER
                badge (20px vertical bar, rotated text) shows ONLY when the device is master -->
-          <!-- no card fill or outline: the meters, name and MASTER badge float
-               directly on the window background (nothing in the dock is a panel) -->
           <Border Grid.Column="2" Name="SourceCard" CornerRadius="8"
-                  Background="Transparent" ClipToBounds="True">
+                  BorderBrush="{StaticResource Line}" BorderThickness="1"
+                  Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
               <controls:MeterBars Name="SourceMeters" Horizontal="True" Margin="4" />
               <Border Name="SourceMasterBadge" Classes="masterBadge" IsVisible="False">
@@ -413,7 +464,8 @@
 
           <!-- destination card -->
           <Border Grid.Column="8" Name="DestCard" CornerRadius="8"
-                  Background="Transparent" ClipToBounds="True">
+                  BorderBrush="{StaticResource Line}" BorderThickness="1"
+                  Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
               <controls:MeterBars Name="DestMeters" Horizontal="True" Margin="4" />
               <Border Name="DestMasterBadge" Classes="masterBadge" IsVisible="False">
@@ -471,55 +523,6 @@
           </UniformGrid>
         </Grid>
       </Border>
-
-      <!-- ===== Main area: the matrix, with the corner control block overlaid on its
-           label square (top-left, LabelSquare × LabelSquare, 4×4 map per §3.2). ===== -->
-      <Panel Name="MainArea" Margin="12">
-        <controls:MatrixControl Name="Matrix" />
-
-        <Border Name="CornerBox" HorizontalAlignment="Left" VerticalAlignment="Top"
-                Width="224" Height="224" CornerRadius="8" Padding="3"
-                BorderBrush="{StaticResource Line}" BorderThickness="1"
-                Background="{StaticResource CornerBg}">
-          <Grid Name="CornerGrid"
-                RowDefinitions="*,*,*,*" ColumnDefinitions="*,*,*,*">
-            <!-- row 1: power · single BUFFER drum (drives OUT; IN derived) · lock -->
-            <Button Name="PowerBtn" Classes="key" Grid.Row="0" Grid.Column="0" Content="⏻" />
-            <controls:DrumControl Name="OutDrum" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Margin="2"
-                                  Minimum="10" Maximum="200" Step="5" DefaultValue="40"
-                                  PxPerStep="10" Caption="BUFFER" />
-            <Button Name="LockBtn" Classes="key" Grid.Row="0" Grid.Column="3" Content="🔓" />
-
-            <!-- row 2: reload · master gain drum (2×2, big value + small dB suffix) -->
-            <Button Name="ReloadBtn" Classes="key" Grid.Row="1" Grid.Column="0" Content="↻" />
-            <controls:DrumControl Name="GainDrum" Grid.Row="1" Grid.Column="1"
-                                  Grid.RowSpan="2" Grid.ColumnSpan="2" Margin="2"
-                                  Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"
-                                  PxPerStep="24" Suffix="dB" />
-
-            <!-- row 3: input-mode cycle (icon-only: 🎤 input · 🔊 loopback · ⇄ both) -->
-            <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
-                    Content="⇄" FontSize="{DynamicResource FsMd}" />
-
-            <!-- row 4: show-all · transient mute (wide) · view toggle -->
-            <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
-            <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
-                    Grid.ColumnSpan="2" Content="🔊" FontSize="{DynamicResource FsMd}" />
-            <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
-          </Grid>
-        </Border>
-
-        <!-- transient error banner (4s), fed by SetRoutes route errors etc. -->
-        <Border Name="Banner" IsVisible="False" HorizontalAlignment="Center"
-                VerticalAlignment="Top" Margin="0,10,0,0" CornerRadius="6"
-                Background="#F03C1111" BorderBrush="#EF4444" BorderThickness="1"
-                Padding="14,7" MaxWidth="720" ZIndex="10">
-          <TextBlock Name="BannerText" Foreground="#F6D9D9"
-                     FontSize="{DynamicResource FsXs}"
-                     TextWrapping="Wrap" />
-        </Border>
-      </Panel>
-    </DockPanel>
 
     <!-- click-anywhere backdrop that collapses the drawer again -->
     <Border Name="PickerBackdrop" IsVisible="False" Background="Transparent"
