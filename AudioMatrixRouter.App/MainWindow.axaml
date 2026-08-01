@@ -1,124 +1,54 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:chrome="using:Avalonia.Controls.Chrome"
+        xmlns:controls="using:AudioMatrixRouter.App.Controls"
         x:Class="AudioMatrixRouter.App.MainWindow"
-        Title="Audio Router Matrix"
-        Width="1100" Height="720"
+        Title="Audio Matrix Router"
+        Width="1280" Height="820"
         MinWidth="900" MinHeight="600"
         Background="#101113"
+        FontFamily="Consolas,Cascadia Mono,monospace"
         WindowDecorations="BorderOnly"
         ExtendClientAreaToDecorationsHint="True"
         ExtendClientAreaTitleBarHeightHint="-1">
 
+  <!-- Design tokens (static mirror of Theme.cs; TODO: theme preset pickers swap these
+       via a ThemeService — docs/DESIGN-REFERENCE.md §2). -->
   <Window.Resources>
-    <!-- Design tokens — see docs/DESIGN-REFERENCE.md §2. Placeholder set; the full
-         ThemeService (preset mixing) replaces these static values. -->
     <SolidColorBrush x:Key="Bg" Color="#101113" />
     <SolidColorBrush x:Key="Surface" Color="#1A1D22" />
     <SolidColorBrush x:Key="Panel" Color="#16181D" />
     <SolidColorBrush x:Key="Line" Color="#39404D" />
+    <SolidColorBrush x:Key="LineStrong" Color="#555B66" />
     <SolidColorBrush x:Key="Text" Color="#DBE0E8" />
+    <SolidColorBrush x:Key="TextStrong" Color="#DEE3EA" />
     <SolidColorBrush x:Key="Muted" Color="#9AA4B2" />
     <SolidColorBrush x:Key="Accent" Color="#2DD4BF" />
-    <SolidColorBrush x:Key="AccentDim" Color="#12332F" />
-    <SolidColorBrush x:Key="AccentLine" Color="#2B6F66" />
+    <SolidColorBrush x:Key="AccentHl" Color="#77F0DF" />
+    <SolidColorBrush x:Key="TextOnAccent" Color="#0D0E10" />
+    <SolidColorBrush x:Key="Danger" Color="#EF4444" />
+
+    <!-- key faces: surface +8% white → panel −14% black; lit face per §3.2 -->
+    <LinearGradientBrush x:Key="KeyFace" StartPoint="0%,0%" EndPoint="0%,100%">
+      <GradientStop Color="#2C2F34" Offset="0" />
+      <GradientStop Color="#131519" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="KeyFaceHover" StartPoint="0%,0%" EndPoint="0%,100%">
+      <GradientStop Color="#33373D" Offset="0" />
+      <GradientStop Color="#17191E" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="AccentFace" StartPoint="0%,0%" EndPoint="0%,100%">
+      <GradientStop Color="#8DF2E4" Offset="0" />
+      <GradientStop Color="#29C3B0" Offset="1" />
+    </LinearGradientBrush>
+    <LinearGradientBrush x:Key="DangerFace" StartPoint="0%,0%" EndPoint="0%,100%">
+      <GradientStop Color="#5A292C" Offset="0" />
+      <GradientStop Color="#3C1111" Offset="1" />
+    </LinearGradientBrush>
   </Window.Resources>
 
-  <DockPanel>
-    <!-- ===== Header IS the title bar (constraint #3). Avalonia 12 element roles:
-         TitleBar gives native drag + double-click-maximize; interactive children
-         opt out with the User role. ===== -->
-    <Border DockPanel.Dock="Top" Background="{StaticResource Panel}"
-            BorderBrush="#23272E" BorderThickness="0,0,0,1"
-            Name="HeaderBar" MinHeight="56"
-            chrome:WindowDecorationProperties.ElementRole="TitleBar">
-      <Grid ColumnDefinitions="Auto,*,Auto,Auto">
-
-        <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12"
-                    Margin="16,0,0,0" VerticalAlignment="Center">
-          <!-- brand grid icon -->
-          <UniformGrid Columns="3" Rows="3" Width="24" Height="24">
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
-            <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" />
-          </UniformGrid>
-
-          <StackPanel Spacing="2" VerticalAlignment="Center">
-            <StackPanel Orientation="Horizontal" Spacing="8">
-              <TextBlock Text="AUDIO MATRIX PATCH" FontSize="14" FontWeight="SemiBold"
-                         LetterSpacing="0.8" Foreground="{StaticResource Text}" />
-              <Border CornerRadius="999" BorderBrush="{StaticResource AccentLine}"
-                      BorderThickness="1" Background="{StaticResource AccentDim}"
-                      Padding="8,2" VerticalAlignment="Center">
-                <TextBlock Name="VersionText" Text="v0.0.0" FontSize="10" FontWeight="Bold"
-                           Foreground="#BFE9E2" />
-              </Border>
-            </StackPanel>
-            <TextBlock Name="StatusText" Text="Standby" FontSize="11"
-                       Foreground="{StaticResource Muted}" />
-          </StackPanel>
-        </StackPanel>
-
-        <!-- empty space = drag region (wired in code-behind) -->
-        <Border Grid.Column="1" Background="Transparent" Name="DragRegion" />
-
-        <Border Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
-                VerticalAlignment="Center" CornerRadius="7"
-                BorderBrush="{StaticResource Line}" BorderThickness="1"
-                Background="{StaticResource Surface}">
-          <TextBlock Text="⚙" FontSize="14" Foreground="{StaticResource Muted}"
-                     HorizontalAlignment="Center" VerticalAlignment="Center" />
-        </Border>
-
-        <!-- caption buttons -->
-        <StackPanel Grid.Column="3" Orientation="Horizontal"
-                    chrome:WindowDecorationProperties.ElementRole="User">
-          <Button Name="MinButton" Classes="caption" Content="—" />
-          <Button Name="MaxButton" Classes="caption" Content="▢" />
-          <Button Name="CloseButton" Classes="caption close" Content="✕" />
-        </StackPanel>
-      </Grid>
-    </Border>
-
-    <!-- ===== Body: Core-linkage proof — live device enumeration ===== -->
-    <Border Padding="16">
-      <Grid RowDefinitions="Auto,*" ColumnDefinitions="*,*">
-        <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Margin="0,0,0,12"
-                   Foreground="{StaticResource Muted}" FontSize="12" TextWrapping="Wrap"
-                   Text="Avalonia scaffold — engine linked from AudioMatrixRouter.Core. Next: MatrixControl / DrumControl / MeterBars / HeaderStrip per docs/AVALONIA-MIGRATION.md §2.2." />
-
-        <Border Grid.Row="1" Grid.Column="0" Margin="0,0,8,0"
-                Background="{StaticResource Surface}" BorderBrush="{StaticResource Line}"
-                BorderThickness="1" CornerRadius="8" Padding="12">
-          <DockPanel>
-            <TextBlock DockPanel.Dock="Top" Text="INPUT DEVICES" FontSize="11"
-                       FontWeight="Bold" LetterSpacing="0.6"
-                       Foreground="{StaticResource Muted}" Margin="0,0,0,8" />
-            <ItemsControl Name="InputList" />
-          </DockPanel>
-        </Border>
-
-        <Border Grid.Row="1" Grid.Column="1" Margin="8,0,0,0"
-                Background="{StaticResource Surface}" BorderBrush="{StaticResource Line}"
-                BorderThickness="1" CornerRadius="8" Padding="12">
-          <DockPanel>
-            <TextBlock DockPanel.Dock="Top" Text="OUTPUT DEVICES" FontSize="11"
-                       FontWeight="Bold" LetterSpacing="0.6"
-                       Foreground="{StaticResource Muted}" Margin="0,0,0,8" />
-            <ItemsControl Name="OutputList" />
-          </DockPanel>
-        </Border>
-      </Grid>
-    </Border>
-  </DockPanel>
-
   <Window.Styles>
+    <!-- caption buttons -->
     <Style Selector="Button.caption">
       <Setter Property="Width" Value="44" />
       <Setter Property="Height" Value="56" />
@@ -137,5 +67,341 @@
       <Setter Property="Background" Value="#B1332C" />
       <Setter Property="Foreground" Value="White" />
     </Style>
+
+    <!-- corner key-face buttons (§3.2) -->
+    <Style Selector="Button.key">
+      <Setter Property="Margin" Value="2" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="HorizontalAlignment" Value="Stretch" />
+      <Setter Property="VerticalAlignment" Value="Stretch" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="Background" Value="{StaticResource KeyFace}" />
+      <Setter Property="Foreground" Value="{StaticResource Text}" />
+      <Setter Property="BorderBrush" Value="{StaticResource LineStrong}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="FontSize" Value="16" />
+      <Setter Property="FontWeight" Value="Bold" />
+    </Style>
+    <Style Selector="Button.key:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource KeyFaceHover}" />
+      <Setter Property="Foreground" Value="{StaticResource TextStrong}" />
+    </Style>
+    <Style Selector="Button.key:pressed /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#101216" />
+    </Style>
+    <Style Selector="Button.key.active">
+      <Setter Property="Background" Value="{StaticResource AccentFace}" />
+      <Setter Property="Foreground" Value="{StaticResource TextOnAccent}" />
+      <Setter Property="BorderBrush" Value="#4FDBC9" />
+    </Style>
+    <Style Selector="Button.key.active:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource AccentFace}" />
+      <Setter Property="Foreground" Value="{StaticResource TextOnAccent}" />
+    </Style>
+    <Style Selector="Button.key.danger">
+      <Setter Property="Background" Value="{StaticResource DangerFace}" />
+      <Setter Property="Foreground" Value="#F4B9B9" />
+      <Setter Property="BorderBrush" Value="#944249" />
+    </Style>
+    <Style Selector="Button.key.danger:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="{StaticResource DangerFace}" />
+      <Setter Property="Foreground" Value="#F4B9B9" />
+    </Style>
+
+    <!-- header pills (version / update) -->
+    <Style Selector="Button.pill">
+      <Setter Property="MinWidth" Value="46" />
+      <Setter Property="MinHeight" Value="22" />
+      <Setter Property="Padding" Value="9,2" />
+      <Setter Property="CornerRadius" Value="999" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="BorderBrush" Value="#338784" />
+      <Setter Property="Background" Value="#1D3A3B" />
+      <Setter Property="Foreground" Value="#D3E1E7" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+    <Style Selector="Button.pill:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Background" Value="#215B57" />
+      <Setter Property="Foreground" Value="#77F0DF" />
+    </Style>
+    <Style Selector="Button.pill.actionable">
+      <Setter Property="Background" Value="#215B57" />
+      <Setter Property="Foreground" Value="#77F0DF" />
+      <Setter Property="BorderBrush" Value="#2DD4BF" />
+    </Style>
+
+    <!-- dock metric tiles (§3.6) -->
+    <Style Selector="Border.metric">
+      <Setter Property="Margin" Value="1" />
+      <Setter Property="Padding" Value="6,3" />
+      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="BorderBrush" Value="{StaticResource Line}" />
+      <Setter Property="Background" Value="{StaticResource KeyFace}" />
+    </Style>
+    <Style Selector="TextBlock.metricLabel">
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="Foreground" Value="{StaticResource Muted}" />
+      <Setter Property="LetterSpacing" Value="0.6" />
+    </Style>
+    <Style Selector="TextBlock.metricValue">
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="Foreground" Value="{StaticResource TextStrong}" />
+    </Style>
   </Window.Styles>
+
+  <Panel>
+    <!-- window background aurora: radial accent glow at top-left (§3.7) -->
+    <Border IsHitTestVisible="False">
+      <Border.Background>
+        <RadialGradientBrush Center="10%,0%" GradientOrigin="10%,0%" RadiusX="55%" RadiusY="55%">
+          <GradientStop Color="#292DD4BF" Offset="0" />
+          <GradientStop Color="#002DD4BF" Offset="1" />
+        </RadialGradientBrush>
+      </Border.Background>
+    </Border>
+
+    <DockPanel>
+      <!-- ===== Header IS the title bar. Avalonia 12 element roles: TitleBar gives
+           native drag + double-click-maximize; interactive children opt out with the
+           User role. ===== -->
+      <Border DockPanel.Dock="Top" Background="{StaticResource Panel}"
+              BorderBrush="#23272E" BorderThickness="0,0,0,1"
+              Name="HeaderBar" MinHeight="56"
+              chrome:WindowDecorationProperties.ElementRole="TitleBar">
+        <Grid ColumnDefinitions="Auto,*,Auto,Auto">
+
+          <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="12"
+                      Margin="16,0,0,0" VerticalAlignment="Center">
+            <!-- brand: 3×3 accent grid, alternating 85%/35% opacity -->
+            <UniformGrid Columns="3" Rows="3" Width="24" Height="24">
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.35" />
+              <Border Background="{StaticResource Accent}" Margin="1" CornerRadius="1" Opacity="0.85" />
+            </UniformGrid>
+
+            <StackPanel Spacing="2" VerticalAlignment="Center">
+              <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBlock Text="AUDIO MATRIX PATCH" FontSize="14" FontWeight="SemiBold"
+                           LetterSpacing="0.84" Foreground="{StaticResource Text}"
+                           VerticalAlignment="Center" />
+                <Border CornerRadius="999" BorderBrush="#338784" BorderThickness="1"
+                        Background="#1D3A3B" Padding="9,2" VerticalAlignment="Center"
+                        MinWidth="46" MinHeight="22">
+                  <TextBlock Name="VersionText" Text="v0.0.0" FontSize="10" FontWeight="Bold"
+                             Foreground="#D3E1E7" HorizontalAlignment="Center"
+                             VerticalAlignment="Center" />
+                </Border>
+                <Button Name="UpdateBtn" Classes="pill" Content="⟳"
+                        VerticalAlignment="Center"
+                        chrome:WindowDecorationProperties.ElementRole="User" />
+              </StackPanel>
+              <TextBlock Name="StatusText" Text="Standby" FontSize="11"
+                         Foreground="{StaticResource Muted}" />
+            </StackPanel>
+          </StackPanel>
+
+          <!-- empty space = drag region (TitleBar role on HeaderBar) -->
+          <Border Grid.Column="1" Background="Transparent" Name="DragRegion" />
+
+          <!-- gear: settings placeholder (TODO: theme preset pickers — static Theme for now) -->
+          <Border Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
+                  VerticalAlignment="Center" CornerRadius="7"
+                  BorderBrush="{StaticResource Line}" BorderThickness="1"
+                  Background="{StaticResource Surface}">
+            <TextBlock Text="⚙" FontSize="14" Foreground="{StaticResource Muted}"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+          </Border>
+
+          <!-- caption buttons: ✕ hides to tray, real quit lives in the tray menu -->
+          <StackPanel Grid.Column="3" Orientation="Horizontal"
+                      chrome:WindowDecorationProperties.ElementRole="User">
+            <Button Name="MinButton" Classes="caption" Content="—" />
+            <Button Name="MaxButton" Classes="caption" Content="▢" />
+            <Button Name="CloseButton" Classes="caption close" Content="✕" />
+          </StackPanel>
+        </Grid>
+      </Border>
+
+      <!-- ===== Dock (§3.6): metrics | source card | chips | route | dest card | chips | metrics ===== -->
+      <Border DockPanel.Dock="Bottom" Background="{StaticResource Panel}"
+              BorderBrush="#23272E" BorderThickness="0,1,0,0" Padding="10,8" Height="116">
+        <Grid ColumnDefinitions="128,*,20,56,*,20,128">
+
+          <!-- input-side metric tiles -->
+          <UniformGrid Grid.Column="0" Columns="2" Rows="2">
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="LATENCY" />
+                <TextBlock Name="MetricInLatency" Classes="metricValue" Text="--" />
+              </StackPanel>
+            </Border>
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="JITTER" />
+                <TextBlock Name="MetricInJitter" Classes="metricValue" Text="--" />
+              </StackPanel>
+            </Border>
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="OVERFLOWS" />
+                <TextBlock Name="MetricInOverflows" Classes="metricValue" Text="0" />
+              </StackPanel>
+            </Border>
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="DROPS" />
+                <TextBlock Name="MetricInDrops" Classes="metricValue" Text="0" />
+              </StackPanel>
+            </Border>
+          </UniformGrid>
+
+          <!-- source card: name/sub top-left over full-lane horizontal meters;
+               MASTER simplified as an accent left border for the shell -->
+          <Border Grid.Column="1" Name="SourceCard" Margin="8,0,4,0" CornerRadius="8"
+                  BorderBrush="{StaticResource Line}" BorderThickness="1"
+                  Background="#E61A1D22" ClipToBounds="True">
+            <Panel>
+              <controls:MeterBars Name="SourceMeters" Horizontal="True" Margin="4" />
+              <StackPanel Margin="10,6,10,0" Spacing="2"
+                          HorizontalAlignment="Left" VerticalAlignment="Top">
+                <TextBlock Name="SourceName" Text="—" FontSize="12" FontWeight="Bold"
+                           Foreground="{StaticResource TextStrong}"
+                           TextTrimming="CharacterEllipsis" />
+                <TextBlock Name="SourceSub" Text="" FontSize="9"
+                           Foreground="{StaticResource Muted}"
+                           TextTrimming="CharacterEllipsis" />
+              </StackPanel>
+            </Panel>
+          </Border>
+
+          <!-- detached source chip column (one bordered mini-key per channel) -->
+          <StackPanel Grid.Column="2" Name="SourceChipsPanel" Spacing="4"
+                      VerticalAlignment="Stretch" />
+
+          <!-- route indicator: 🡢 active / ⏸ none -->
+          <Border Grid.Column="3" Width="44" Height="44" CornerRadius="6"
+                  HorizontalAlignment="Center" VerticalAlignment="Center"
+                  BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
+                  Background="{StaticResource KeyFace}">
+            <TextBlock Name="RouteGlyph" Text="⏸" FontSize="16"
+                       Foreground="{StaticResource Muted}"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" />
+          </Border>
+
+          <!-- destination card -->
+          <Border Grid.Column="4" Name="DestCard" Margin="4,0,8,0" CornerRadius="8"
+                  BorderBrush="{StaticResource Line}" BorderThickness="1"
+                  Background="#E61A1D22" ClipToBounds="True">
+            <Panel>
+              <controls:MeterBars Name="DestMeters" Horizontal="True" Margin="4" />
+              <StackPanel Margin="10,6,10,0" Spacing="2"
+                          HorizontalAlignment="Left" VerticalAlignment="Top">
+                <TextBlock Name="DestName" Text="—" FontSize="12" FontWeight="Bold"
+                           Foreground="{StaticResource TextStrong}"
+                           TextTrimming="CharacterEllipsis" />
+                <TextBlock Name="DestSub" Text="" FontSize="9"
+                           Foreground="{StaticResource Muted}"
+                           TextTrimming="CharacterEllipsis" />
+              </StackPanel>
+            </Panel>
+          </Border>
+
+          <!-- detached destination chip column -->
+          <StackPanel Grid.Column="5" Name="DestChipsPanel" Spacing="4"
+                      VerticalAlignment="Stretch" />
+
+          <!-- output-side metric tiles -->
+          <UniformGrid Grid.Column="6" Columns="2" Rows="2">
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="LATENCY" />
+                <TextBlock Name="MetricOutLatency" Classes="metricValue" Text="--" />
+              </StackPanel>
+            </Border>
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="SYNC" />
+                <TextBlock Name="MetricOutSync" Classes="metricValue" Text="0" />
+              </StackPanel>
+            </Border>
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="UNDERRUNS" />
+                <TextBlock Name="MetricOutUnderruns" Classes="metricValue" Text="0" />
+              </StackPanel>
+            </Border>
+            <Border Classes="metric">
+              <StackPanel>
+                <TextBlock Classes="metricLabel" Text="DROPS" />
+                <TextBlock Name="MetricOutDrops" Classes="metricValue" Text="0" />
+              </StackPanel>
+            </Border>
+          </UniformGrid>
+        </Grid>
+      </Border>
+
+      <!-- ===== Main area: the matrix, with the corner control block overlaid on its
+           label square (top-left, LabelSquare × LabelSquare, 4×4 map per §3.2). ===== -->
+      <Panel Name="MainArea" Margin="12">
+        <controls:MatrixControl Name="Matrix" />
+
+        <Border Name="CornerBox" HorizontalAlignment="Left" VerticalAlignment="Top"
+                Width="224" Height="224" CornerRadius="8" Padding="3"
+                BorderBrush="{StaticResource Line}" BorderThickness="1"
+                Background="#F016181D">
+          <Grid Name="CornerGrid"
+                RowDefinitions="*,*,*,*" ColumnDefinitions="*,*,*,*">
+            <!-- row 1: power · IN drum · OUT drum · lock -->
+            <Button Name="PowerBtn" Classes="key" Grid.Row="0" Grid.Column="0" Content="⏻" />
+            <controls:DrumControl Name="InDrum" Grid.Row="0" Grid.Column="1" Margin="2"
+                                  Minimum="10" Maximum="200" Step="5" DefaultValue="40"
+                                  PxPerStep="10" Caption="IN" />
+            <controls:DrumControl Name="OutDrum" Grid.Row="0" Grid.Column="2" Margin="2"
+                                  Minimum="10" Maximum="200" Step="5" DefaultValue="40"
+                                  PxPerStep="10" Caption="OUT" />
+            <Button Name="LockBtn" Classes="key" Grid.Row="0" Grid.Column="3" Content="🔓" />
+
+            <!-- row 2: reload · master gain drum (2×2) -->
+            <Button Name="ReloadBtn" Classes="key" Grid.Row="1" Grid.Column="0" Content="↻" />
+            <controls:DrumControl Name="GainDrum" Grid.Row="1" Grid.Column="1"
+                                  Grid.RowSpan="2" Grid.ColumnSpan="2" Margin="2"
+                                  Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"
+                                  PxPerStep="24" Caption="GAIN" />
+
+            <!-- row 3: input-mode cycle -->
+            <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
+                    Content="BOTH" FontSize="9" />
+
+            <!-- row 4: show-all · transient mute (wide) · view toggle -->
+            <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
+            <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
+                    Grid.ColumnSpan="2" Content="🔈 MUTE" FontSize="12" />
+            <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
+          </Grid>
+        </Border>
+
+        <!-- transient error banner (4s), fed by SetRoutes route errors etc. -->
+        <Border Name="Banner" IsVisible="False" HorizontalAlignment="Center"
+                VerticalAlignment="Top" Margin="0,10,0,0" CornerRadius="6"
+                Background="#F03C1111" BorderBrush="#EF4444" BorderThickness="1"
+                Padding="14,7" MaxWidth="720" ZIndex="10">
+          <TextBlock Name="BannerText" Foreground="#F6D9D9" FontSize="12"
+                     TextWrapping="Wrap" />
+        </Border>
+      </Panel>
+    </DockPanel>
+  </Panel>
 </Window>

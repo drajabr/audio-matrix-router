@@ -2,6 +2,9 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              x:Class="AudioMatrixRouter.App.App"
              RequestedThemeVariant="Dark">
+  <!-- The tray icon (Show / Start with Windows / Quit) is built in code-behind so the
+       icon path (AppContext.BaseDirectory\app.ico) and the checkable startup item can
+       be wired against the controller at runtime. -->
   <Application.Styles>
     <FluentTheme />
   </Application.Styles>
