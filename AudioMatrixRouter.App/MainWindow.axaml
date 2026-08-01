@@ -86,8 +86,8 @@
       <Setter Property="Width" Value="44" />
       <Setter Property="Height" Value="56" />
       <Setter Property="Background" Value="Transparent" />
-      <Setter Property="Foreground" Value="#8B93A1" />
-      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Foreground" Value="{StaticResource TextStrong}" />
+      <Setter Property="FontSize" Value="13" />
       <Setter Property="CornerRadius" Value="0" />
       <Setter Property="BorderThickness" Value="0" />
       <Setter Property="HorizontalContentAlignment" Value="Center" />
@@ -234,7 +234,9 @@
       <!-- ===== Header IS the title bar. Avalonia 12 element roles: TitleBar gives
            native drag + double-click-maximize; interactive children opt out with the
            User role. ===== -->
-      <Border DockPanel.Dock="Top" Background="{StaticResource Panel}"
+      <!-- Transparent title bar: the window background (and aurora) reads through;
+           only a hairline separates it from the matrix area. -->
+      <Border DockPanel.Dock="Top" Background="Transparent"
               BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,0,0,1"
               Name="HeaderBar" MinHeight="56"
               chrome:WindowDecorationProperties.ElementRole="TitleBar">
@@ -282,9 +284,9 @@
           <!-- gear: settings placeholder (theme preset pickers TODO — presets applied from prefs) -->
           <Border Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
                   VerticalAlignment="Center" CornerRadius="7"
-                  BorderBrush="{StaticResource Line}" BorderThickness="1"
-                  Background="{StaticResource Surface}">
-            <TextBlock Text="⚙" FontSize="14" Foreground="{StaticResource Muted}"
+                  BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
+                  Background="{StaticResource KeyFace}">
+            <TextBlock Text="⚙" FontSize="15" Foreground="{StaticResource TextStrong}"
                        HorizontalAlignment="Center" VerticalAlignment="Center" />
           </Border>
 
