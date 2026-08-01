@@ -302,8 +302,11 @@
       <Border DockPanel.Dock="Bottom" Background="{StaticResource Panel}"
               Name="DockBar"
               BorderBrush="{StaticResource HeaderLine}" BorderThickness="0,1,0,0"
-              Padding="10,8" Height="122">
-        <Grid ColumnDefinitions="132,*,26,112,*,26,132">
+              Padding="10,8" Height="131">
+        <!-- Symmetry rule: dock content height = ONE device tile (2×54+6 = 114).
+             Cards, chip columns, metric groups and the route square all fill it.
+             131 = 114 content + 8+8 padding + 1 top border. -->
+        <Grid ColumnDefinitions="132,*,26,114,*,26,132">
 
           <!-- input-side metric tiles -->
           <UniformGrid Grid.Column="0" Columns="2" Rows="2">
@@ -367,9 +370,9 @@
           <Grid Grid.Column="2" Name="SourceChipsPanel" Width="24"
                 HorizontalAlignment="Center" VerticalAlignment="Stretch" />
 
-          <!-- route indicator: large rounded key, just the arrow (🡢 active / ⏸ none) -->
-          <Border Grid.Column="3" Name="RouteBox" Width="100" Height="100" CornerRadius="8"
-                  HorizontalAlignment="Center" VerticalAlignment="Center"
+          <!-- route indicator: device-tile-sized square key (114×114, the dock height) -->
+          <Border Grid.Column="3" Name="RouteBox" Width="114" CornerRadius="8"
+                  HorizontalAlignment="Center" VerticalAlignment="Stretch"
                   BorderBrush="{StaticResource LineStrong}" BorderThickness="2"
                   Background="Transparent">
             <TextBlock Name="RouteGlyph" Text="⏸" FontSize="{DynamicResource FsXl}"
