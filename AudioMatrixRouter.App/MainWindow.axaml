@@ -281,14 +281,14 @@
           <!-- empty space = drag region (TitleBar role on HeaderBar) -->
           <Border Grid.Column="1" Background="Transparent" Name="DragRegion" />
 
-          <!-- gear: settings placeholder (theme preset pickers TODO — presets applied from prefs) -->
-          <Border Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
-                  VerticalAlignment="Center" CornerRadius="7"
+          <!-- gear: theme preset picker (background/accent/font/size/scale, applied live) -->
+          <Button Name="GearBtn" Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
+                  VerticalAlignment="Center" CornerRadius="7" Padding="0"
+                  HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
                   BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
-                  Background="{StaticResource KeyFace}">
-            <TextBlock Text="⚙" FontSize="15" Foreground="{StaticResource TextStrong}"
-                       HorizontalAlignment="Center" VerticalAlignment="Center" />
-          </Border>
+                  Background="{StaticResource KeyFace}"
+                  Foreground="{StaticResource TextStrong}" FontSize="15" Content="⚙"
+                  chrome:WindowDecorationProperties.ElementRole="User" />
 
           <!-- caption buttons: ✕ hides to tray, real quit lives in the tray menu -->
           <StackPanel Grid.Column="3" Orientation="Horizontal"

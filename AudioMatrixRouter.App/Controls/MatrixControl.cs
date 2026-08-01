@@ -859,6 +859,18 @@ public sealed class MatrixControl : Control
             }
         }
 
+        // Sticky hover: crossing the gaps between tiles must NOT drop the selection
+        // (it flickered every 6px of travel). While the pointer stays inside the tile
+        // area, only landing on a DIFFERENT tile changes the hover; headers/corner or
+        // leaving the area still clear it.
+        if (hit.Kind == MatrixHitKind.None && _hoverRowKey is not null &&
+            p.X >= l.TilesOriginX && p.Y >= l.TilesOriginY &&
+            p.X <= l.TilesOriginX + l.TileAreaWidth - _scrollX &&
+            p.Y <= l.TilesOriginY + l.TileAreaHeight - _scrollY)
+        {
+            return;
+        }
+
         UpdateHover(hit);
     }
 

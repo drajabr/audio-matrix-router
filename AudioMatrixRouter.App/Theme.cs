@@ -85,6 +85,18 @@ public static class Theme
         new("md", 1.0), new("lg", 1.08), new("xl", 1.16), new("xxl", 1.25),
     };
 
+    // Preset key lists for the picker UI.
+    public static IReadOnlyList<string> BackgroundKeys { get; } =
+        BackgroundPresets.Select(p => p.Key).ToArray();
+    public static IReadOnlyList<string> AccentKeys { get; } =
+        AccentPresets.Select(p => p.Key).ToArray();
+    public static IReadOnlyList<string> FontKeys { get; } =
+        FontPresets.Select(p => p.Key).ToArray();
+    public static IReadOnlyList<string> FontSizeKeys { get; } =
+        FontSizePresets.Select(p => p.Key).ToArray();
+    public static IReadOnlyList<string> UiScaleKeys { get; } =
+        UiScalePresets.Select(p => p.Key).ToArray();
+
     // Web defaults (App.jsx useState initializers): black background, WHITE accent,
     // consolas font, font-size index 4 (18px), MD scale.
     private const string DefaultBackgroundKey = "black";

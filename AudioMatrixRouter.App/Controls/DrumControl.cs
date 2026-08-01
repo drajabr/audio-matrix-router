@@ -117,7 +117,9 @@ public sealed class DrumControl : Control
     }
 
     private double _value;
-    private double _texOffset;
+    private double _texOffset;        // target texture offset (moves with the value)
+    private double _displayTexOffset; // eased offset actually rendered (CSS 80ms ease-out)
+    private bool _texAnimating;
 
     private bool _dragging;
     private double _dragStartY;
@@ -220,13 +222,50 @@ public sealed class DrumControl : Control
         if (Maximum > Minimum) target = Math.Clamp(target, Minimum, Maximum);
         if (Math.Abs(target - _value) < 1e-9) return;
 
-        // the drum texture rolls with the value
+        // the drum texture rolls with the value; the RENDERED offset eases toward it
         var step = Math.Abs(Step) < 1e-9 ? 1 : Step;
         _texOffset -= (target - _value) / step * Math.Max(6, PxPerStep);
 
         _value = target;
+        StartTexAnimation();
         InvalidateVisual();
         ValueCommitted?.Invoke(this, _value);
+    }
+
+    private void StartTexAnimation()
+    {
+        if (_texAnimating) return;
+        var top = TopLevel.GetTopLevel(this);
+        if (top is null)
+        {
+            _displayTexOffset = _texOffset;
+            InvalidateVisual();
+            return;
+        }
+        _texAnimating = true;
+        top.RequestAnimationFrame(TexTick);
+    }
+
+    private void TexTick(TimeSpan _)
+    {
+        _texAnimating = false;
+        var delta = _texOffset - _displayTexOffset;
+        if (Math.Abs(delta) <= 0.5)
+        {
+            _displayTexOffset = _texOffset;
+            InvalidateVisual();
+            return;
+        }
+
+        _displayTexOffset += delta * 0.35; // ≈ the CSS 80ms ease-out at 60fps
+        InvalidateVisual();
+
+        var top = TopLevel.GetTopLevel(this);
+        if (top is not null)
+        {
+            _texAnimating = true;
+            top.RequestAnimationFrame(TexTick);
+        }
     }
 
     // ===================================================================== rendering
@@ -257,7 +296,7 @@ public sealed class DrumControl : Control
             context.DrawRectangle(DrumBase, null, drum);
 
             // ribbed drum texture, 12px per rib: 0–1 groove · 1–3 crest · 3–9 body · 9–11 slope · 11–12 gap
-            var off = _texOffset % RibPeriod;
+            var off = _displayTexOffset % RibPeriod;
             if (off < 0) off += RibPeriod;
             using (context.PushClip(drum))
             {

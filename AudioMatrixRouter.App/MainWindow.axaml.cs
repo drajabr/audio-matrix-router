@@ -36,6 +36,10 @@ public partial class MainWindow : Window
 
     private string _viewMode = "device";       // "device" | "channel"
     private float _masterGainDb;
+    private float _appliedMasterGainDb;        // master gain the snapshot's gains include
+    private int? _pendingBufferMs;
+    private readonly DispatcherTimer _gainApplyTimer;
+    private readonly DispatcherTimer _bufferApplyTimer;
     private bool _showAll;
     private bool _powerOn = true;
     private bool _mutedAll;
@@ -96,6 +100,12 @@ public partial class MainWindow : Window
         _metricsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
         _metricsTimer.Tick += (_, _) => OnMetricsTick();
         _metricsTimer.Start();
+
+        _gainApplyTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        _gainApplyTimer.Tick += (_, _) => { _gainApplyTimer.Stop(); ApplyPendingMasterGain(); };
+
+        _bufferApplyTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(450) };
+        _bufferApplyTimer.Tick += (_, _) => { _bufferApplyTimer.Stop(); ApplyPendingBufferMs(); };
 
         _bannerTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
         _bannerTimer.Tick += (_, _) =>
@@ -226,6 +236,7 @@ public partial class MainWindow : Window
     {
         _viewMode = _prefs.ViewMode;
         _masterGainDb = ClampDb((float)_prefs.MasterGainDb);
+        _appliedMasterGainDb = _masterGainDb; // persisted route gains already include it
         _showAll = _prefs.ShowAllDevices;
         _powerOn = _prefs.PowerOn;
         _labelSquare = Math.Clamp(_prefs.LabelSquare, AppTheme.LabelSquareMin, AppTheme.LabelSquareMax);
@@ -327,6 +338,8 @@ public partial class MainWindow : Window
 
         UpdateBtn.Click += async (_, _) => await HandleUpdateClickAsync();
         SetUpdateState(UpdateState.Idle);
+
+        GearBtn.Click += (_, _) => ShowThemePicker();
     }
 
     private async Task HandleUpdateClickAsync()
@@ -491,17 +504,15 @@ public partial class MainWindow : Window
         GainDrum.ShowGlow = true; // only the master gain wheel carries the accent glow
 
         // ONE buffer knob: OUT is the knob that actually governs stability/latency
-        // (render buffer + ASRC fill target + barrier); IN is derived — capture buffer
-        // adds latency but contributes little stability behind the ring/ASRC.
+        // (render buffer + ASRC fill target + barrier); IN is derived. DEBOUNCED:
+        // applying a buffer change restarts the whole engine, so per-tick application
+        // froze the wheel — the drum spins freely and the engine restarts once, 450ms
+        // after the last tick (the web app did the same with a 500ms timer).
         OutDrum.ValueCommitted += (_, v) =>
         {
-            try
-            {
-                var outMs = (int)Math.Round(v);
-                _controller.SetOutputBufferMs(outMs);
-                _controller.SetInputBufferMs(Math.Clamp(outMs / 2, 10, 40));
-            }
-            catch (Exception ex) { ShowBanner(ex.Message); }
+            _pendingBufferMs = (int)Math.Round(v);
+            _bufferApplyTimer.Stop();
+            _bufferApplyTimer.Start();
         };
         GainDrum.ValueCommitted += (_, v) => OnMasterGainCommitted((float)v);
     }
@@ -523,12 +534,21 @@ public partial class MainWindow : Window
 
     private void OnMasterGainCommitted(float newMaster)
     {
-        var oldMaster = _masterGainDb;
+        // UI reacts instantly; the route push is debounced — pushing every active route
+        // per 0.5dB wheel tick made the wheel feel laggy.
         _masterGainDb = ClampDb(newMaster);
         _prefs.MasterGainDb = _masterGainDb;
+        RebuildModel(); // gain readouts shift immediately
+        _gainApplyTimer.Stop();
+        _gainApplyTimer.Start();
+    }
 
-        // Re-send every active route with the master delta folded in (the engine only
-        // knows absolute per-route gain — master gain is a UI concept, like App.jsx).
+    private void ApplyPendingMasterGain()
+    {
+        // _appliedMasterGainDb = the master gain the snapshot's route gains already
+        // include; deltas accumulate correctly across any number of debounced ticks.
+        if (Math.Abs(_masterGainDb - _appliedMasterGainDb) < 0.001f) return;
+
         var requests = new List<RouteRequest>();
         foreach (var route in _snapshot.Routes)
         {
@@ -537,13 +557,102 @@ public partial class MainWindow : Window
             requests.Add(new RouteRequest(
                 inDev.Id, inCh, outDev.Id, outCh,
                 Active: true,
-                GainDb: ClampDb(route.GainDb - oldMaster + _masterGainDb),
+                GainDb: ClampDb(route.GainDb - _appliedMasterGainDb + _masterGainDb),
                 PhaseInverted: route.PhaseInverted));
         }
+        _appliedMasterGainDb = _masterGainDb;
         if (requests.Count > 0)
             ApplyRoutes(requests);
-        else
-            RebuildModel(); // gain readouts shift even with no routes staged
+    }
+
+    // =====================================================================
+    // theme preset picker (gear)
+    // =====================================================================
+
+    private void ShowThemePicker()
+    {
+        var flyout = new Flyout { Placement = PlacementMode.BottomEdgeAlignedRight };
+
+        void Rebuild()
+        {
+            var panel = new StackPanel { Spacing = 8, Margin = new Thickness(12), MinWidth = 260 };
+            panel.Children.Add(PickerRow("THEME", AppTheme.BackgroundKeys, _prefs.BackgroundKey, k => { _prefs.BackgroundKey = k; ApplyThemeLive(); Rebuild(); }));
+            panel.Children.Add(PickerRow("ACCENT", AppTheme.AccentKeys, _prefs.AccentKey, k => { _prefs.AccentKey = k; ApplyThemeLive(); Rebuild(); }));
+            panel.Children.Add(PickerRow("FONT", AppTheme.FontKeys, _prefs.FontKey, k => { _prefs.FontKey = k; ApplyThemeLive(); Rebuild(); }));
+            panel.Children.Add(PickerRow("SIZE", AppTheme.FontSizeKeys, _prefs.FontSizeKey, k => { _prefs.FontSizeKey = k; ApplyThemeLive(); Rebuild(); }));
+            panel.Children.Add(PickerRow("SCALE", AppTheme.UiScaleKeys, _prefs.UiScaleKey, k => { _prefs.UiScaleKey = k; ApplyThemeLive(); Rebuild(); }));
+            flyout.Content = panel;
+        }
+
+        Rebuild();
+        flyout.ShowAt(GearBtn);
+    }
+
+    private static Control PickerRow(string label, IReadOnlyList<string> keys, string current, Action<string> pick)
+    {
+        var wrap = new WrapPanel { ItemSpacing = 4, LineSpacing = 4 };
+        foreach (var key in keys)
+        {
+            var active = string.Equals(key, current, StringComparison.OrdinalIgnoreCase);
+            var chip = new Button
+            {
+                Content = key,
+                FontSize = AppTheme.Fs2xs,
+                FontWeight = active ? FontWeight.ExtraBold : FontWeight.SemiBold,
+                Padding = new Thickness(8, 4),
+                CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
+                BorderThickness = new Thickness(1),
+                BorderBrush = active
+                    ? AppTheme.AccentBrush
+                    : AppTheme.LineStrongBrush,
+                Background = active ? AppTheme.AccentFace() : AppTheme.KeyFace(0.08, 0.14),
+                Foreground = active ? AppTheme.TextOnAccentBrush : AppTheme.TextBrush,
+            };
+            chip.Click += (_, _) => pick(key);
+            wrap.Children.Add(chip);
+        }
+
+        return new StackPanel
+        {
+            Spacing = 4,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = label,
+                    FontSize = AppTheme.Fs2xs * 0.9,
+                    FontWeight = FontWeight.Bold,
+                    Foreground = AppTheme.MutedBrush,
+                },
+                wrap,
+            }
+        };
+    }
+
+    /// <summary>Re-applies the palette from prefs and repaints every themed surface.</summary>
+    private void ApplyThemeLive()
+    {
+        AppTheme.Apply(_prefs.BackgroundKey, _prefs.AccentKey, _prefs.FontKey,
+            _prefs.FontSizeKey, _prefs.UiScaleKey);
+        ApplyThemeToWindow();
+        Matrix.InvalidateVisual();
+        OutDrum.InvalidateVisual();
+        GainDrum.InvalidateVisual();
+        SourceMeters.InvalidateVisual();
+        DestMeters.InvalidateVisual();
+        UpdateDockCards();
+    }
+
+    private void ApplyPendingBufferMs()
+    {
+        if (_pendingBufferMs is not { } outMs) return;
+        _pendingBufferMs = null;
+        try
+        {
+            _controller.SetOutputBufferMs(outMs);
+            _controller.SetInputBufferMs(Math.Clamp(outMs / 2, 10, 40));
+        }
+        catch (Exception ex) { ShowBanner(ex.Message); }
     }
 
     // =====================================================================
@@ -789,9 +898,10 @@ public partial class MainWindow : Window
 
     private void SyncFromSnapshot()
     {
-        // Drum value follows the authoritative config (skip while unchanged so a
-        // mid-drag value is not stomped for no reason).
-        if (Math.Abs(OutDrum.Value - _snapshot.OutputBufferMs) >= 0.5)
+        // Drum value follows the authoritative config — but never stomp a value the
+        // user just dialed while its debounced apply is still pending.
+        if ((_bufferApplyTimer?.IsEnabled ?? false) == false &&
+            Math.Abs(OutDrum.Value - _snapshot.OutputBufferMs) >= 0.5)
             OutDrum.Value = _snapshot.OutputBufferMs;
     }
 

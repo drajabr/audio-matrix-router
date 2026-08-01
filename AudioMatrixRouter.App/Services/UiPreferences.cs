@@ -98,13 +98,36 @@ public sealed class UiPreferences
         set => SetNode("outputMasterId", value);
     }
 
-    // Theme keys — read-only for now (preset picker UI is a TODO in MainWindow);
-    // they round-trip untouched because we never rewrite keys we don't set.
-    public string BackgroundKey => GetString("backgroundKey", "black");
-    public string AccentKey => GetString("accentKey", "teal");
-    public string FontKey => GetString("fontKey", "consolas");
-    public string FontSizeKey => GetString("fontSizeKey", "md");
-    public string UiScaleKey => GetString("uiScaleKey", "md");
+    // Theme keys — settable: the gear popup writes them live.
+    public string BackgroundKey
+    {
+        get => GetString("backgroundKey", "black");
+        set => SetNode("backgroundKey", value);
+    }
+
+    public string AccentKey
+    {
+        get => GetString("accentKey", "teal");
+        set => SetNode("accentKey", value);
+    }
+
+    public string FontKey
+    {
+        get => GetString("fontKey", "consolas");
+        set => SetNode("fontKey", value);
+    }
+
+    public string FontSizeKey
+    {
+        get => GetString("fontSizeKey", "md");
+        set => SetNode("fontSizeKey", value);
+    }
+
+    public string UiScaleKey
+    {
+        get => GetString("uiScaleKey", "md");
+        set => SetNode("uiScaleKey", value);
+    }
 
     // ===== labelSizing { sourceWidth, destinationHeight } =====
     // Both handles write the same number in the web app (the corner box is always
