@@ -339,7 +339,17 @@ public partial class MainWindow : Window
         UpdateBtn.Click += async (_, _) => await HandleUpdateClickAsync();
         SetUpdateState(UpdateState.Idle);
 
-        GearBtn.Click += (_, _) => ShowThemePicker();
+        PickBgBtn.Click += (_, _) => ShowPicker(PickBgBtn, AppTheme.BackgroundOptions,
+            () => _prefs.BackgroundKey, k => _prefs.BackgroundKey = k);
+        PickAccentBtn.Click += (_, _) => ShowPicker(PickAccentBtn, AppTheme.AccentOptions,
+            () => _prefs.AccentKey, k => _prefs.AccentKey = k);
+        PickFontBtn.Click += (_, _) => ShowPicker(PickFontBtn, AppTheme.FontOptions,
+            () => _prefs.FontKey, k => _prefs.FontKey = k);
+        PickSizeBtn.Click += (_, _) => ShowPicker(PickSizeBtn, AppTheme.FontSizeOptions,
+            () => _prefs.FontSizeKey, k => _prefs.FontSizeKey = k);
+        PickScaleBtn.Click += (_, _) => ShowPicker(PickScaleBtn, AppTheme.UiScaleOptions,
+            () => _prefs.UiScaleKey, k => _prefs.UiScaleKey = k);
+        UpdateQuickButtons();
     }
 
     private async Task HandleUpdateClickAsync()
@@ -569,64 +579,117 @@ public partial class MainWindow : Window
     // theme preset picker (gear)
     // =====================================================================
 
-    private void ShowThemePicker()
+    /// <summary>
+    /// Category picker panel, faithful to the web `.quick-control-picker`: a dark
+    /// chassis panel with VERTICAL option rows — colored swatch square (or letter)
+    /// + preset name — the active row accent-highlighted. One panel per category,
+    /// anchored under its header button.
+    /// </summary>
+    private void ShowPicker(Control anchor, IReadOnlyList<AppTheme.PresetOption> options,
+        Func<string> getCurrent, Action<string> setKey)
     {
         var flyout = new Flyout { Placement = PlacementMode.BottomEdgeAlignedRight };
+        flyout.FlyoutPresenterClasses.Add("bare");
 
         void Rebuild()
         {
-            var panel = new StackPanel { Spacing = 8, Margin = new Thickness(12), MinWidth = 260 };
-            panel.Children.Add(PickerRow("THEME", AppTheme.BackgroundKeys, _prefs.BackgroundKey, k => { _prefs.BackgroundKey = k; ApplyThemeLive(); Rebuild(); }));
-            panel.Children.Add(PickerRow("ACCENT", AppTheme.AccentKeys, _prefs.AccentKey, k => { _prefs.AccentKey = k; ApplyThemeLive(); Rebuild(); }));
-            panel.Children.Add(PickerRow("FONT", AppTheme.FontKeys, _prefs.FontKey, k => { _prefs.FontKey = k; ApplyThemeLive(); Rebuild(); }));
-            panel.Children.Add(PickerRow("SIZE", AppTheme.FontSizeKeys, _prefs.FontSizeKey, k => { _prefs.FontSizeKey = k; ApplyThemeLive(); Rebuild(); }));
-            panel.Children.Add(PickerRow("SCALE", AppTheme.UiScaleKeys, _prefs.UiScaleKey, k => { _prefs.UiScaleKey = k; ApplyThemeLive(); Rebuild(); }));
-            flyout.Content = panel;
+            var list = new StackPanel { Spacing = 2 };
+            foreach (var opt in options)
+            {
+                var active = string.Equals(opt.Key, getCurrent(), StringComparison.OrdinalIgnoreCase);
+
+                var swatch = new Border
+                {
+                    Width = 22,
+                    Height = 22,
+                    CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
+                    BorderThickness = new Thickness(1),
+                    BorderBrush = AppTheme.LineStrongBrush,
+                    Background = opt.Swatch is { } c ? new SolidColorBrush(c) : Brushes.Transparent,
+                    Child = string.IsNullOrEmpty(opt.SwatchLabel) ? null : new TextBlock
+                    {
+                        Text = opt.SwatchLabel,
+                        FontSize = opt.SwatchLabel.Length > 2 ? 7 : AppTheme.Fs2xs,
+                        FontWeight = FontWeight.Bold,
+                        Foreground = opt.SwatchText is { } tc ? new SolidColorBrush(tc) : AppTheme.TextStrongBrush,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center,
+                    },
+                };
+
+                var row = new Button
+                {
+                    Padding = new Thickness(8, 5),
+                    HorizontalAlignment = HorizontalAlignment.Stretch,
+                    HorizontalContentAlignment = HorizontalAlignment.Left,
+                    CornerRadius = new CornerRadius(AppTheme.RadiusOverlay),
+                    BorderThickness = new Thickness(1),
+                    BorderBrush = active
+                        ? new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, AppTheme.Line, 0.60))
+                        : Brushes.Transparent,
+                    Background = active
+                        ? new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.14))
+                        : Brushes.Transparent,
+                    Content = new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 10,
+                        Children =
+                        {
+                            swatch,
+                            new TextBlock
+                            {
+                                Text = opt.Key,
+                                FontSize = AppTheme.FsXs,
+                                FontWeight = active ? FontWeight.Bold : FontWeight.SemiBold,
+                                Foreground = active ? AppTheme.TextStrongBrush : AppTheme.MutedBrush,
+                                VerticalAlignment = VerticalAlignment.Center,
+                            },
+                        }
+                    },
+                };
+
+                var key = opt.Key;
+                var wasActive = active;
+                row.Click += (_, _) =>
+                {
+                    if (wasActive) { flyout.Hide(); return; } // web: re-click active = close
+                    setKey(key);
+                    ApplyThemeLive();
+                    Rebuild();
+                };
+                list.Children.Add(row);
+            }
+
+            // dark chassis panel (web .quick-control-picker: panel bg, line border, radius 8)
+            flyout.Content = new Border
+            {
+                MinWidth = 170,
+                Background = new SolidColorBrush(AppTheme.Panel),
+                BorderBrush = new SolidColorBrush(AppTheme.Line),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(AppTheme.RadiusPanel),
+                Padding = new Thickness(6),
+                BoxShadow = new BoxShadows(new BoxShadow
+                {
+                    OffsetY = 10, Blur = 26, Color = AppTheme.WithAlpha(Colors.Black, 0.45),
+                }),
+                Child = list,
+            };
         }
 
         Rebuild();
-        flyout.ShowAt(GearBtn);
+        flyout.ShowAt(anchor);
     }
 
-    private static Control PickerRow(string label, IReadOnlyList<string> keys, string current, Action<string> pick)
+    /// <summary>Refresh the header quick-button faces after a theme change.</summary>
+    private void UpdateQuickButtons()
     {
-        var wrap = new WrapPanel { ItemSpacing = 4, LineSpacing = 4 };
-        foreach (var key in keys)
-        {
-            var active = string.Equals(key, current, StringComparison.OrdinalIgnoreCase);
-            var chip = new Button
-            {
-                Content = key,
-                FontSize = AppTheme.Fs2xs,
-                FontWeight = active ? FontWeight.ExtraBold : FontWeight.SemiBold,
-                Padding = new Thickness(8, 4),
-                CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
-                BorderThickness = new Thickness(1),
-                BorderBrush = active
-                    ? AppTheme.AccentBrush
-                    : AppTheme.LineStrongBrush,
-                Background = active ? AppTheme.AccentFace() : AppTheme.KeyFace(0.08, 0.14),
-                Foreground = active ? AppTheme.TextOnAccentBrush : AppTheme.TextBrush,
-            };
-            chip.Click += (_, _) => pick(key);
-            wrap.Children.Add(chip);
-        }
-
-        return new StackPanel
-        {
-            Spacing = 4,
-            Children =
-            {
-                new TextBlock
-                {
-                    Text = label,
-                    FontSize = AppTheme.Fs2xs * 0.9,
-                    FontWeight = FontWeight.Bold,
-                    Foreground = AppTheme.MutedBrush,
-                },
-                wrap,
-            }
-        };
+        PickBgSwatch.Background = new SolidColorBrush(AppTheme.Surface);
+        PickAccentSwatch.Background = new SolidColorBrush(AppTheme.AccentHl);
+        PickFontBtn.Content = AppTheme.CurrentFontLabel;
+        PickSizeBtn.Content = AppTheme.CurrentSizeLabel;
+        PickScaleBtn.Content = AppTheme.CurrentScaleLabel;
     }
 
     /// <summary>Re-applies the palette from prefs and repaints every themed surface.</summary>
@@ -635,6 +698,7 @@ public partial class MainWindow : Window
         AppTheme.Apply(_prefs.BackgroundKey, _prefs.AccentKey, _prefs.FontKey,
             _prefs.FontSizeKey, _prefs.UiScaleKey);
         ApplyThemeToWindow();
+        UpdateQuickButtons();
         Matrix.InvalidateVisual();
         OutDrum.InvalidateVisual();
         GainDrum.InvalidateVisual();

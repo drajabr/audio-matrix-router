@@ -85,17 +85,39 @@ public static class Theme
         new("md", 1.0), new("lg", 1.08), new("xl", 1.16), new("xxl", 1.25),
     };
 
-    // Preset key lists for the picker UI.
-    public static IReadOnlyList<string> BackgroundKeys { get; } =
-        BackgroundPresets.Select(p => p.Key).ToArray();
-    public static IReadOnlyList<string> AccentKeys { get; } =
-        AccentPresets.Select(p => p.Key).ToArray();
-    public static IReadOnlyList<string> FontKeys { get; } =
-        FontPresets.Select(p => p.Key).ToArray();
-    public static IReadOnlyList<string> FontSizeKeys { get; } =
-        FontSizePresets.Select(p => p.Key).ToArray();
-    public static IReadOnlyList<string> UiScaleKeys { get; } =
-        UiScalePresets.Select(p => p.Key).ToArray();
+    // ===== picker options (web .quick-picker-option: swatch + key label) =====
+    // Swatch = colored square for background/accent rows; for font/size/scale the
+    // "swatch" is just a letter/label (transparent square), exactly like the CSS
+    // `option.swatch || option.accent || "transparent"` fallback chain.
+
+    public readonly record struct PresetOption(string Key, string SwatchLabel, Color? Swatch, Color? SwatchText);
+
+    private static readonly string[] FontLabels = { "P", "M", "S", "B", "U", "C", "U" }; // web FONT_PRESETS labels
+    private static readonly string[] ScaleLabels = { "XXS", "XS", "SM", "MD", "LG", "XL", "XXL" };
+
+    public static IReadOnlyList<PresetOption> BackgroundOptions { get; } =
+        BackgroundPresets.Select(p => new PresetOption(
+            p.Key, "", Color.Parse(p.Surface), Color.Parse(p.Text))).ToArray();
+
+    public static IReadOnlyList<PresetOption> AccentOptions { get; } =
+        AccentPresets.Select(p => new PresetOption(
+            p.Key, "", Color.Parse(p.Accent), Color.Parse(p.AccentHl))).ToArray();
+
+    public static IReadOnlyList<PresetOption> FontOptions { get; } =
+        FontPresets.Select((p, i) => new PresetOption(p.Key, FontLabels[i], null, null)).ToArray();
+
+    public static IReadOnlyList<PresetOption> FontSizeOptions { get; } =
+        FontSizePresets.Select(p => new PresetOption(p.Key, p.Key, null, null)).ToArray();
+
+    public static IReadOnlyList<PresetOption> UiScaleOptions { get; } =
+        UiScalePresets.Select((p, i) => new PresetOption(p.Key, ScaleLabels[i], null, null)).ToArray();
+
+    /// <summary>Current font preset's letter (for the header font button).</summary>
+    public static string CurrentFontLabel { get; private set; } = "C";
+    /// <summary>Current size preset's digit (for the header size button).</summary>
+    public static string CurrentSizeLabel { get; private set; } = "5";
+    /// <summary>Current scale preset's label (for the header scale button).</summary>
+    public static string CurrentScaleLabel { get; private set; } = "MD";
 
     // Web defaults (App.jsx useState initializers): black background, WHITE accent,
     // consolas font, font-size index 4 (18px), MD scale.
@@ -168,6 +190,10 @@ public static class Theme
         _faceBold = new Typeface(_fontFamily, FontStyle.Normal, FontWeight.Bold);
         _faceHeavy = new Typeface(_fontFamily, FontStyle.Normal, FontWeight.ExtraBold);
         _fontSize = sp.SizePx;
+
+        CurrentFontLabel = FontLabels[Math.Max(0, Array.IndexOf(FontPresets, fp))];
+        CurrentSizeLabel = sp.Key;
+        CurrentScaleLabel = ScaleLabels[Math.Max(0, Array.IndexOf(UiScalePresets, up))];
         _uiScale = up.Scale;
 
         Version++;

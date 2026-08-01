@@ -169,6 +169,30 @@
       <Setter Property="BorderBrush" Value="{StaticResource PillBorderActive}" />
     </Style>
 
+    <!-- header quick-control keys (34px squares like the web icon-btn square variant) -->
+    <Style Selector="Button.quick">
+      <Setter Property="Width" Value="34" />
+      <Setter Property="Height" Value="34" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="CornerRadius" Value="7" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="BorderBrush" Value="{StaticResource LineStrong}" />
+      <Setter Property="Background" Value="{StaticResource KeyFace}" />
+      <Setter Property="Foreground" Value="{StaticResource TextStrong}" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <!-- picker flyouts carry their own dark chrome; strip the Fluent presenter's -->
+    <Style Selector="FlyoutPresenter.bare">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="CornerRadius" Value="8" />
+    </Style>
+
     <!-- dock metric tiles (§3.6): label + value centered both ways -->
     <Style Selector="Border.metric">
       <Setter Property="Margin" Value="3" />
@@ -281,14 +305,22 @@
           <!-- empty space = drag region (TitleBar role on HeaderBar) -->
           <Border Grid.Column="1" Background="Transparent" Name="DragRegion" />
 
-          <!-- gear: theme preset picker (background/accent/font/size/scale, applied live) -->
-          <Button Name="GearBtn" Grid.Column="2" Width="34" Height="34" Margin="0,0,6,0"
-                  VerticalAlignment="Center" CornerRadius="7" Padding="0"
-                  HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
-                  BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
-                  Background="{StaticResource KeyFace}"
-                  Foreground="{StaticResource TextStrong}" FontSize="15" Content="⚙"
-                  chrome:WindowDecorationProperties.ElementRole="User" />
+          <!-- quick style controls: always-visible button drawer (web .ui-quick-controls);
+               each opens its category's picker panel below it -->
+          <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6"
+                      Margin="0,0,6,0" VerticalAlignment="Center"
+                      chrome:WindowDecorationProperties.ElementRole="User">
+            <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
+              <Border Name="PickBgSwatch" Width="14" Height="14" CornerRadius="3"
+                      BorderBrush="{StaticResource LineStrong}" BorderThickness="1" />
+            </Button>
+            <Button Name="PickAccentBtn" Classes="quick" ToolTip.Tip="Accent color">
+              <Border Name="PickAccentSwatch" Width="12" Height="12" CornerRadius="999" />
+            </Button>
+            <Button Name="PickFontBtn" Classes="quick" ToolTip.Tip="Font" Content="C" />
+            <Button Name="PickSizeBtn" Classes="quick" ToolTip.Tip="Font size" Content="5" />
+            <Button Name="PickScaleBtn" Classes="quick" ToolTip.Tip="UI scale" Content="MD" FontSize="9" />
+          </StackPanel>
 
           <!-- caption buttons: ✕ hides to tray, real quit lives in the tray menu -->
           <StackPanel Grid.Column="3" Orientation="Horizontal"
