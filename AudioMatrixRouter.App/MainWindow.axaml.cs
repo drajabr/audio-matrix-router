@@ -2,6 +2,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Media.Transformation;
 using Avalonia.Threading;
 using AudioMatrixRouter.App.Controls;
 using AudioMatrixRouter.App.Services;
@@ -54,6 +55,10 @@ public partial class MainWindow : Window
     private UpdateState _updateState = UpdateState.Idle;
     private string _updateVersion = "";
     private int _updatePercent;
+    private long _updateBytes;          // size of what will be downloaded
+    private double _updateSpeedBps;     // smoothed download rate
+    private int _lastProgressPercent;
+    private long _lastProgressAt;
 
     /// <summary>Raised when the app must really exit (update apply armed a restart).</summary>
     public event Action? QuitRequested;
@@ -381,6 +386,9 @@ public partial class MainWindow : Window
             if (_updateState == UpdateState.Available)
             {
                 _updatePercent = 0;
+                _updateSpeedBps = 0;
+                _lastProgressPercent = 0;
+                _lastProgressAt = 0;
                 SetUpdateState(UpdateState.Downloading);
                 await _controller.DownloadUpdateAsync();
                 SetUpdateState(_controller.CanApplyUpdate ? UpdateState.Ready : UpdateState.Idle);
@@ -406,9 +414,12 @@ public partial class MainWindow : Window
             if (!string.IsNullOrEmpty(result.AvailableVersion))
             {
                 _updateVersion = result.AvailableVersion!;
+                _updateBytes = result.DownloadBytes;
                 SetUpdateState(UpdateState.Available);
                 return;
             }
+            _updateVersion = result.CurrentVersion;
+            _updateBytes = 0;
             SetUpdateState(UpdateState.Current);
             DispatcherTimer.RunOnce(() =>
             {
@@ -429,35 +440,79 @@ public partial class MainWindow : Window
     private void OnUpdateDownloadProgress(int percent)
     {
         _updatePercent = Math.Clamp(percent, 0, 100);
-        if (_updateState == UpdateState.Downloading)
-            UpdateSuffix.Text = $"{_updatePercent}%";
+
+        // Velopack reports percent only; derive bytes/sec from how fast the percentage
+        // moves against the known package size, smoothed so the figure stays readable.
+        var now = Environment.TickCount64;
+        if (_updateBytes > 0 && _lastProgressAt > 0 && now > _lastProgressAt)
+        {
+            var deltaBytes = (_updatePercent - _lastProgressPercent) / 100.0 * _updateBytes;
+            var deltaSec = (now - _lastProgressAt) / 1000.0;
+            if (deltaBytes > 0 && deltaSec > 0.05)
+            {
+                var sample = deltaBytes / deltaSec;
+                _updateSpeedBps = _updateSpeedBps <= 0 ? sample : _updateSpeedBps * 0.7 + sample * 0.3;
+                _lastProgressPercent = _updatePercent;
+                _lastProgressAt = now;
+            }
+        }
+        else
+        {
+            _lastProgressPercent = _updatePercent;
+            _lastProgressAt = now;
+        }
+
+        if (_updateState == UpdateState.Downloading) SetUpdateState(UpdateState.Downloading);
     }
+
+    private static string FormatBytes(double bytes) => bytes switch
+    {
+        >= 1024 * 1024 * 1024 => $"{bytes / (1024 * 1024 * 1024):0.0} GB",
+        >= 1024 * 1024 => $"{bytes / (1024 * 1024):0.0} MB",
+        >= 1024 => $"{bytes / 1024:0} KB",
+        _ => $"{bytes:0} B",
+    };
 
     private void SetUpdateState(UpdateState state)
     {
         _updateState = state;
-        // ONE pill: "v0.3.0" stays put, only the action suffix changes with state.
+
+        // ONE pill: the version stays put on the left; the right half spells out what
+        // is happening and what a click will do (plus size/progress/speed mid-download).
+        var size = _updateBytes > 0 ? FormatBytes(_updateBytes) : null;
+        var done = _updateBytes > 0 ? FormatBytes(_updateBytes * _updatePercent / 100.0) : null;
+        var speed = _updateSpeedBps > 0 ? $" · {FormatBytes(_updateSpeedBps)}/s" : "";
+
         UpdateSuffix.Text = state switch
         {
-            UpdateState.Checking => "…",
-            UpdateState.Current => "✓",
-            UpdateState.Available => $"↓ v{_updateVersion}",
-            UpdateState.Downloading => $"{_updatePercent}%",
-            UpdateState.Ready => "RESTART",
-            UpdateState.Error => "!",
-            UpdateState.Portable => "⟳",
-            _ => "⟳",
+            UpdateState.Checking => "checking…",
+            UpdateState.Current => "up to date ✓",
+            UpdateState.Available => size is null
+                ? $"↓ update to v{_updateVersion}"
+                : $"↓ update to v{_updateVersion} · {size}",
+            UpdateState.Downloading => done is null
+                ? $"downloading {_updatePercent}%"
+                : $"{_updatePercent}% · {done}/{size}{speed}",
+            UpdateState.Ready => "restart to install ⏻",
+            UpdateState.Error => "failed — retry",
+            UpdateState.Portable => "portable build",
+            _ => "check for updates ⟳",
         };
         ToolTip.SetTip(UpdateBtn, state switch
         {
-            UpdateState.Checking => "Checking for updates…",
-            UpdateState.Current => "Up to date",
-            UpdateState.Available => $"Download v{_updateVersion}",
-            UpdateState.Downloading => $"Downloading update {_updatePercent}%",
-            UpdateState.Ready => "Restart to install the update",
-            UpdateState.Portable => "Portable build — download the installer from GitHub Releases to enable in-app updates",
+            UpdateState.Checking => "Contacting GitHub releases…",
+            UpdateState.Current => $"v{_updateVersion} is the latest release",
+            UpdateState.Available => size is null
+                ? $"Version {_updateVersion} is available — click to download it in the background"
+                : $"Version {_updateVersion} is available ({size}) — click to download it in the background",
+            UpdateState.Downloading => $"Downloading v{_updateVersion}: {_updatePercent}%" +
+                                       (done is null ? "" : $" ({done} of {size})") +
+                                       (_updateSpeedBps > 0 ? $" at {FormatBytes(_updateSpeedBps)}/s" : "") +
+                                       ". You can keep using the app.",
+            UpdateState.Ready => $"v{_updateVersion} is ready. Click to close the app, install and relaunch.",
+            UpdateState.Portable => "This build updates itself only when installed via Setup.exe — grab it from GitHub Releases",
             UpdateState.Error => "Update check failed — click to retry",
-            _ => "Check for updates",
+            _ => "Click to check for a newer release",
         });
         UpdateBtn.Classes.Set("actionable", state is UpdateState.Available or UpdateState.Ready);
     }
@@ -714,6 +769,17 @@ public partial class MainWindow : Window
 
         Rebuild();
         PickerBackdrop.IsVisible = true;
+
+        // start from the hidden pose, then let the transitions carry it in on the
+        // next frame (setting both in one tick would skip the animation)
+        QuickList.Opacity = 0;
+        QuickList.RenderTransform = TransformOperations.Parse("translateY(-10px)");
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (_pickerCategory is null) return;
+            QuickList.Opacity = 1;
+            QuickList.RenderTransform = TransformOperations.Parse("translateY(0px)");
+        }, DispatcherPriority.Render);
     }
 
     /// <summary>Keep the floating drawer over the footprint reserved for it in the
@@ -1176,6 +1242,7 @@ public partial class MainWindow : Window
     {
         var custom = isInput ? _prefs.GetInputLabel(device.Id) : _prefs.GetOutputLabel(device.Id);
         var (primary, hardware) = SplitDeviceLabel(device.Name);
+        custom = CleanCustomLabel(custom, device.Name, hardware);
 
         var channels = Math.Max(1, device.Channels);
         if (!_peaksByDevice.TryGetValue(device.Id, out var peaks) || peaks.Length != channels)
@@ -1196,21 +1263,59 @@ public partial class MainWindow : Window
         };
     }
 
-    /// <summary>App.jsx getDeviceLabelParts, trimmed: text before "(" + first "(...)".</summary>
+    /// <summary>
+    /// Windows names endpoints "&lt;endpoint&gt; (&lt;hardware&gt;)". Split them so the
+    /// hardware part appears ONCE, on the sub-label line — the name never repeats what
+    /// is written underneath it. Matching runs from the end with depth counting so
+    /// nested parens survive ("Speaker (Realtek(R) Audio)" → "Speaker" + "Realtek(R) Audio").
+    /// </summary>
     private static (string Primary, string Hardware) SplitDeviceLabel(string raw)
     {
         raw = (raw ?? "").Trim();
-        var open = raw.IndexOf('(');
-        var primary = open > 0 ? raw[..open].Trim() : raw;
+
+        // "(loopback)" is our own marker, not part of the device name: hold it aside
+        // so the hardware match sees the real trailing group, then put it back.
+        const string loopback = "(loopback)";
+        var isLoopback = raw.EndsWith(loopback, StringComparison.OrdinalIgnoreCase);
+        var core = isLoopback ? raw[..^loopback.Length].TrimEnd() : raw;
+
+        var primary = core;
         var hardware = "";
-        if (open >= 0)
+        if (core.EndsWith(')'))
         {
-            var close = raw.IndexOf(')', open + 1);
-            if (close > open)
-                hardware = raw[(open + 1)..close].Trim();
+            var depth = 0;
+            for (var i = core.Length - 1; i >= 0; i--)
+            {
+                if (core[i] == ')') depth++;
+                else if (core[i] == '(' && --depth == 0)
+                {
+                    hardware = core[(i + 1)..^1].Trim();
+                    primary = core[..i].TrimEnd();
+                    break;
+                }
+            }
         }
-        if (hardware == primary) hardware = "";
-        return (primary.Length > 0 ? primary : raw, hardware);
+
+        if (primary.Length == 0) { primary = core; hardware = ""; }
+        if (string.Equals(hardware, primary, StringComparison.OrdinalIgnoreCase)) hardware = "";
+        if (isLoopback) primary += " " + loopback;
+        return (primary, hardware);
+    }
+
+    /// <summary>A saved label that is just the raw device name is not a real rename —
+    /// treat it as absent, and strip a trailing "(hardware)" from genuine ones.</summary>
+    private static string? CleanCustomLabel(string? custom, string rawName, string hardware)
+    {
+        if (string.IsNullOrWhiteSpace(custom)) return null;
+        custom = custom.Trim();
+        if (string.Equals(custom, rawName.Trim(), StringComparison.OrdinalIgnoreCase)) return null;
+        if (hardware.Length > 0)
+        {
+            var suffix = "(" + hardware + ")";
+            if (custom.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                custom = custom[..^suffix.Length].TrimEnd();
+        }
+        return custom.Length > 0 ? custom : null;
     }
 
     private bool TryMapRoute(RouteSnapshot route, out DeviceSnapshot inDev, out int inCh, out DeviceSnapshot outDev, out int outCh)
@@ -1287,10 +1392,6 @@ public partial class MainWindow : Window
         MetricOutSync.Text = metrics.Outputs.Sum(d => d.SyncCorrections).ToString();
         MetricOutUnderruns.Text = metrics.Outputs.Sum(d => d.Underruns).ToString();
         MetricOutDrops.Text = metrics.Outputs.Sum(d => d.DroppedFrames).ToString();
-
-        StatusText.Text = metrics.Running
-            ? $"Running · {_totalLatencySmooth.Format(metrics.TotalLatencyMs)}"
-            : "Standby";
 
         // Dock card meters follow the detail pair.
         var (sourceId, destId) = ResolveDetailPair();

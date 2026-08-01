@@ -9,7 +9,6 @@ public partial class App : Application
 {
     private MainWindow? _mainWindow;
     private TrayIcon? _trayIcon;
-    private NativeMenuItem? _startupItem;
     private bool _quitting;
 
     public override void Initialize() => AvaloniaXamlLoader.Load(this);
@@ -71,27 +70,15 @@ public partial class App : Application
             // Icon decode failure must never block startup.
         }
 
+        // Deliberately just these two entries — everything else belongs in the app.
         var showItem = new NativeMenuItem("Show");
         showItem.Click += (_, _) => ShowMainWindow();
-
-        _startupItem = new NativeMenuItem("Start with Windows")
-        {
-            ToggleType = MenuItemToggleType.CheckBox,
-            IsChecked = _mainWindow?.StartupAtBoot ?? false,
-        };
-        _startupItem.Click += (_, _) =>
-        {
-            if (_mainWindow is not null && _startupItem is not null)
-                _startupItem.IsChecked = _mainWindow.ToggleStartupAtBoot();
-        };
 
         var quitItem = new NativeMenuItem("Quit");
         quitItem.Click += (_, _) => Quit(desktop);
 
         var menu = new NativeMenu();
         menu.Items.Add(showItem);
-        menu.Items.Add(_startupItem);
-        menu.Items.Add(new NativeMenuItemSeparator());
         menu.Items.Add(quitItem);
         _trayIcon.Menu = menu;
 

@@ -74,4 +74,10 @@ public sealed record RouteRequest(
     float GainDb,
     bool PhaseInverted);
 
-public sealed record UpdateCheckResult(string CurrentVersion, string? AvailableVersion, bool Portable);
+/// <summary><paramref name="DownloadBytes"/> is what will actually be fetched —
+/// the delta packages when Velopack can patch, otherwise the full package.</summary>
+public sealed record UpdateCheckResult(
+    string CurrentVersion,
+    string? AvailableVersion,
+    bool Portable,
+    long DownloadBytes = 0);

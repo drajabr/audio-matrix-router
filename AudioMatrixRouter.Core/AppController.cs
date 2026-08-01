@@ -908,7 +908,30 @@ public sealed class AppController : IDisposable
         return new UpdateCheckResult(
             mgr.CurrentVersion?.ToString() ?? AppVersionString,
             info?.TargetFullRelease?.Version?.ToString(),
-            Portable: false);
+            Portable: false,
+            DownloadBytes: EstimateDownloadBytes(info));
+    }
+
+    /// <summary>What the download will actually pull: the delta chain when one exists
+    /// (the usual case between consecutive releases), otherwise the full package.</summary>
+    private static long EstimateDownloadBytes(Velopack.UpdateInfo? info)
+    {
+        if (info is null) return 0;
+        try
+        {
+            var deltas = info.DeltasToTarget;
+            if (deltas is { Length: > 0 })
+            {
+                long sum = 0;
+                foreach (var d in deltas) sum += d.Size;
+                if (sum > 0) return sum;
+            }
+            return info.TargetFullRelease?.Size ?? 0;
+        }
+        catch
+        {
+            return 0; // size is cosmetic — never let it break the check
+        }
     }
 
     public async Task DownloadUpdateAsync()

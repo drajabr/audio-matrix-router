@@ -136,6 +136,10 @@ public sealed class MatrixControl : Control
     private string? _hoverColKey;
     private double _bottomInset;
 
+    // per-cell toggle animation: key -> eased 0..1 progress toward the on state
+    private readonly Dictionary<string, double> _tileAnim = new();
+    private bool _tileAnimating;
+
     // label-square resize drag (web grid-resize-handles: both axes write ONE value)
     private static readonly Cursor ResizeCursor = new(StandardCursorType.SizeAll);
     private const double ResizeGrip = 5;
@@ -491,41 +495,64 @@ public sealed class MatrixControl : Control
                      ((rt.Key == selRow!.Key && ct.StartUnit < selCol!.StartUnit) ||
                       (ct.Key == selCol!.Key && rt.StartUnit < selRow!.StartUnit));
 
-        // CSS: base off 0.62, on 1, blocked 0.5; with a selection, path cells 0.9 and
-        // everything else dims hard (.28 off / .38 on)
-        var opacity = blocked ? 0.5 : on ? 1.0 : 0.62;
-        if (hasSel && !isHover)
-            opacity = onPath ? 0.9 : on ? 0.38 : 0.28;
+        // Toggle animation: t eases 0→1 as the cell turns on, so the accent face,
+        // its glow and the readout fade in instead of snapping.
+        var t = blocked ? 0 : TileProgress(rt.Key + "|" + ct.Key, on);
 
-        var pen = blocked ? BlockedPen
+        // CSS: base off 0.62, on 1, blocked 0.5; with a selection, path cells 0.9 and
+        // everything else dims hard (.28 off / .38 on) — interpolated across t
+        var offOpacity = blocked ? 0.5 : 0.62;
+        var onOpacity = 1.0;
+        if (hasSel && !isHover)
+        {
+            offOpacity = onPath ? 0.9 : 0.28;
+            onOpacity = onPath ? 0.9 : 0.38;
+        }
+        var opacity = offOpacity + (onOpacity - offOpacity) * t;
+
+        var basePen = blocked ? BlockedPen
             : isHover ? HoverTilePen
             : phase ? PhaseTilePen
-            : on ? OnTilePen
             : OffTilePen;
+        var litPen = isHover ? HoverTilePen : phase ? PhaseTilePen : OnTilePen;
 
         var rr = new RoundedRect(rect, AppTheme.RadiusTile);
 
         using (ctx.PushOpacity(opacity))
         {
-            if (on)
+            if (t > 0.01)
             {
                 // soft outer glow: concentric rounded strokes with decreasing alpha
-                for (var g = GlowPens.Length - 1; g >= 0; g--)
+                using (ctx.PushOpacity(t))
                 {
-                    var inf = GlowInflates[g];
-                    ctx.DrawRectangle(null, GlowPens[g], new RoundedRect(rect.Inflate(inf), AppTheme.RadiusTile + inf));
+                    for (var g = GlowPens.Length - 1; g >= 0; g--)
+                    {
+                        var inf = GlowInflates[g];
+                        ctx.DrawRectangle(null, GlowPens[g], new RoundedRect(rect.Inflate(inf), AppTheme.RadiusTile + inf));
+                    }
                 }
             }
             if (phase)
                 ctx.DrawRectangle(null, PhaseGlowPen, new RoundedRect(rect.Inflate(1.5), AppTheme.RadiusTile + 1.5));
 
-            ctx.DrawRectangle(on ? AccentFaceBrush : KeyFaceBrush, pen, rr);
+            ctx.DrawRectangle(KeyFaceBrush, basePen, rr);
+            if (t > 0.01)
+            {
+                using (ctx.PushOpacity(t))
+                {
+                    ctx.DrawRectangle(AccentFaceBrush, litPen, rr);
+                }
+            }
 
             // --fx-edge: 1px light on top, 1px shade on the bottom (inset, corner-clear)
             if (rect.Width > 16 && rect.Height > 12)
             {
-                ctx.DrawRectangle(on ? EdgeLightOnBrush : EdgeLightBrush, null,
-                    new Rect(rect.X + AppTheme.RadiusTile, rect.Y + 1, rect.Width - 2 * AppTheme.RadiusTile, 1));
+                var edge = new Rect(rect.X + AppTheme.RadiusTile, rect.Y + 1, rect.Width - 2 * AppTheme.RadiusTile, 1);
+                ctx.DrawRectangle(EdgeLightBrush, null, edge);
+                if (t > 0.01)
+                {
+                    using (ctx.PushOpacity(t)) { ctx.DrawRectangle(EdgeLightOnBrush, null, edge); }
+                }
                 // Overlap the border stroke (0.25px past its inner edge): meeting it
                 // exactly still left an anti-aliased hairline between shade and border.
                 ctx.DrawRectangle(EdgeShadeBrush, null,
@@ -537,17 +564,69 @@ public sealed class MatrixControl : Control
             else if (phase)
                 DrawDiagonalStripes(ctx, rr, PhaseStripePen, 9);
 
-            if (on && cell is not null && Math.Abs(cell.GainDb) >= 0.5)
+            if (t > 0.01 && cell is not null && Math.Abs(cell.GainDb) >= 0.5)
             {
                 // small bold centered readout, dark-on-accent, e.g. "+3.5dB"
                 var text = FormatGain(cell.GainDb);
                 var ft = Ft(text, FaceBold, AppTheme.Fs2xs, ReadoutBrush);
                 var origin = new Point(rect.Center.X - ft.Width / 2, rect.Center.Y - ft.Height / 2);
                 var shadow = Ft(text, FaceBold, AppTheme.Fs2xs, TextShadowBrush);
-                ctx.DrawText(shadow, origin + new Vector(0, 1));
-                ctx.DrawText(ft, origin);
+                using (ctx.PushOpacity(t))
+                {
+                    ctx.DrawText(shadow, origin + new Vector(0, 1));
+                    ctx.DrawText(ft, origin);
+                }
             }
         }
+    }
+
+    /// <summary>Current 0..1 toggle progress for a cell, starting the ease loop when
+    /// it has not reached its target yet. First sight of a cell snaps (no intro fade).</summary>
+    private double TileProgress(string key, bool on)
+    {
+        var target = on ? 1.0 : 0.0;
+        if (!_tileAnim.TryGetValue(key, out var cur))
+        {
+            _tileAnim[key] = target;
+            return target;
+        }
+        if (Math.Abs(cur - target) > 0.005) StartTileAnimation();
+        return cur;
+    }
+
+    private void StartTileAnimation()
+    {
+        if (_tileAnimating) return;
+        var top = TopLevel.GetTopLevel(this);
+        if (top is null) return;
+        _tileAnimating = true;
+        top.RequestAnimationFrame(TileTick);
+    }
+
+    private void TileTick(TimeSpan _)
+    {
+        _tileAnimating = false;
+        var m = _model;
+        if (m is null) return;
+
+        var moving = false;
+        foreach (var key in _tileAnim.Keys.ToList())
+        {
+            var target = m.Cells.TryGetValue(key, out var c) && c.On ? 1.0 : 0.0;
+            var cur = _tileAnim[key];
+            var delta = target - cur;
+            if (Math.Abs(delta) <= 0.01)
+            {
+                if (target <= 0 && !m.Cells.ContainsKey(key)) _tileAnim.Remove(key);
+                else _tileAnim[key] = target;
+                continue;
+            }
+            _tileAnim[key] = cur + delta * 0.3; // ~120ms to settle at 60fps
+            moving = true;
+        }
+
+        InvalidateVisual();
+        if (moving) StartTileAnimation();
     }
 
     private static void DrawDiagonalStripes(DrawingContext ctx, RoundedRect rr, IPen pen, double step)

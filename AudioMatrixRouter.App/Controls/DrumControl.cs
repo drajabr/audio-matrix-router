@@ -145,6 +145,10 @@ public sealed class DrumControl : Control
     /// <summary>Tiny caps label ABOVE the value (e.g. "IN"); null = value only.</summary>
     public string? Caption { get; set; }
 
+    /// <summary>Value type size relative to FsLg. The master gain is the headline
+    /// readout (1.0); the buffer is a secondary setting and reads smaller.</summary>
+    public double ValueScale { get; set; } = 1.0;
+
     /// <summary>Small unit suffix drawn after the value at reduced size (e.g. "dB").</summary>
     public string? Suffix { get; set; }
 
@@ -333,10 +337,11 @@ public sealed class DrumControl : Control
     {
         var text = (ValueFormatter ?? DefaultFormat)(_value);
         // value: lg, weight 800, text-strong (CSS .corner-gain-wheel-value)
+        var valueSize = AppTheme.FsLg * ValueScale;
         var value = new FormattedText(text, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-            FaceHeavy, AppTheme.FsLg, AppTheme.TextStrongBrush);
+            FaceHeavy, valueSize, AppTheme.TextStrongBrush);
         var shadow = new FormattedText(text, CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-            FaceHeavy, AppTheme.FsLg, ValueShadowBrush);
+            FaceHeavy, valueSize, ValueShadowBrush);
 
         FormattedText? suffix = null;
         if (!string.IsNullOrEmpty(Suffix))
