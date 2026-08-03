@@ -294,7 +294,7 @@
                       chrome:WindowDecorationProperties.ElementRole="User">
                 <StackPanel Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
                   <TextBlock Name="VersionText" Text="v0.0.0" VerticalAlignment="Center" />
-                  <TextBlock Name="UpdateSuffix" Text="⟳" VerticalAlignment="Center" />
+                  <TextBlock Name="UpdateSuffix" Text="check for updates" VerticalAlignment="Center" />
                 </StackPanel>
               </Button>
             </StackPanel>

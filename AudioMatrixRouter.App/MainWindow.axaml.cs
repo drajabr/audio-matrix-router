@@ -490,20 +490,22 @@ public partial class MainWindow : Window
         var done = _updateBytes > 0 ? FormatBytes(_updateBytes * _updatePercent / 100.0) : null;
         var speed = _updateSpeedBps > 0 ? $" · {FormatBytes(_updateSpeedBps)}/s" : "";
 
+        // Text only, no symbol glyphs: ⟳/✓/⏻ are not in Consolas, and the fallback
+        // font's taller line box made the pill text jump vertically between states.
         UpdateSuffix.Text = state switch
         {
             UpdateState.Checking => "checking…",
-            UpdateState.Current => "up to date ✓",
+            UpdateState.Current => "up to date",
             UpdateState.Available => size is null
                 ? $"↓ update to v{_updateVersion}"
                 : $"↓ update to v{_updateVersion} · {size}",
             UpdateState.Downloading => done is null
                 ? $"downloading {_updatePercent}%"
                 : $"{_updatePercent}% · {done}/{size}{speed}",
-            UpdateState.Ready => "restart to install ⏻",
+            UpdateState.Ready => "restart to install",
             UpdateState.Error => "failed — retry",
             UpdateState.Portable => "portable build",
-            _ => "check for updates ⟳",
+            _ => "check for updates",
         };
         ToolTip.SetTip(UpdateBtn, state switch
         {
@@ -642,11 +644,11 @@ public partial class MainWindow : Window
 
     private void OnMasterGainCommitted(float newMaster)
     {
-        // UI reacts instantly; the route push is debounced — pushing every active route
-        // per 0.5dB wheel tick made the wheel feel laggy.
+        // The route push is debounced — pushing every active route per 0.5dB wheel tick
+        // made the wheel feel laggy. No model rebuild here: master gain is invisible on
+        // the tiles by design (their readouts are per-tile offsets only).
         _masterGainDb = ClampDb(newMaster);
         _prefs.MasterGainDb = _masterGainDb;
-        RebuildModel(); // gain readouts shift immediately
         _gainApplyTimer.Stop();
         _gainApplyTimer.Start();
     }
@@ -1137,7 +1139,11 @@ public partial class MainWindow : Window
             if (!TryMapRoute(route, out var inDev, out var inCh, out var outDev, out var outCh))
                 continue;
 
-            var cellGain = ClampDb(route.GainDb - _masterGainDb);
+            // Tiles show ONLY their own offset. Route gains include the master gain that
+            // was last PUSHED (_appliedMasterGainDb), so subtract exactly that — using the
+            // wheel's live value here made every tile sprout a phantom readout while the
+            // master moved (and until the debounced apply landed).
+            var cellGain = ClampDb(route.GainDb - _appliedMasterGainDb);
             if (channelView)
             {
                 cells[$"ch:{inDev.Id}:{inCh}|ch:{outDev.Id}:{outCh}"] = new MatrixCell
