@@ -578,16 +578,27 @@ public sealed class AppController : IDisposable
             });
         }
 
+        // Input-side figure = the worst ROUTED capture+queue path, so it decomposes the
+        // same routes the total measures (the master input may be an idle loopback whose
+        // queue means nothing). Output-side = everything that is NOT the input path —
+        // the raw render-buffer number was a constant equal to the knob setting.
+        double? inputSide = Engine.TryGetRoutedInputPathLatencyMs(out var routedInputLatency)
+            ? Math.Round(routedInputLatency, 1)
+            : Engine.TryGetInputPathLatencyMs(out var inputPathLatency)
+                ? Math.Round(inputPathLatency, 1)
+                : null;
+        double? outputSide = maxWorkingLatencyMs is { } total && inputSide is { } inp
+            ? Math.Max(0, Math.Round(total - inp, 1))
+            : Engine.TryGetOutputPathLatencyMs(out var outputPathLatency)
+                ? Math.Round(outputPathLatency, 1)
+                : null;
+
         return new MetricsSnapshot
         {
             Running = Engine.IsRunning,
             TotalLatencyMs = maxWorkingLatencyMs,
-            InputLatencyMs = Engine.TryGetInputPathLatencyMs(out var inputPathLatency)
-                ? Math.Round(inputPathLatency, 1)
-                : null,
-            OutputLatencyMs = Engine.TryGetOutputPathLatencyMs(out var outputPathLatency)
-                ? Math.Round(outputPathLatency, 1)
-                : null,
+            InputLatencyMs = inputSide,
+            OutputLatencyMs = outputSide,
             InputJitterMs = Engine.TryGetInputJitterMs(out var inputJitter)
                 ? Math.Round(inputJitter, 1)
                 : null,

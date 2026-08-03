@@ -113,12 +113,16 @@ jobs:
           --icon AudioMatrixRouter.App/app.ico
           --noPortable
 
+      # Every push builds an installable Setup and stores it as a workflow artifact
+      # (Actions run page → Artifacts), named by version + run so parallel test builds
+      # on other devices are distinguishable before anything is released.
       - name: Upload Velopack setup artifact
         uses: actions/upload-artifact@v4
         with:
-          name: audio-matrix-router-setup
+          name: audio-matrix-router-setup-${{ needs.version.outputs.app_version_number }}-r${{ github.run_number }}
           path: Releases/*.exe
           if-no-files-found: error
+          retention-days: 14
 
       - name: Create tag
         if: needs.version.outputs.release_requested == 'true'

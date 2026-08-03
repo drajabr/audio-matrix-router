@@ -91,14 +91,14 @@ public sealed class InputAsrc
 
     /// <summary>
     /// Surplus beyond which the servo stops easing and simply cuts. Ring fill naturally
-    /// sawtooths by roughly one render gulp above target (render drains in output-buffer
-    /// chunks while capture feeds 10 ms ones), so the threshold must sit safely OUTSIDE
-    /// that: a full extra target (≈1.5 output buffers), floored at ~20 ms. Tighter
-    /// settings put the trip point inside normal operation and the drain fires on every
-    /// callback — a permanent stutter loop, not a recovery.
+    /// sawtooths by roughly one render gulp above target (render drains in render-buffer
+    /// chunks while capture feeds 10 ms ones), and the budget guarantees target ≥ gulp
+    /// + 10 ms — so half a target, floored at 20 ms, always clears the normal excursion
+    /// while keeping steady-state latency near what the knob promises. Tighter trips
+    /// inside normal operation (a permanent stutter loop, not a recovery).
     /// </summary>
     private static double HardDrainFrames(int targetFillFrames, int engineSampleRate) =>
-        Math.Max(targetFillFrames, engineSampleRate * 20 / 1000.0);
+        Math.Max(targetFillFrames / 2.0, engineSampleRate * 20 / 1000.0);
 
     public void SetFillConsumer(string consumerId)
     {

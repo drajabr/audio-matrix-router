@@ -51,12 +51,16 @@ public class AudioEngine : IDisposable
     // Ring capacity stays at a stable ceiling; sliders move targets, not allocations.
     private const int RingBufferCapacityMs = 400;
     private const int RenderPeriodMs = 10;
-    // Input ASRC keeps ring fill at (output buffer + headroom) so render-side jitter
-    // never starves the ring in steady state. The headroom SCALES with the user's
-    // buffer setting instead of being a fixed slab — the knob owns the whole latency
-    // budget. (It used to be a flat 30 ms, which put a 60 ms floor under a 10 ms
-    // buffer and made the minimum setting almost meaningless.)
-    private const int MinInputFillHeadroomMs = 4;
+    // ===== Latency budget =====
+    // The user's knob (_outputBufferMs, kept under its historic name for config
+    // compatibility) is the TARGET END-TO-END LATENCY. The engine splits it:
+    //   capture buffer  : 10 ms fixed (the WASAPI shared-mode period — nothing gained
+    //                     by making it configurable, plenty lost when it was out/2)
+    //   render buffer   : a quarter of the budget, 10..50 ms
+    //   ring fill target: whatever remains — floored at (render + 10 ms) so one render
+    //                     gulp plus one capture block can never starve the ring
+    // Reported total ≈ capture + fill + render ≈ the knob value, so what the user sets
+    // is what the tiles show. Below ~40 ms the stability floors win over the split.
 
     private readonly DeviceEnumerator _enumerator = new();
     private readonly List<ActiveDevice> _inputDevices = [];
@@ -176,6 +180,48 @@ public class AudioEngine : IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Worst capture+queue latency across ACTIVE routes — the input-side figure that
+    /// pairs with the route-based total. The master-input variant below measures a
+    /// device nobody may be routed to (an idle loopback master reads high and means
+    /// nothing), which made total−input go negative on the metrics tiles.
+    /// </summary>
+    public bool TryGetRoutedInputPathLatencyMs(out double latencyMs)
+    {
+        latencyMs = 0;
+        bool any = false;
+        var matrix = _routingMatrix;
+        var front = matrix.GetFrontBuffer();
+        int outChannels = matrix.OutputChannels;
+        if (front.Length == 0 || outChannels == 0 || _engineSampleRate <= 0) return false;
+
+        var seen = new HashSet<(string InputId, string ConsumerId)>();
+        for (int inCh = 0; inCh < matrix.InputChannels; inCh++)
+        {
+            var input = FindInputDeviceByChannel(inCh);
+            if (input?.RingBuffer == null) continue;
+
+            for (int outCh = 0; outCh < outChannels; outCh++)
+            {
+                int idx = inCh * outChannels + outCh;
+                if (idx >= front.Length || !front[idx].Active) continue;
+
+                var output = FindOutputDeviceByChannel(outCh);
+                if (output == null) continue;
+
+                var consumerId = string.IsNullOrWhiteSpace(output.ConsumerId) ? output.Info.Id : output.ConsumerId;
+                if (!seen.Add((input.Info.Id, consumerId))) continue;
+
+                int captureDriverMs = input.CaptureLatencyMs > 0 ? input.CaptureLatencyMs : _inputBufferMs;
+                double queueMs = (input.RingBuffer.GetAvailableFrames(consumerId) * 1000.0) / _engineSampleRate;
+                var path = captureDriverMs + queueMs;
+                if (path > latencyMs) latencyMs = path;
+                any = true;
+            }
+        }
+        return any;
     }
 
     public bool TryGetInputPathLatencyMs(out double latencyMs)
@@ -770,7 +816,9 @@ public class AudioEngine : IDisposable
             // Barrier releases at the input ASRC's fill target (outputBuffer + headroom),
             // not below it — otherwise the servo ramps fill up by the headroom right
             // after start, a real latency step in the first seconds of every start.
-            _syncCoordinator.SetHoldHeadroomMs(InputFillHeadroomMs);
+            // The coordinator computes its release target as (knob + headroom); hand it
+            // the difference so barrier release fill == the ASRC's actual fill target.
+            _syncCoordinator.SetHoldHeadroomMs(InputFillTargetMs - _outputBufferMs);
             _syncCoordinator.ArmGlobalRefillHold();
 
             var sources = _inputDevices
@@ -801,7 +849,7 @@ public class AudioEngine : IDisposable
                     dev.ConsumerId,
                     _syncCoordinator);
 
-                if (!TryInitRender(dev, mmDevice, _outputBufferMs))
+                if (!TryInitRender(dev, mmDevice, RenderBufferMs))
                 {
                     try { dev.MixProvider?.DetachConsumer(); } catch { }
                     dev.MixProvider = null;
@@ -1118,17 +1166,18 @@ public class AudioEngine : IDisposable
         }
     }
 
-    /// <summary>Headroom above one output buffer, derived from the buffer itself:
-    /// half a buffer covers the capture/render callback interleave at any setting.</summary>
-    private int InputFillHeadroomMs => Math.Max(MinInputFillHeadroomMs, _outputBufferMs / 2);
+    /// <summary>Render buffer share of the latency budget (see the budget comment).</summary>
+    private int RenderBufferMs => Math.Clamp(_outputBufferMs / 4, 10, 50);
 
-    private int CalculateInputFillTargetFrames()
-    {
-        // Keep ring fill at output-buffer + headroom so render jitter never starves the
-        // ring, while staying well inside ring capacity (400 ms).
-        int targetMs = Math.Clamp(_outputBufferMs + InputFillHeadroomMs, 12, RingBufferCapacityMs * 3 / 4);
-        return Math.Max(64, _engineSampleRate * targetMs / 1000);
-    }
+    /// <summary>Ring fill target: the budget minus capture and render, floored for
+    /// stability (one render gulp + one capture block must always be covered).</summary>
+    private int InputFillTargetMs => Math.Clamp(
+        _outputBufferMs - _inputBufferMs - RenderBufferMs,
+        RenderBufferMs + 10,
+        RingBufferCapacityMs * 3 / 4);
+
+    private int CalculateInputFillTargetFrames() =>
+        Math.Max(64, _engineSampleRate * InputFillTargetMs / 1000);
 
     private (int BaseMasterTargetFrames, int MaxMasterTargetFrames) CalculateSyncTargetFrames()
     {

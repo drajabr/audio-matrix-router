@@ -862,8 +862,11 @@ public partial class MainWindow : Window
         _pendingBufferMs = null;
         try
         {
+            // The knob is the end-to-end latency budget; the engine splits it. Capture
+            // stays at the 10 ms WASAPI period — deriving it from the knob only ever
+            // added latency without adding stability.
             _controller.SetOutputBufferMs(outMs);
-            _controller.SetInputBufferMs(Math.Clamp(outMs / 2, 10, 40));
+            _controller.SetInputBufferMs(10);
         }
         catch (Exception ex) { ShowBanner(ex.Message); }
     }
@@ -1472,9 +1475,12 @@ public partial class MainWindow : Window
             }
 
             _missingSince = 0;
-            _smooth = _smooth is { } s ? s * 0.9 + v * 0.1 : v;
+            // Fast tracker: big moves pass straight through (a buffer change or drain
+            // must show immediately, not crawl over seconds), small ones get a light
+            // EMA so the last digit doesn't flicker at 10 Hz.
+            _smooth = _smooth is { } s && Math.Abs(v - s) < 8 ? s * 0.6 + v * 0.4 : v;
             var display = Math.Round(_smooth.Value, 1);
-            if (_shown is not { } last || Math.Abs(display - last) >= 1.2 || now - _shownAt >= 900)
+            if (_shown is not { } last || Math.Abs(display - last) >= 0.7 || now - _shownAt >= 400)
             {
                 _shown = display;
                 _shownAt = now;
