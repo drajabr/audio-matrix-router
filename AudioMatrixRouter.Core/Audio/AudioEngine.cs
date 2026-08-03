@@ -930,6 +930,7 @@ public class AudioEngine : IDisposable
             _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
             // ===== 5. Start captures (rings begin filling; cursors already pinned) =====
+            _worstCaptureCadenceMs = 10; // provisional until real cadences are known
             int inputFillTargetFrames = CalculateInputFillTargetFrames();
             foreach (var dev in _inputDevices)
             {
@@ -939,6 +940,21 @@ public class AudioEngine : IDisposable
                     continue;
                 }
             }
+
+            // Real cadences are known now (small-period mics can be < 10 ms):
+            // recompute the fill target and retarget every servo + the barrier
+            // BEFORE release — the rings are still pre-filling, so this is glitch-free.
+            _worstCaptureCadenceMs = _inputDevices
+                .Where(d => d.Capture != null)
+                .Select(d => d.CaptureCadenceMs)
+                .DefaultIfEmpty(10)
+                .Max();
+            int refinedFillFrames = CalculateInputFillTargetFrames();
+            foreach (var dev in _inputDevices)
+            {
+                dev.InputAsrc?.SetTargetFillFrames(refinedFillFrames);
+            }
+            _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
             // ===== 6. Play all outputs together =====
             foreach (var dev in _outputDevices)
@@ -1063,8 +1079,22 @@ public class AudioEngine : IDisposable
         // Endpoint buffer DEPTH is not latency — the delivery cadence drains it every
         // period regardless. A 1-period-deep buffer silently DROPPED a packet whenever
         // the capture thread was one period late; 4+ periods of depth costs nothing.
-        // Loopbacks use the polled 20 ms / ~10 ms-cadence mode (see Endpoints.cs).
-        dev.Capture = new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
+        // Loopbacks use the polled 20 ms / ~10 ms-cadence mode.
+        string endpointId = dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
+            ? dev.Info.Id.Substring("loop:".Length)
+            : dev.Info.Id;
+        ICaptureEndpoint? custom = null;
+        if (!string.Equals(_backend, "legacy", StringComparison.OrdinalIgnoreCase))
+        {
+            custom = new Wasapi.WasapiCaptureClient(
+                endpointId,
+                dev.IsLoopback
+                    ? Wasapi.WasapiCaptureClient.CaptureMode.PolledLoopback
+                    : Wasapi.WasapiCaptureClient.CaptureMode.EventMic,
+                EndpointTier.MinPeriod,
+                dev.Info.Name);
+        }
+        dev.Capture = custom ?? new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
             Math.Max(40, _inputBufferMs), dev.Info.SampleRate, dev.Info.Channels);
 
         // Capture-side ASRC: convert this device's stream into the engine clock domain.
@@ -1074,14 +1104,71 @@ public class AudioEngine : IDisposable
         asrc.SetFillConsumer(masterConsumerId);
         dev.InputAsrc = asrc;
 
+        RewireCaptureHandler(dev);
+
+        try
+        {
+            dev.Capture.Start();
+
+            // Format drift guard for the custom client: it captures at the LIVE mix
+            // format; if that no longer matches what we enumerated (user changed the
+            // endpoint format), the ASRC's static ratio would be wrong. Fall back to
+            // the NAudio adapter, which converts to our requested format.
+            if (dev.Capture is Wasapi.WasapiCaptureClient wc &&
+                (wc.ActualSampleRate != dev.Info.SampleRate || wc.ActualChannels != dev.Info.Channels))
+            {
+                var handlerCarrier = dev.Capture;
+                try { handlerCarrier.Dispose(); } catch { }
+                dev.Capture = new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
+                    Math.Max(40, _inputBufferMs), dev.Info.SampleRate, dev.Info.Channels);
+                RewireCaptureHandler(dev);
+                dev.Capture.Start();
+            }
+        }
+        catch
+        {
+            // Custom client failed outright → one NAudio retry before giving up.
+            if (dev.Capture is Wasapi.WasapiCaptureClient)
+            {
+                try { dev.Capture?.Dispose(); } catch { }
+                try
+                {
+                    dev.Capture = new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
+                        Math.Max(40, _inputBufferMs), dev.Info.SampleRate, dev.Info.Channels);
+                    RewireCaptureHandler(dev);
+                    dev.Capture.Start();
+                }
+                catch
+                {
+                    try { dev.Capture?.Dispose(); } catch { }
+                    dev.Capture = null;
+                    dev.InputAsrc = null;
+                    return false;
+                }
+            }
+            else
+            {
+                try { dev.Capture?.Dispose(); } catch { }
+                dev.Capture = null;
+                dev.InputAsrc = null;
+                return false;
+            }
+        }
+
+        // Latency contribution = delivery cadence (one period), NOT buffer depth.
+        dev.CaptureCadenceMs = dev.Capture.ActualPeriodMs;
+        dev.CaptureLatencyMs = (int)Math.Ceiling(dev.CaptureCadenceMs);
+        return true;
+    }
+
+    /// <summary>Re-attaches the standard capture handler after a fallback swap.</summary>
+    private void RewireCaptureHandler(ActiveDevice dev)
+    {
         int channels = dev.Info.Channels;
-        dev.Capture.DataAvailable += (buffer, frames) =>
+        dev.Capture!.DataAvailable += (buffer, frames) =>
         {
             var deviceAsrc = dev.InputAsrc;
-            if (dev.RingBuffer == null || deviceAsrc == null || frames <= 0)
-            {
-                return;
-            }
+            if (dev.RingBuffer == null || deviceAsrc == null || frames <= 0) return;
 
             var peaks = dev.PeakLevels;
             if (peaks != null)
@@ -1104,23 +1191,6 @@ public class AudioEngine : IDisposable
                 Interlocked.Increment(ref dev.InputOverflowCount);
             }
         };
-
-        try
-        {
-            dev.Capture.Start();
-        }
-        catch
-        {
-            try { dev.Capture?.Dispose(); } catch { }
-            dev.Capture = null;
-            dev.InputAsrc = null;
-            return false;
-        }
-
-        // Latency contribution = delivery cadence (one period), NOT buffer depth.
-        dev.CaptureCadenceMs = dev.Capture.ActualPeriodMs;
-        dev.CaptureLatencyMs = (int)Math.Ceiling(dev.CaptureCadenceMs);
-        return true;
     }
 
     public bool SetOutputBufferMs(int bufferMs)
@@ -1218,13 +1288,13 @@ public class AudioEngine : IDisposable
     /// <summary>Render buffer share of the latency budget (see the budget comment).</summary>
     private int RenderBufferMs => Math.Clamp(_outputBufferMs / 4, 10, 50);
 
-    // Delivery cadence of capture data: one engine period. This is what capture
-    // contributes to LATENCY — endpoint buffer DEPTH only absorbs scheduling jitter.
-    private const int CaptureCadenceMs = 10;
-
     // Worst REAL render gulp across started outputs (WASAPI tops the buffer to full
     // each period, so the gulp = the real buffer size). 0 until renders initialize.
     private int _worstRenderGulpMs;
+
+    // Worst REAL capture delivery cadence across started inputs (2.67-10ms for
+    // small-period mics, 10 for default periods and polled loopbacks).
+    private double _worstCaptureCadenceMs = 10;
 
     /// <summary>Ring fill target: the budget minus capture cadence and render, floored
     /// so one REAL render gulp + one capture block + safety can never starve the ring.</summary>
@@ -1233,9 +1303,10 @@ public class AudioEngine : IDisposable
         get
         {
             int gulp = _worstRenderGulpMs > 0 ? _worstRenderGulpMs : RenderBufferMs;
+            int cadence = (int)Math.Ceiling(_worstCaptureCadenceMs > 0 ? _worstCaptureCadenceMs : 10);
             return Math.Clamp(
-                _outputBufferMs - CaptureCadenceMs - RenderBufferMs,
-                gulp + CaptureCadenceMs + 5,
+                _outputBufferMs - cadence - RenderBufferMs,
+                gulp + cadence + 5,
                 RingBufferCapacityMs * 3 / 4);
         }
     }
