@@ -86,6 +86,9 @@ public class AppConfig
     public string InputMasterDeviceId { get; set; } = "";
     public string OutputMasterDeviceId { get; set; } = "";
     public string InputDeviceMode { get; set; } = "both";
+    /// <summary>"auto" = custom IAudioClient3 clients with per-device fallback;
+    /// "legacy" = NAudio backend (operator kill-switch).</summary>
+    public string EngineBackend { get; set; } = "auto";
     public string UiPreferencesJson { get; set; } = "";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
@@ -194,6 +197,7 @@ public class AppConfig
             StartupAtBoot = startupAtBoot,
             InputBufferMs = engine.InputBufferMs,
             OutputBufferMs = engine.OutputBufferMs,
+            EngineBackend = engine.Backend,
             InputMasterDeviceId = engine.GetInputMasterDevice()?.Info.Id ?? "",
             // Persist the durable preference, not just the session flags — a master that is
             // currently offline must survive the save or it would never be promoted again.
@@ -388,6 +392,7 @@ public class AppConfig
 
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
+        engine.SetBackend(EngineBackend);
         engine.SetInputBufferMs(InputBufferMs > 0 ? InputBufferMs : 40);
         engine.SetOutputBufferMs(OutputBufferMs > 0 ? OutputBufferMs : 40);
 

@@ -26,6 +26,9 @@ public class ActiveDevice
     public int RealRenderBufferMs { get; set; }
     public int RenderPeriodMs { get; set; }
     public bool IsLoopback { get; set; }
+    /// <summary>The period tier the next (re)start should request for this device
+    /// (adaptive degrade demotes it; survives Stop/Start).</summary>
+    public EndpointTier RequestedRenderTier { get; set; } = EndpointTier.MinPeriod;
     public double BaseLatencyMs { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
     public float[]? PeakLevels;
@@ -115,6 +118,18 @@ public class AudioEngine : IDisposable
     public int TotalOutputChannels { get; private set; }
     public int InputBufferMs => _inputBufferMs;
     public int OutputBufferMs => _outputBufferMs;
+
+    /// <summary>"auto" (IAudioClient3 clients) or "legacy" (NAudio). Applied at the
+    /// next engine start.</summary>
+    public string Backend => _backend;
+    private string _backend = "auto";
+
+    public void SetBackend(string? backend)
+    {
+        _backend = string.Equals(backend, "legacy", StringComparison.OrdinalIgnoreCase)
+            ? "legacy"
+            : "auto";
+    }
 
     public bool TryGetRouteWorkingLatencyMs(int inCh, int outCh, out double latencyMs)
     {
@@ -983,19 +998,31 @@ public class AudioEngine : IDisposable
 
     private bool TryInitRender(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
     {
+        // "auto" backend: our IAudioClient3 client (small-period ladder inside it).
+        // A total failure of the custom client falls through to NAudio — the belt
+        // under the ladder's own braces.
+        if (!string.Equals(_backend, "legacy", StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                IRenderEndpoint rc = new Wasapi.WasapiRenderClient(
+                    dev.Info.Id, latencyMs, dev.RequestedRenderTier, dev.Info.Name);
+                rc.Init(dev.MixProvider!);
+                AdoptRender(dev, rc, latencyMs);
+                return true;
+            }
+            catch
+            {
+                try { dev.Render?.Dispose(); } catch { }
+                dev.Render = null;
+            }
+        }
+
         try
         {
             IRenderEndpoint render = new NAudioRenderEndpoint(mmDevice, latencyMs, dev.Info.SampleRate);
             render.Init(dev.MixProvider!);
-            dev.Render = render;
-
-            // Honest numbers come from the endpoint (real buffer + one period of
-            // mix-ahead); fall back to the request when read-back was unavailable.
-            dev.RealRenderBufferMs = render.ActualBufferMs;
-            dev.RenderPeriodMs = (int)Math.Ceiling(render.ActualPeriodMs);
-            dev.RenderLatencyMs = render.ActualBufferMs > 0
-                ? render.ActualBufferMs + dev.RenderPeriodMs
-                : latencyMs;
+            AdoptRender(dev, render, latencyMs);
             return true;
         }
         catch
@@ -1004,6 +1031,18 @@ public class AudioEngine : IDisposable
             dev.Render = null;
             return false;
         }
+    }
+
+    private static void AdoptRender(ActiveDevice dev, IRenderEndpoint render, int requestedMs)
+    {
+        dev.Render = render;
+        // Honest numbers come from the endpoint (real buffer + one period of
+        // mix-ahead); fall back to the request when read-back was unavailable.
+        dev.RealRenderBufferMs = render.ActualBufferMs;
+        dev.RenderPeriodMs = (int)Math.Ceiling(render.ActualPeriodMs);
+        dev.RenderLatencyMs = render.ActualBufferMs > 0
+            ? render.ActualBufferMs + dev.RenderPeriodMs
+            : requestedMs;
     }
 
     private bool CreateAndStartCapture(ActiveDevice dev, int fillTargetFrames, string masterConsumerId)
