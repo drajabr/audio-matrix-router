@@ -58,8 +58,22 @@ jobs:
             release_requested=true
           fi
 
+          # Non-release builds get a UNIQUE prerelease version (next patch + -ci.run):
+          # Velopack refuses to install a Setup whose version equals the installed one,
+          # so a test artifact stamped with the released version was uninstallable.
+          # Semver orders these correctly: 0.4.4 < 0.4.5-ci.N < 0.4.5, so a test build
+          # installs over the current release and the NEXT release updates over it.
+          if [[ "$release_requested" != "true" ]]; then
+            base="${app_version#v}"
+            IFS=. read -r maj min patch <<< "$base"
+            app_version_number="${maj}.${min}.$(( ${patch:-0} + 1 ))-ci.${{ github.run_number }}"
+            app_version="v${app_version_number}"
+          else
+            app_version_number="${app_version#v}"
+          fi
+
           echo "app_version=$app_version" >> "$GITHUB_OUTPUT"
-          echo "app_version_number=${app_version#v}" >> "$GITHUB_OUTPUT"
+          echo "app_version_number=$app_version_number" >> "$GITHUB_OUTPUT"
           echo "release_requested=$release_requested" >> "$GITHUB_OUTPUT"
 
   windows-installer:

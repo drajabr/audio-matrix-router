@@ -39,6 +39,7 @@ public partial class MainWindow : Window
     private float _masterGainDb;
     private float _appliedMasterGainDb;        // master gain the snapshot's gains include
     private int? _pendingBufferMs;
+    private int? _pendingInBufferMs;
     private readonly DispatcherTimer _gainApplyTimer;
     private readonly DispatcherTimer _bufferApplyTimer;
     private bool _showAll;
@@ -602,9 +603,14 @@ public partial class MainWindow : Window
             UpdateCornerVisuals();
         };
 
+        InDrum.ValueFormatter = v => v.ToString("0") + "ms";
         OutDrum.ValueFormatter = v => v.ToString("0") + "ms";
         GainDrum.ValueFormatter = v => v.ToString("+0.0;-0.0;0.0");
         GainDrum.ShowGlow = true; // only the master gain wheel carries the accent glow
+        ToolTip.SetTip(InDrum, "Capture buffer. Leave at 10ms unless an input device glitches; " +
+                               "the latency budget rebalances around it.");
+        ToolTip.SetTip(OutDrum, "Target end-to-end latency. The engine splits it across " +
+                                "capture, ring and render buffers.");
 
         // ONE buffer knob: OUT is the knob that actually governs stability/latency
         // (render buffer + ASRC fill target + barrier); IN is derived. DEBOUNCED:
@@ -614,6 +620,12 @@ public partial class MainWindow : Window
         OutDrum.ValueCommitted += (_, v) =>
         {
             _pendingBufferMs = (int)Math.Round(v);
+            _bufferApplyTimer.Stop();
+            _bufferApplyTimer.Start();
+        };
+        InDrum.ValueCommitted += (_, v) =>
+        {
+            _pendingInBufferMs = (int)Math.Round(v);
             _bufferApplyTimer.Stop();
             _bufferApplyTimer.Start();
         };
@@ -858,17 +870,18 @@ public partial class MainWindow : Window
 
     private void ApplyPendingBufferMs()
     {
-        if (_pendingBufferMs is not { } outMs) return;
-        _pendingBufferMs = null;
+        if (_pendingBufferMs is null && _pendingInBufferMs is null) return;
         try
         {
-            // The knob is the end-to-end latency budget; the engine splits it. Capture
-            // stays at the 10 ms WASAPI period — deriving it from the knob only ever
-            // added latency without adding stability.
-            _controller.SetOutputBufferMs(outMs);
-            _controller.SetInputBufferMs(10);
+            // LATENCY = the end-to-end budget the engine splits; IN = capture-buffer
+            // override for glitchy capture devices (the budget rebalances around it,
+            // so total latency still tracks the LATENCY knob).
+            if (_pendingBufferMs is { } outMs) _controller.SetOutputBufferMs(outMs);
+            if (_pendingInBufferMs is { } inMs) _controller.SetInputBufferMs(inMs);
         }
         catch (Exception ex) { ShowBanner(ex.Message); }
+        _pendingBufferMs = null;
+        _pendingInBufferMs = null;
     }
 
     // =====================================================================
@@ -1123,11 +1136,15 @@ public partial class MainWindow : Window
 
     private void SyncFromSnapshot()
     {
-        // Drum value follows the authoritative config — but never stomp a value the
+        // Drum values follow the authoritative config — but never stomp a value the
         // user just dialed while its debounced apply is still pending.
-        if ((_bufferApplyTimer?.IsEnabled ?? false) == false &&
-            Math.Abs(OutDrum.Value - _snapshot.OutputBufferMs) >= 0.5)
-            OutDrum.Value = _snapshot.OutputBufferMs;
+        if ((_bufferApplyTimer?.IsEnabled ?? false) == false)
+        {
+            if (Math.Abs(OutDrum.Value - _snapshot.OutputBufferMs) >= 0.5)
+                OutDrum.Value = _snapshot.OutputBufferMs;
+            if (Math.Abs(InDrum.Value - _snapshot.InputBufferMs) >= 0.5)
+                InDrum.Value = _snapshot.InputBufferMs;
+        }
     }
 
     private void RebuildModel()
