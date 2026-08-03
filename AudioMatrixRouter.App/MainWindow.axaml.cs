@@ -1213,11 +1213,34 @@ public partial class MainWindow : Window
         var configured = isInput ? _snapshot.Inputs : _snapshot.Outputs;
         var available = isInput ? _snapshot.AvailableInputs : _snapshot.AvailableOutputs;
 
-        var pool = new List<DeviceSnapshot>(configured);
+        // Which engine devices actually carry a route right now. Devices stay in the
+        // engine after their last route is removed (dormant-route bookkeeping), but a
+        // row with no routes is noise when show-all is off.
+        var routedIds = new HashSet<string>();
+        foreach (var route in _snapshot.Routes)
+        {
+            if (TryMapRoute(route, out var inDev, out _, out var outDev, out _))
+                routedIds.Add(isInput ? inDev.Id : outDev.Id);
+        }
+
+        // The input-mode filter applies to every UNROUTED row, configured or available:
+        // "input" shows capture endpoints only (the VB-Audio virtual mic), "loopback"
+        // shows render loopbacks only (the virtual speaker). Routed devices and the
+        // master always show — hiding audio that is actively flowing would be worse.
+        bool ModeAllows(DeviceSnapshot d) => !isInput || _snapshot.InputDeviceMode switch
+        {
+            "input" => !d.IsLoopback,
+            "loopback" => d.IsLoopback,
+            _ => true,
+        };
+
+        var pool = configured
+            .Where(d => routedIds.Contains(d.Id) || d.IsMaster || (_showAll && ModeAllows(d)))
+            .ToList();
         if (_showAll)
         {
             foreach (var device in available)
-                if (!pool.Any(d => d.Id == device.Id))
+                if (ModeAllows(device) && !pool.Any(d => d.Id == device.Id))
                     pool.Add(device);
         }
 
