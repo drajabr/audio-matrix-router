@@ -140,6 +140,12 @@ public sealed class MatrixControl : Control
     private readonly Dictionary<string, double> _tileAnim = new();
     private bool _tileAnimating;
 
+    // eased 0..1 strength of the hover-selection dimming (fade keys let it fade out)
+    private double _selProgress;
+    private bool _selAnimating;
+    private string? _fadeRowKey;
+    private string? _fadeColKey;
+
     // label-square resize drag (web grid-resize-handles: both axes write ONE value)
     private static readonly Cursor ResizeCursor = new(StandardCursorType.SizeAll);
     private const double ResizeGrip = 5;
@@ -457,12 +463,17 @@ public sealed class MatrixControl : Control
 
     private void DrawTiles(DrawingContext ctx, MatrixLayout l, MatrixModel m, Rect clip)
     {
-        var hasSel = _hoverRowKey is not null && _hoverColKey is not null;
+        // Selection dimming fades in/out (_selProgress): while fading OUT the hover
+        // keys are already null, so the last selection (_fadeRow/ColKey) keeps
+        // shaping the dim until the fade completes.
+        var rowKey = _hoverRowKey ?? _fadeRowKey;
+        var colKey = _hoverColKey ?? _fadeColKey;
+        var hasSel = rowKey is not null && colKey is not null && _selProgress > 0.01;
         MatrixTrack? selRow = null, selCol = null;
         if (hasSel)
         {
-            l.RowTrackByKey.TryGetValue(_hoverRowKey!, out selRow);
-            l.ColTrackByKey.TryGetValue(_hoverColKey!, out selCol);
+            l.RowTrackByKey.TryGetValue(rowKey!, out selRow);
+            l.ColTrackByKey.TryGetValue(colKey!, out selCol);
             hasSel = selRow is not null && selCol is not null;
         }
 
@@ -500,14 +511,20 @@ public sealed class MatrixControl : Control
         var t = blocked ? 0 : TileProgress(rt.Key + "|" + ct.Key, on);
 
         // CSS: base off 0.62, on 1, blocked 0.5; with a selection, path cells 0.9 and
-        // everything else dims hard (.28 off / .38 on) — interpolated across t
-        var offOpacity = blocked ? 0.5 : 0.62;
-        var onOpacity = 1.0;
+        // everything else dims hard (.28 off / .38 on) — interpolated across t, and
+        // the whole dimming blends in/out with the eased selection progress.
+        var offBase = blocked ? 0.5 : 0.62;
+        var onBase = 1.0;
+        var offSel = offBase;
+        var onSel = onBase;
         if (hasSel && !isHover)
         {
-            offOpacity = onPath ? 0.9 : 0.28;
-            onOpacity = onPath ? 0.9 : 0.38;
+            offSel = onPath ? 0.9 : 0.28;
+            onSel = onPath ? 0.9 : 0.38;
         }
+        var p = _selProgress;
+        var offOpacity = offBase + (offSel - offBase) * p;
+        var onOpacity = onBase + (onSel - onBase) * p;
         var opacity = offOpacity + (onOpacity - offOpacity) * t;
 
         var basePen = blocked ? BlockedPen
@@ -1128,7 +1145,41 @@ public sealed class MatrixControl : Control
         if (row == _hoverRowKey && col == _hoverColKey) return;
         _hoverRowKey = row;
         _hoverColKey = col;
+        // remember the last real selection so the dim can fade OUT over it
+        if (row is not null) _fadeRowKey = row;
+        if (col is not null) _fadeColKey = col;
+        StartSelAnimation();
         SelectionChanged?.Invoke(this, new MatrixSelectionEvent(row, col));
         InvalidateVisual();
+    }
+
+    private void StartSelAnimation()
+    {
+        if (_selAnimating) return;
+        var top = TopLevel.GetTopLevel(this);
+        if (top is null)
+        {
+            _selProgress = _hoverRowKey is not null && _hoverColKey is not null ? 1 : 0;
+            InvalidateVisual();
+            return;
+        }
+        _selAnimating = true;
+        top.RequestAnimationFrame(SelTick);
+    }
+
+    private void SelTick(TimeSpan _)
+    {
+        _selAnimating = false;
+        var target = _hoverRowKey is not null && _hoverColKey is not null ? 1.0 : 0.0;
+        var delta = target - _selProgress;
+        if (Math.Abs(delta) <= 0.02)
+        {
+            _selProgress = target;
+            InvalidateVisual();
+            return;
+        }
+        _selProgress += delta * 0.3; // the shared ~120ms exponential ease
+        InvalidateVisual();
+        StartSelAnimation();
     }
 }

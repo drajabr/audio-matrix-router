@@ -1,8 +1,9 @@
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Layout;
+using Avalonia.Animation;
+using Avalonia.Animation.Easings;
 using Avalonia.Media;
-using Avalonia.Media.Transformation;
 using Avalonia.Threading;
 using AudioMatrixRouter.App.Controls;
 using AudioMatrixRouter.App.Services;
@@ -707,109 +708,137 @@ public partial class MainWindow : Window
         // toggle: clicking the open category's button collapses the drawer; clicking
         // a different one swaps the list in place (no popup, no dismiss races).
         if (_pickerCategory == category) { ClosePicker(); return; }
+        var switching = _pickerCategory is not null;
         _pickerCategory = category;
 
         // pin the collapsed width so growing the list never widens the box
         if (double.IsNaN(QuickStrip.Width) && QuickStrip.Bounds.Width > 0)
             QuickStrip.Width = QuickStrip.Bounds.Width;
 
-        void Rebuild()
+        static Transitions RowTransitions() => new()
         {
-            var list = new StackPanel { Spacing = 2 };
-            foreach (var opt in options)
+            new BrushTransition { Property = Button.BackgroundProperty, Duration = TimeSpan.FromMilliseconds(100), Easing = new CubicEaseOut() },
+            new BrushTransition { Property = Button.BorderBrushProperty, Duration = TimeSpan.FromMilliseconds(100), Easing = new CubicEaseOut() },
+        };
+
+        var rows = new List<Button>();
+
+        // Selecting an option restyles rows IN PLACE (the row brushes glide via their
+        // transitions) — rebuilding the controls on every click made selection snap.
+        void ApplyRowVisual(Button row, bool active)
+        {
+            row.BorderBrush = active
+                ? new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, AppTheme.Line, 0.60))
+                : Brushes.Transparent;
+            row.Background = active
+                ? new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.14))
+                : Brushes.Transparent;
+            if (row.Content is StackPanel sp && sp.Children.Count > 1 && sp.Children[1] is TextBlock tb)
             {
-                var active = string.Equals(opt.Key, getCurrent(), StringComparison.OrdinalIgnoreCase);
-
-                var swatch = new Border
-                {
-                    Width = 22,
-                    Height = 22,
-                    CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
-                    BorderThickness = new Thickness(1),
-                    BorderBrush = AppTheme.LineStrongBrush,
-                    Background = opt.Swatch is { } c ? new SolidColorBrush(c) : Brushes.Transparent,
-                    Child = string.IsNullOrEmpty(opt.SwatchLabel) ? null : new TextBlock
-                    {
-                        Text = opt.SwatchLabel,
-                        FontSize = opt.SwatchLabel.Length > 2 ? 7 : AppTheme.Fs2xs,
-                        FontWeight = FontWeight.Bold,
-                        Foreground = opt.SwatchText is { } tc ? new SolidColorBrush(tc) : AppTheme.TextStrongBrush,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center,
-                    },
-                };
-
-                var row = new Button
-                {
-                    Padding = new Thickness(8, 5),
-                    HorizontalAlignment = HorizontalAlignment.Stretch,
-                    HorizontalContentAlignment = HorizontalAlignment.Left,
-                    CornerRadius = new CornerRadius(AppTheme.RadiusOverlay),
-                    BorderThickness = new Thickness(1),
-                    BorderBrush = active
-                        ? new SolidColorBrush(AppTheme.Mix(AppTheme.Accent, AppTheme.Line, 0.60))
-                        : Brushes.Transparent,
-                    Background = active
-                        ? new SolidColorBrush(AppTheme.WithAlpha(AppTheme.Accent, 0.14))
-                        : Brushes.Transparent,
-                    Content = new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 10,
-                        Children =
-                        {
-                            swatch,
-                            new TextBlock
-                            {
-                                Text = opt.Key,
-                                FontSize = AppTheme.FsXs,
-                                FontWeight = active ? FontWeight.Bold : FontWeight.SemiBold,
-                                Foreground = active ? AppTheme.TextStrongBrush : AppTheme.MutedBrush,
-                                VerticalAlignment = VerticalAlignment.Center,
-                                TextTrimming = TextTrimming.CharacterEllipsis,
-                            },
-                        }
-                    },
-                };
-
-                var key = opt.Key;
-                var wasActive = active;
-                row.Click += (_, _) =>
-                {
-                    if (wasActive) { ClosePicker(); return; } // web: re-click active = close
-                    setKey(key);
-                    ApplyThemeLive();
-                    Rebuild();
-                };
-                list.Children.Add(row);
+                tb.FontWeight = active ? FontWeight.Bold : FontWeight.SemiBold;
+                tb.Foreground = active ? AppTheme.TextStrongBrush : AppTheme.MutedBrush;
             }
-
-            // the options go INSIDE the drawer box, under a hairline separator —
-            // the drawer literally grows to show them (web .quick-control-picker)
-            QuickList.Children.Clear();
-            QuickList.Children.Add(new Border
-            {
-                Height = 1,
-                Margin = new Thickness(2, 5, 2, 0),
-                Background = new SolidColorBrush(AppTheme.Line),
-            });
-            QuickList.Children.Add(list);
-            QuickList.IsVisible = true;
-            QuickStrip.Background = new SolidColorBrush(AppTheme.Panel);
-
-            // measure what the list wants so MaxHeight can animate 0 → exactly that
-            // (animating to an arbitrary big number would distort the grow timing)
-            var innerWidth = Math.Max(60,
-                QuickStrip.Bounds.Width - QuickStrip.Padding.Left - QuickStrip.Padding.Right - 2);
-            list.Measure(new Size(innerWidth, double.PositiveInfinity));
-            _pickerContentHeight = list.DesiredSize.Height + 6; // + separator row
         }
 
-        Rebuild();
+        void RefreshRows()
+        {
+            foreach (var row in rows)
+                ApplyRowVisual(row, string.Equals((string)row.Tag!, getCurrent(), StringComparison.OrdinalIgnoreCase));
+        }
+
+        var list = new StackPanel { Spacing = 2 };
+        foreach (var opt in options)
+        {
+            var swatch = new Border
+            {
+                Width = 22,
+                Height = 22,
+                CornerRadius = new CornerRadius(AppTheme.RadiusMicro),
+                BorderThickness = new Thickness(1),
+                BorderBrush = AppTheme.LineStrongBrush,
+                Background = opt.Swatch is { } c ? new SolidColorBrush(c) : Brushes.Transparent,
+                Child = string.IsNullOrEmpty(opt.SwatchLabel) ? null : new TextBlock
+                {
+                    Text = opt.SwatchLabel,
+                    FontSize = opt.SwatchLabel.Length > 2 ? 7 : AppTheme.Fs2xs,
+                    FontWeight = FontWeight.Bold,
+                    Foreground = opt.SwatchText is { } tc ? new SolidColorBrush(tc) : AppTheme.TextStrongBrush,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center,
+                },
+            };
+
+            var row = new Button
+            {
+                Tag = opt.Key,
+                Padding = new Thickness(8, 5),
+                HorizontalAlignment = HorizontalAlignment.Stretch,
+                HorizontalContentAlignment = HorizontalAlignment.Left,
+                CornerRadius = new CornerRadius(AppTheme.RadiusOverlay),
+                BorderThickness = new Thickness(1),
+                Transitions = RowTransitions(),
+                Content = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = 10,
+                    Children =
+                    {
+                        swatch,
+                        new TextBlock
+                        {
+                            Text = opt.Key,
+                            FontSize = AppTheme.FsXs,
+                            VerticalAlignment = VerticalAlignment.Center,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                        },
+                    }
+                },
+            };
+
+            var key = opt.Key;
+            row.Click += (_, _) =>
+            {
+                if (string.Equals(key, getCurrent(), StringComparison.OrdinalIgnoreCase))
+                {
+                    ClosePicker(); // web: re-click active = close
+                    return;
+                }
+                setKey(key);
+                ApplyThemeLive();
+                RefreshRows();
+            };
+            rows.Add(row);
+            list.Children.Add(row);
+        }
+        RefreshRows();
+
+        // the options go INSIDE the drawer box, under a hairline separator —
+        // the drawer literally grows to show them (web .quick-control-picker)
+        QuickList.Children.Clear();
+        QuickList.Children.Add(new Border
+        {
+            Height = 1,
+            Margin = new Thickness(2, 5, 2, 0),
+            Background = new SolidColorBrush(AppTheme.Line),
+        });
+        QuickList.Children.Add(list);
+        QuickList.IsVisible = true;
+        QuickStrip.Background = new SolidColorBrush(AppTheme.Panel);
+
+        // measure what the list wants so MaxHeight can animate 0 → exactly that
+        // (animating to an arbitrary big number would distort the grow timing)
+        var innerWidth = Math.Max(60,
+            QuickStrip.Bounds.Width - QuickStrip.Padding.Left - QuickStrip.Padding.Right - 2);
+        list.Measure(new Size(innerWidth, double.PositiveInfinity));
+        _pickerContentHeight = list.DesiredSize.Height + 6; // + separator row
+
         PickerBackdrop.IsVisible = true;
 
+        // category switch: dip the list so the swap reads as a crossfade while the
+        // box height glides old → new
+        if (switching) QuickList.Opacity = 0.25;
+
         // next frame: the transitions carry the box open (height) and the rows in
-        // (opacity); on a category switch the height glides old → new instead
         Dispatcher.UIThread.Post(() =>
         {
             if (_pickerCategory is null) return;

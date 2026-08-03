@@ -82,9 +82,17 @@
 
   <Window.Styles>
     <!-- ===== Global motion language =====
-         Motion glides (120ms cubic-out, the tile-toggle feel); COLORS SNAP — hover
-         and state recolors are instant so the UI stays crisp. Only geometry animates:
-         presses dip 4%, panels grow/shrink, overlays fade, layout shifts slide. -->
+         Geometry glides at 120-150ms cubic-out (the tile-toggle feel); interactive
+         feedback colors (hover, press, state) glide FAST — 90ms, quick enough to
+         stay crisp while killing the hard flicker. -->
+    <Style Selector="Button /template/ ContentPresenter#PART_ContentPresenter">
+      <Setter Property="Transitions">
+        <Transitions>
+          <BrushTransition Property="Background" Duration="0:0:0.09" Easing="CubicEaseOut" />
+          <BrushTransition Property="BorderBrush" Duration="0:0:0.09" Easing="CubicEaseOut" />
+        </Transitions>
+      </Setter>
+    </Style>
     <Style Selector="Button.key, Button.quick, Button.pill">
       <Setter Property="RenderTransform" Value="scale(1)" />
       <Setter Property="Transitions">
