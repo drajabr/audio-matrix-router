@@ -29,6 +29,12 @@ public class ActiveDevice
     /// <summary>The period tier the next (re)start should request for this device
     /// (adaptive degrade demotes it; survives Stop/Start).</summary>
     public EndpointTier RequestedRenderTier { get; set; } = EndpointTier.MinPeriod;
+    public EndpointTier RequestedCaptureTier { get; set; } = EndpointTier.MinPeriod;
+    // Adaptive-degrade bookkeeping (per session, survives Stop/Start).
+    public long TierUnderrunBaseline { get; set; }
+    public long TierDiscontinuityBaseline { get; set; }
+    public long TierStartTimestamp { get; set; }
+    public int TierDegradeCount { get; set; }
     public double BaseLatencyMs { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
     public float[]? PeakLevels;
@@ -129,6 +135,107 @@ public class AudioEngine : IDisposable
         _backend = string.Equals(backend, "legacy", StringComparison.OrdinalIgnoreCase)
             ? "legacy"
             : "auto";
+    }
+
+    /// <summary>An endpoint died mid-stream (device invalidated / stalled). Raised
+    /// from an audio thread — the host must marshal and drive recovery from there
+    /// (AppController debounces into ReloadEngine). Never restarts inline.</summary>
+    public event Action? EngineFaulted;
+
+    private void OnEndpointFaulted(string deviceName, int hr)
+    {
+        System.Diagnostics.Debug.WriteLine($"[Engine] endpoint faulted: {deviceName} hr=0x{hr:X8}");
+        try { EngineFaulted?.Invoke(); } catch { }
+    }
+
+    // ===================================================================== adaptive degrade
+    // Watches the first ~10s of every small-period tier. A driver that advertises a
+    // small period but can't sustain it shows up as an underrun (render) or
+    // discontinuity/overflow (capture) burst — demote that device one rung and
+    // restart through the NORMAL start path (barrier/fill/phase logic reused).
+    // Tier state lives on ActiveDevice and survives Stop/Start; two demotions pin
+    // the device at the default period for the session. The timer self-disarms
+    // when nothing is left to evaluate.
+
+    private Timer? _degradeTimer;
+    private int _degradeBusy;
+
+    private void ArmDegradeTimer()
+    {
+        _degradeTimer?.Dispose();
+        _degradeTimer = new Timer(_ => EvaluateAdaptiveDegrade(), null, 1000, 1000);
+    }
+
+    private void EvaluateAdaptiveDegrade()
+    {
+        if (!_running) return;
+        if (Interlocked.CompareExchange(ref _degradeBusy, 1, 0) != 0) return;
+        try
+        {
+            const double WindowSec = 10;
+            const long Threshold = 5;
+            bool anyEvaluating = false;
+            bool demoted = false;
+            double freq = System.Diagnostics.Stopwatch.Frequency;
+
+            foreach (var dev in _outputDevices)
+            {
+                if (dev.Render is null) continue;
+                if (dev.Render.Tier is not (EndpointTier.MinPeriod or EndpointTier.DoublePeriod)) continue;
+                double elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - dev.TierStartTimestamp) / freq;
+                if (elapsed > WindowSec) continue;
+                anyEvaluating = true;
+
+                long delta = (dev.MixProvider?.UnderrunCount ?? 0) - dev.TierUnderrunBaseline;
+                if (delta > Threshold && dev.TierDegradeCount < 2)
+                {
+                    dev.RequestedRenderTier = dev.RequestedRenderTier == EndpointTier.MinPeriod
+                        ? EndpointTier.DoublePeriod
+                        : EndpointTier.DefaultPeriod;
+                    dev.TierDegradeCount++;
+                    demoted = true;
+                }
+            }
+
+            foreach (var dev in _inputDevices)
+            {
+                var cap = dev.Capture;
+                if (cap is null) continue;
+                if (cap.Tier is not (EndpointTier.MinPeriod or EndpointTier.DoublePeriod)) continue;
+                anyEvaluating = true;
+
+                long delta = cap.DiscontinuityCount + Interlocked.Read(ref dev.InputOverflowCount)
+                             - dev.TierDiscontinuityBaseline;
+                if (delta > Threshold && dev.TierDegradeCount < 2)
+                {
+                    dev.RequestedCaptureTier = dev.RequestedCaptureTier == EndpointTier.MinPeriod
+                        ? EndpointTier.DoublePeriod
+                        : EndpointTier.DefaultPeriod;
+                    dev.TierDegradeCount++;
+                    demoted = true;
+                }
+            }
+
+            if (demoted)
+            {
+                // Timer thread, never an audio thread — a direct restart is safe here
+                // and goes through the proven barrier/fill path.
+                FullRestart();
+            }
+            else if (!anyEvaluating)
+            {
+                _degradeTimer?.Dispose();
+                _degradeTimer = null; // self-disarm: zero steady-state cost
+            }
+        }
+        catch
+        {
+            // Degrade evaluation must never take the engine down.
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _degradeBusy, 0);
+        }
     }
 
     public bool TryGetRouteWorkingLatencyMs(int inCh, int outCh, out double latencyMs)
@@ -963,6 +1070,7 @@ public class AudioEngine : IDisposable
             }
 
             _running = true;
+            ArmDegradeTimer();
             StateChanged?.Invoke();
             return true;
         }
@@ -1049,9 +1157,12 @@ public class AudioEngine : IDisposable
         }
     }
 
-    private static void AdoptRender(ActiveDevice dev, IRenderEndpoint render, int requestedMs)
+    private void AdoptRender(ActiveDevice dev, IRenderEndpoint render, int requestedMs)
     {
         dev.Render = render;
+        render.Faulted += hr => OnEndpointFaulted(dev.Info.Name, hr);
+        dev.TierUnderrunBaseline = 0;
+        dev.TierStartTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         // Honest numbers come from the endpoint (real buffer + one period of
         // mix-ahead); fall back to the request when read-back was unavailable.
         dev.RealRenderBufferMs = render.ActualBufferMs;
@@ -1091,7 +1202,7 @@ public class AudioEngine : IDisposable
                 dev.IsLoopback
                     ? Wasapi.WasapiCaptureClient.CaptureMode.PolledLoopback
                     : Wasapi.WasapiCaptureClient.CaptureMode.EventMic,
-                EndpointTier.MinPeriod,
+                dev.RequestedCaptureTier,
                 dev.Info.Name);
         }
         dev.Capture = custom ?? new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
@@ -1158,6 +1269,8 @@ public class AudioEngine : IDisposable
         // Latency contribution = delivery cadence (one period), NOT buffer depth.
         dev.CaptureCadenceMs = dev.Capture.ActualPeriodMs;
         dev.CaptureLatencyMs = (int)Math.Ceiling(dev.CaptureCadenceMs);
+        dev.Capture.Faulted += hr => OnEndpointFaulted(dev.Info.Name, hr);
+        dev.TierDiscontinuityBaseline = 0;
         return true;
     }
 
@@ -1224,6 +1337,9 @@ public class AudioEngine : IDisposable
 
     public void Stop()
     {
+        _degradeTimer?.Dispose();
+        _degradeTimer = null;
+
         foreach (var dev in _inputDevices)
         {
             try { dev.Capture?.Stop(); } catch { }

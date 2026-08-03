@@ -86,6 +86,25 @@ public sealed class AppController : IDisposable
         _saveTimer = new System.Threading.Timer(_ => _marshal(OnSaveTimerTick), null, Timeout.Infinite, Timeout.Infinite);
         _deviceRefreshTimer = new System.Threading.Timer(_ => _marshal(OnDeviceRefreshTick), null, Timeout.Infinite, Timeout.Infinite);
         _startupRetryTimer = new System.Threading.Timer(_ => _marshal(OnStartupRetryTick), null, Timeout.Infinite, Timeout.Infinite);
+        // Mid-stream endpoint deaths: debounce (a hub drop kills several endpoints at
+        // once) then force a full ReloadEngine — its unconditional Stop+Start is what
+        // recovers a device that is dead but still present in the device list.
+        _faultRestartTimer = new System.Threading.Timer(_ => _marshal(OnFaultRestartTick), null, Timeout.Infinite, Timeout.Infinite);
+    }
+
+    private const int FaultRestartDebounceMs = 300;
+    private readonly System.Threading.Timer _faultRestartTimer;
+
+    private void OnEngineFaulted()
+    {
+        if (_disposed) return;
+        try { _faultRestartTimer.Change(FaultRestartDebounceMs, Timeout.Infinite); } catch { }
+    }
+
+    private void OnFaultRestartTick()
+    {
+        if (_disposed) return;
+        ReloadEngine();
     }
 
     public Audio.AudioEngine Engine { get; }
@@ -120,6 +139,7 @@ public sealed class AppController : IDisposable
         Engine.Init();
         Engine.DevicesChanged += OnEngineDevicesChanged;
         Engine.StateChanged += OnEngineStateChanged;
+        Engine.EngineFaulted += OnEngineFaulted;
 
         _suppressConfigSave = true;
         try
@@ -177,10 +197,12 @@ public sealed class AppController : IDisposable
 
         Engine.DevicesChanged -= OnEngineDevicesChanged;
         Engine.StateChanged -= OnEngineStateChanged;
+        Engine.EngineFaulted -= OnEngineFaulted;
 
         _saveTimer.Dispose();
         _deviceRefreshTimer.Dispose();
         _startupRetryTimer.Dispose();
+        _faultRestartTimer.Dispose();
 
         Engine.Stop();
         Engine.Dispose();
