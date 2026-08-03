@@ -66,7 +66,7 @@ public sealed class OutputSyncCoordinator
     private int _engineSampleRate;
     private int _baseMasterTargetFrames;
     private int _maxMasterTargetFrames;
-    private int _holdHeadroomMs;
+    private int _releaseFillTargetMs;
     private bool _startBarrierActive = true;
     private long _barrierArmedTicks;
     private long _totalUnderruns;
@@ -126,17 +126,28 @@ public sealed class OutputSyncCoordinator
     }
 
     /// <summary>
-    /// Extra fill (ms) added to each consumer's barrier release target so the barrier
-    /// releases at the input ASRC's steady-state fill point. Releasing lower made the
-    /// ASRC pull fill UP right after start — a real 30 ms latency ramp in the first
-    /// seconds of every start.
+    /// The barrier releases when every consumer's ring fill reaches EXACTLY the input
+    /// ASRC's fill target, handed over verbatim by the engine. (This replaces the old
+    /// knob+headroom reconstruction, whose Math.Max(0, headroom) clamp made release
+    /// fill exceed the servo target at any knob > ~40 ms — the servo then hard-drained
+    /// the surplus as an audible skip right after every start.)
     /// </summary>
-    public void SetHoldHeadroomMs(int headroomMs)
+    public void SetReleaseFillTargetMs(int fillTargetMs)
     {
         lock (_lock)
         {
-            _holdHeadroomMs = Math.Max(0, headroomMs);
+            _releaseFillTargetMs = Math.Clamp(fillTargetMs, 20, 300);
+            int frames = HoldTargetFramesNoLock();
+            foreach (var s in _states.Values)
+                s.HoldTargetFrames = frames;
         }
+    }
+
+    private int HoldTargetFramesNoLock()
+    {
+        // Until the engine hands over the real fill target, fall back to a safe 20 ms.
+        int targetMs = _releaseFillTargetMs > 0 ? _releaseFillTargetMs : 20;
+        return Math.Max(1, (int)Math.Round(_engineSampleRate * (targetMs / 1000.0)));
     }
 
     public void RegisterConsumer(string consumerId, int deviceSampleRate, int outputBufferMs)
@@ -149,11 +160,7 @@ public sealed class OutputSyncCoordinator
                 _states[consumerId] = s;
             }
             if (deviceSampleRate > 0) s.DeviceSampleRate = deviceSampleRate;
-            // Mirror the input ASRC's fill target (outputBuffer + headroom, same clamp as
-            // AudioEngine.CalculateInputFillTargetFrames) so release fill == servo target.
-            int targetMs = Math.Clamp(Math.Max(1, outputBufferMs) + _holdHeadroomMs, 20, 300);
-            s.HoldTargetFrames = Math.Max(1,
-                (int)Math.Round(_engineSampleRate * (targetMs / 1000.0)));
+            s.HoldTargetFrames = HoldTargetFramesNoLock();
         }
     }
 
@@ -712,6 +719,10 @@ public class MixingSampleProvider : ISampleProvider
 
     public int Read(float[] buffer, int offset, int count)
     {
+        // NAudio's playback thread runs at normal priority with no MMCSS; boost it
+        // once (Read always runs on this output's one WasapiOut thread).
+        MmcssHelper.BoostCurrentThread();
+
         int frames = count / _outputChannels;
         if (frames <= 0) return 0;
 
@@ -849,8 +860,12 @@ public class MixingSampleProvider : ISampleProvider
             long writePos = src.Buffer.GetWritePositionFrames();
             bool producerAlive = writePos > _lastSourceWritePos[srcIdx];
             _lastSourceWritePos[srcIdx] = writePos;
+            // pendingSkip > 0 = this source is catching its cursor up after an idle
+            // spell (e.g. a loopback that just resumed). That churn is already booked
+            // as sync-discarded frames; counting it here read as 100 underruns/s
+            // against audio nobody could have heard.
             if ((useAll || _sourceActiveMask[srcIdx]) && deficit >= audibleDeficitThreshold
-                && producerAlive)
+                && producerAlive && _pendingSkipPerSource[srcIdx] <= 0)
             {
                 Interlocked.Increment(ref _underrunCount);
             }

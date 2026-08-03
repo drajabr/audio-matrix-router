@@ -19,6 +19,10 @@ public class ActiveDevice
     public long InputOverflowCount;
     public int CaptureLatencyMs { get; set; }
     public int RenderLatencyMs { get; set; }
+    // Read back from WASAPI after Initialize (0 = read-back unavailable): the REAL
+    // allocated render buffer and engine period, not the requested values.
+    public int RealRenderBufferMs { get; set; }
+    public int RenderPeriodMs { get; set; }
     public bool IsLoopback { get; set; }
     public double BaseLatencyMs { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
@@ -810,15 +814,10 @@ public class AudioEngine : IDisposable
             }
 
             // ===== 3. Coordinator =====
+            _worstRenderGulpMs = 0; // real render numbers arrive in step 4
             var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames();
             _syncCoordinator = new OutputSyncCoordinator(
                 masterOutput.Info.Id, _engineSampleRate, baseMasterTargetFrames, maxMasterTargetFrames);
-            // Barrier releases at the input ASRC's fill target (outputBuffer + headroom),
-            // not below it — otherwise the servo ramps fill up by the headroom right
-            // after start, a real latency step in the first seconds of every start.
-            // The coordinator computes its release target as (knob + headroom); hand it
-            // the difference so barrier release fill == the ASRC's actual fill target.
-            _syncCoordinator.SetHoldHeadroomMs(InputFillTargetMs - _outputBufferMs);
             _syncCoordinator.ArmGlobalRefillHold();
 
             var sources = _inputDevices
@@ -892,6 +891,15 @@ public class AudioEngine : IDisposable
 
             // Preferred consumer for ring trim ordering + the input ASRC fill reference.
             ApplyPreferredMasterConsumerToInputs();
+
+            // Real render buffers are known now — pin the fill floor to the worst REAL
+            // gulp and make the barrier release at EXACTLY the servo's fill target.
+            // (The old path reconstructed this as knob+headroom and clamped the
+            // headroom at 0, so any knob > ~40 released above target and hard-drained
+            // an audible skip right after every start.)
+            _worstRenderGulpMs = startedOutputs.Max(d =>
+                d.RealRenderBufferMs > 0 ? d.RealRenderBufferMs : RenderBufferMs);
+            _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
             // ===== 5. Start captures (rings begin filling; cursors already pinned) =====
             int inputFillTargetFrames = CalculateInputFillTargetFrames();
@@ -967,7 +975,34 @@ public class AudioEngine : IDisposable
             var render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, latencyMs);
             render.Init(dev.MixProvider!);
             dev.Render = render;
-            dev.RenderLatencyMs = latencyMs;
+            dev.RenderLatencyMs = latencyMs; // fallback if the read-back below fails
+
+            // HONEST NUMBERS: Windows rounds the requested buffer up to whole engine
+            // periods (and to the endpoint's minimum), and NAudio keeps the buffer
+            // topped to FULL on every period event — so the real render FIFO depth is
+            // the real BufferSize plus ~one period of mix-ahead, not the request.
+            // NAudio never exposes these, so read its private AudioClient once.
+            try
+            {
+                var acField = typeof(WasapiOut).GetField("audioClient",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                if (acField?.GetValue(render) is AudioClient ac)
+                {
+                    int rate = dev.Info.SampleRate > 0 ? dev.Info.SampleRate : 48000;
+                    int realBufferMs = (int)Math.Round(ac.BufferSize * 1000.0 / rate);
+                    int periodMs = (int)Math.Max(1, mmDevice.AudioClient.DefaultDevicePeriod / 10000);
+                    if (realBufferMs > 0)
+                    {
+                        dev.RealRenderBufferMs = realBufferMs;
+                        dev.RenderPeriodMs = periodMs;
+                        dev.RenderLatencyMs = realBufferMs + periodMs;
+                    }
+                }
+            }
+            catch
+            {
+                // Reflection shape changed — keep the requested value as the estimate.
+            }
             return true;
         }
         catch
@@ -995,11 +1030,18 @@ public class AudioEngine : IDisposable
 
         if (dev.IsLoopback)
         {
-            dev.Capture = new WasapiLoopbackCapture(mmDevice);
+            // NOT WasapiLoopbackCapture: that hardcodes a 100 ms poll buffer (audio
+            // arrives in ~50 ms bursts). PolledLoopbackCapture wakes every ~10 ms.
+            dev.Capture = new PolledLoopbackCapture(mmDevice);
         }
         else
         {
-            dev.Capture = new WasapiCapture(mmDevice, true, _inputBufferMs);
+            // Endpoint buffer DEPTH is not latency — the 10 ms event drains it every
+            // period regardless. A 1-period-deep buffer (the old _inputBufferMs=10)
+            // silently DROPPED a packet whenever the capture thread was one period
+            // late, and rebuilding the lost fill through the ±2000 ppm servo took
+            // seconds of elevated underruns. 4+ periods of depth costs nothing.
+            dev.Capture = new WasapiCapture(mmDevice, true, Math.Max(40, _inputBufferMs));
         }
 
         dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
@@ -1017,6 +1059,10 @@ public class AudioEngine : IDisposable
         float[] captureScratch = [];
         dev.Capture.DataAvailable += (s, e) =>
         {
+            // NAudio's capture thread runs at NORMAL priority with no MMCSS — at low
+            // latency an ordinary scheduling delay starves the ring. Idempotent.
+            MmcssHelper.BoostCurrentThread();
+
             var ring = dev.RingBuffer;
             var deviceAsrc = dev.InputAsrc;
             if (ring == null || deviceAsrc == null)
@@ -1070,7 +1116,8 @@ public class AudioEngine : IDisposable
             return false;
         }
 
-        dev.CaptureLatencyMs = _inputBufferMs;
+        // Latency contribution = delivery cadence (one period), NOT buffer depth.
+        dev.CaptureLatencyMs = CaptureCadenceMs;
         return true;
     }
 
@@ -1169,12 +1216,27 @@ public class AudioEngine : IDisposable
     /// <summary>Render buffer share of the latency budget (see the budget comment).</summary>
     private int RenderBufferMs => Math.Clamp(_outputBufferMs / 4, 10, 50);
 
-    /// <summary>Ring fill target: the budget minus capture and render, floored for
-    /// stability (one render gulp + one capture block must always be covered).</summary>
-    private int InputFillTargetMs => Math.Clamp(
-        _outputBufferMs - _inputBufferMs - RenderBufferMs,
-        RenderBufferMs + 10,
-        RingBufferCapacityMs * 3 / 4);
+    // Delivery cadence of capture data: one engine period. This is what capture
+    // contributes to LATENCY — endpoint buffer DEPTH only absorbs scheduling jitter.
+    private const int CaptureCadenceMs = 10;
+
+    // Worst REAL render gulp across started outputs (WASAPI tops the buffer to full
+    // each period, so the gulp = the real buffer size). 0 until renders initialize.
+    private int _worstRenderGulpMs;
+
+    /// <summary>Ring fill target: the budget minus capture cadence and render, floored
+    /// so one REAL render gulp + one capture block + safety can never starve the ring.</summary>
+    private int InputFillTargetMs
+    {
+        get
+        {
+            int gulp = _worstRenderGulpMs > 0 ? _worstRenderGulpMs : RenderBufferMs;
+            return Math.Clamp(
+                _outputBufferMs - CaptureCadenceMs - RenderBufferMs,
+                gulp + CaptureCadenceMs + 5,
+                RingBufferCapacityMs * 3 / 4);
+        }
+    }
 
     private int CalculateInputFillTargetFrames() =>
         Math.Max(64, _engineSampleRate * InputFillTargetMs / 1000);

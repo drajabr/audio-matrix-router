@@ -45,6 +45,10 @@ public sealed class InputAsrc
 
     private int _targetFillFrames;
     private double _hardDrainFrames;
+    // Sustained-surplus tracking for the hard drain (~1 s at the 10 ms cadence).
+    private const int SurplusWindowUpdates = 100;
+    private double _surplusMinFrames = double.MaxValue;
+    private int _surplusSamples;
     private double _trimPpm;
     private double _integralFrames;
     private string _fillConsumerId = string.Empty;
@@ -245,17 +249,23 @@ public sealed class InputAsrc
 
         double error = fill - _targetFillFrames; // positive: ring too full → slow down (trim negative)
 
-        // Hard drain. The ±2000 ppm trim removes surplus at 0.2%, so 50 ms of backlog
-        // needs ~25 s of undisturbed running to clear — and a single underrun or restart
-        // re-injects more than that. Way past target the audio is already later than the
-        // user asked for, so cut the surplus in one step: every consumer advances by the
-        // SAME amount, so outputs stay phase-locked to each other.
-        if (error > _hardDrainFrames)
+        // Hard drain, SUSTAINED form. The ±2000 ppm trim removes surplus at 0.2%, so
+        // 50 ms of backlog needs ~25 s to clear — but an instantaneous trigger misfired
+        // on ordinary burst/render phasing and turned into a stutter loop. Instead:
+        // track the rolling MINIMUM surplus over ~1 s; only a floor that stays above
+        // the threshold for the whole window is genuine backlog, and cutting by that
+        // floor can never bite into fill the interleave actually needs. The integrator
+        // is deliberately KEPT — a drain changes fill, not clock drift, and zeroing it
+        // discarded the learned crystal offset on every cut.
+        if (error < _surplusMinFrames) _surplusMinFrames = error;
+        if (++_surplusSamples >= SurplusWindowUpdates)
         {
-            _ring.TrimBacklogBy((int)Math.Min(error, int.MaxValue));
-            _integralFrames = 0;
-            _trimPpm = 0;
-            return; // re-measure next callback rather than servo off a stale fill
+            if (_surplusMinFrames > _hardDrainFrames)
+            {
+                _ring.TrimBacklogBy((int)Math.Min(_surplusMinFrames, int.MaxValue));
+            }
+            _surplusSamples = 0;
+            _surplusMinFrames = double.MaxValue;
         }
 
         double absError = Math.Abs(error);
