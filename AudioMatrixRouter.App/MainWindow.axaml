@@ -82,17 +82,9 @@
 
   <Window.Styles>
     <!-- ===== Global motion language =====
-         One timing for everything interactive: 120ms cubic-out — the same feel as
-         the matrix tile toggle (~0.3/frame exponential ease). Hover/press recolors
-         glide, presses dip 4%, state changes never snap. -->
-    <Style Selector="Button /template/ ContentPresenter#PART_ContentPresenter">
-      <Setter Property="Transitions">
-        <Transitions>
-          <BrushTransition Property="Background" Duration="0:0:0.12" Easing="CubicEaseOut" />
-          <BrushTransition Property="BorderBrush" Duration="0:0:0.12" Easing="CubicEaseOut" />
-        </Transitions>
-      </Setter>
-    </Style>
+         Motion glides (120ms cubic-out, the tile-toggle feel); COLORS SNAP — hover
+         and state recolors are instant so the UI stays crisp. Only geometry animates:
+         presses dip 4%, panels grow/shrink, overlays fade, layout shifts slide. -->
     <Style Selector="Button.key, Button.quick, Button.pill">
       <Setter Property="RenderTransform" Value="scale(1)" />
       <Setter Property="Transitions">
@@ -271,13 +263,19 @@
       <Setter Property="HorizontalAlignment" Value="Center" />
     </Style>
 
-    <!-- dock card MASTER badge: 20px vertical accent bar with rotated MASTER text -->
+    <!-- dock card MASTER badge: 20px vertical accent bar with rotated MASTER text.
+         Toggled via Opacity (not IsVisible) so it fades with the shared timing. -->
     <Style Selector="Border.masterBadge">
       <Setter Property="Width" Value="20" />
       <Setter Property="HorizontalAlignment" Value="Left" />
       <Setter Property="VerticalAlignment" Value="Stretch" />
       <Setter Property="Background" Value="{StaticResource BadgeFace}" />
       <Setter Property="CornerRadius" Value="7,0,0,7" />
+      <Setter Property="Transitions">
+        <Transitions>
+          <DoubleTransition Property="Opacity" Duration="0:0:0.12" Easing="CubicEaseOut" />
+        </Transitions>
+      </Setter>
     </Style>
     <Style Selector="Border.masterBadge TextBlock">
       <Setter Property="FontSize" Value="{DynamicResource Fs2xs}" />
@@ -418,6 +416,11 @@
                 VerticalAlignment="Top" Margin="0,10,0,0" CornerRadius="6"
                 Background="#F03C1111" BorderBrush="#EF4444" BorderThickness="1"
                 Padding="14,7" MaxWidth="720" ZIndex="10">
+          <Border.Transitions>
+            <Transitions>
+              <DoubleTransition Property="Opacity" Duration="0:0:0.15" Easing="CubicEaseOut" />
+            </Transitions>
+          </Border.Transitions>
           <TextBlock Name="BannerText" Foreground="#F6D9D9"
                      FontSize="{DynamicResource FsXs}"
                      TextWrapping="Wrap" />
@@ -474,8 +477,14 @@
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
                   Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
-              <controls:MeterBars Name="SourceMeters" Horizontal="True" Margin="4" />
-              <Border Name="SourceMasterBadge" Classes="masterBadge" IsVisible="False">
+              <controls:MeterBars Name="SourceMeters" Horizontal="True" Margin="4">
+                <controls:MeterBars.Transitions>
+                  <Transitions>
+                    <ThicknessTransition Property="Margin" Duration="0:0:0.15" Easing="CubicEaseOut" />
+                  </Transitions>
+                </controls:MeterBars.Transitions>
+              </controls:MeterBars>
+              <Border Name="SourceMasterBadge" Classes="masterBadge" Opacity="0">
                 <LayoutTransformControl HorizontalAlignment="Center" VerticalAlignment="Center">
                   <LayoutTransformControl.LayoutTransform>
                     <RotateTransform Angle="-90" />
@@ -485,6 +494,11 @@
               </Border>
               <StackPanel Name="SourceTextStack" Margin="10,8,10,0" Spacing="2"
                           HorizontalAlignment="Stretch" VerticalAlignment="Top">
+                <StackPanel.Transitions>
+                  <Transitions>
+                    <ThicknessTransition Property="Margin" Duration="0:0:0.15" Easing="CubicEaseOut" />
+                  </Transitions>
+                </StackPanel.Transitions>
                 <TextBlock Name="SourceName" Text="—"
                            FontSize="{DynamicResource FsLg}" FontWeight="Bold"
                            Foreground="{StaticResource TextStrong}"
@@ -507,11 +521,6 @@
                   HorizontalAlignment="Center" VerticalAlignment="Stretch"
                   BorderBrush="{StaticResource LineStrong}" BorderThickness="2"
                   Background="{StaticResource CardBg}">
-            <Border.Transitions>
-              <Transitions>
-                <BrushTransition Property="BorderBrush" Duration="0:0:0.12" Easing="CubicEaseOut" />
-              </Transitions>
-            </Border.Transitions>
             <TextBlock Name="RouteGlyph" Text="⏸" FontSize="{DynamicResource FsXl}"
                        Foreground="{StaticResource Muted}"
                        HorizontalAlignment="Center" VerticalAlignment="Center" />
@@ -522,8 +531,14 @@
                   BorderBrush="{StaticResource Line}" BorderThickness="1"
                   Background="{StaticResource CardBg}" ClipToBounds="True">
             <Panel>
-              <controls:MeterBars Name="DestMeters" Horizontal="True" Margin="4" />
-              <Border Name="DestMasterBadge" Classes="masterBadge" IsVisible="False">
+              <controls:MeterBars Name="DestMeters" Horizontal="True" Margin="4">
+                <controls:MeterBars.Transitions>
+                  <Transitions>
+                    <ThicknessTransition Property="Margin" Duration="0:0:0.15" Easing="CubicEaseOut" />
+                  </Transitions>
+                </controls:MeterBars.Transitions>
+              </controls:MeterBars>
+              <Border Name="DestMasterBadge" Classes="masterBadge" Opacity="0">
                 <LayoutTransformControl HorizontalAlignment="Center" VerticalAlignment="Center">
                   <LayoutTransformControl.LayoutTransform>
                     <RotateTransform Angle="-90" />
@@ -533,6 +548,11 @@
               </Border>
               <StackPanel Name="DestTextStack" Margin="10,8,10,0" Spacing="2"
                           HorizontalAlignment="Stretch" VerticalAlignment="Top">
+                <StackPanel.Transitions>
+                  <Transitions>
+                    <ThicknessTransition Property="Margin" Duration="0:0:0.15" Easing="CubicEaseOut" />
+                  </Transitions>
+                </StackPanel.Transitions>
                 <TextBlock Name="DestName" Text="—"
                            FontSize="{DynamicResource FsLg}" FontWeight="Bold"
                            Foreground="{StaticResource TextStrong}"
@@ -592,11 +612,6 @@
               BorderBrush="{StaticResource LineStrong}" BorderThickness="1"
               Background="Transparent"
               chrome:WindowDecorationProperties.ElementRole="User">
-        <Border.Transitions>
-          <Transitions>
-            <BrushTransition Property="Background" Duration="0:0:0.12" Easing="CubicEaseOut" />
-          </Transitions>
-        </Border.Transitions>
         <StackPanel>
           <StackPanel Name="QuickButtons" Orientation="Horizontal" Spacing="6">
             <Button Name="PickBgBtn" Classes="quick" ToolTip.Tip="Background theme">
@@ -610,15 +625,14 @@
             <Button Name="PickSizeBtn" Classes="quick" ToolTip.Tip="Font size" Content="5" />
             <Button Name="PickScaleBtn" Classes="quick" ToolTip.Tip="UI scale" Content="MD" FontSize="9" />
           </StackPanel>
-          <!-- expand animation: the list fades and glides up into place as the box
-               grows (driven from ShowPicker) -->
-          <StackPanel Name="QuickList" IsVisible="False" Opacity="0"
-                      RenderTransform="translateY(-10px)">
+          <!-- expand animation: MaxHeight animates 0 → measured content height, so the
+               drawer BOX itself grows/shrinks smoothly (driven from ShowPicker) -->
+          <StackPanel Name="QuickList" IsVisible="False" Opacity="0" MaxHeight="0"
+                      ClipToBounds="True">
             <StackPanel.Transitions>
               <Transitions>
-                <DoubleTransition Property="Opacity" Duration="0:0:0.16" Easing="CubicEaseOut" />
-                <TransformOperationsTransition Property="RenderTransform"
-                                               Duration="0:0:0.20" Easing="CubicEaseOut" />
+                <DoubleTransition Property="Opacity" Duration="0:0:0.14" Easing="CubicEaseOut" />
+                <DoubleTransition Property="MaxHeight" Duration="0:0:0.18" Easing="CubicEaseOut" />
               </Transitions>
             </StackPanel.Transitions>
           </StackPanel>

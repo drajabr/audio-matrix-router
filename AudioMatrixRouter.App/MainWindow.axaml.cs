@@ -692,6 +692,7 @@ public partial class MainWindow : Window
     // =====================================================================
 
     private string? _pickerCategory;
+    private double _pickerContentHeight;
 
     /// <summary>
     /// Category picker panel, faithful to the web `.quick-control-picker`: a dark
@@ -795,20 +796,25 @@ public partial class MainWindow : Window
             QuickList.Children.Add(list);
             QuickList.IsVisible = true;
             QuickStrip.Background = new SolidColorBrush(AppTheme.Panel);
+
+            // measure what the list wants so MaxHeight can animate 0 → exactly that
+            // (animating to an arbitrary big number would distort the grow timing)
+            var innerWidth = Math.Max(60,
+                QuickStrip.Bounds.Width - QuickStrip.Padding.Left - QuickStrip.Padding.Right - 2);
+            list.Measure(new Size(innerWidth, double.PositiveInfinity));
+            _pickerContentHeight = list.DesiredSize.Height + 6; // + separator row
         }
 
         Rebuild();
         PickerBackdrop.IsVisible = true;
 
-        // start from the hidden pose, then let the transitions carry it in on the
-        // next frame (setting both in one tick would skip the animation)
-        QuickList.Opacity = 0;
-        QuickList.RenderTransform = TransformOperations.Parse("translateY(-10px)");
+        // next frame: the transitions carry the box open (height) and the rows in
+        // (opacity); on a category switch the height glides old → new instead
         Dispatcher.UIThread.Post(() =>
         {
             if (_pickerCategory is null) return;
             QuickList.Opacity = 1;
-            QuickList.RenderTransform = TransformOperations.Parse("translateY(0px)");
+            QuickList.MaxHeight = _pickerContentHeight;
         }, DispatcherPriority.Render);
     }
 
@@ -835,12 +841,21 @@ public partial class MainWindow : Window
 
     private void ClosePicker()
     {
+        if (_pickerCategory is null && !PickerBackdrop.IsVisible) return;
         _pickerCategory = null;
-        QuickList.Children.Clear();
-        QuickList.IsVisible = false;
-        QuickStrip.Width = double.NaN; // back to auto (the button row's width)
-        QuickStrip.Background = Brushes.Transparent;
         PickerBackdrop.IsVisible = false;
+        QuickStrip.Background = Brushes.Transparent;
+
+        // animate shut (height + fade), then tear down once the motion is done
+        QuickList.Opacity = 0;
+        QuickList.MaxHeight = 0;
+        DispatcherTimer.RunOnce(() =>
+        {
+            if (_pickerCategory is not null) return; // reopened mid-close
+            QuickList.Children.Clear();
+            QuickList.IsVisible = false;
+            QuickStrip.Width = double.NaN; // back to auto (the button row's width)
+        }, TimeSpan.FromMilliseconds(220));
     }
 
     /// <summary>Refresh the header quick-button faces after a theme change.</summary>
@@ -1645,7 +1660,10 @@ public partial class MainWindow : Window
 
     private static void StyleMasterCard(Border badge, StackPanel textStack, MeterBars meters, bool isMaster)
     {
-        badge.IsVisible = isMaster;
+        // Opacity, not IsVisible: the badge fades and the content margins glide
+        // (their ThicknessTransitions) instead of snapping when the pair changes.
+        badge.IsVisible = true;
+        badge.Opacity = isMaster ? 1 : 0;
         // content clears the 20px badge (CSS pads the card 30px left when badged)
         textStack.Margin = new Thickness(isMaster ? 30 : 10, 8, 10, 0);
         meters.Margin = new Thickness(isMaster ? 24 : 4, 4, 4, 4);
@@ -1704,7 +1722,13 @@ public partial class MainWindow : Window
     {
         if (string.IsNullOrWhiteSpace(message)) return;
         BannerText.Text = message;
-        Banner.IsVisible = true;
+        if (!Banner.IsVisible)
+        {
+            // fade in with the shared motion timing (its Opacity transition)
+            Banner.Opacity = 0;
+            Banner.IsVisible = true;
+            Dispatcher.UIThread.Post(() => Banner.Opacity = 1, DispatcherPriority.Render);
+        }
         _bannerTimer.Stop();
         _bannerTimer.Start();
     }
