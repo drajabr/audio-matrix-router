@@ -1498,6 +1498,14 @@ public partial class MainWindow : Window
         MetricInOverflows.Text = metrics.Inputs.Sum(d => d.Overflows).ToString();
         MetricInDrops.Text = metrics.Inputs.Sum(d => d.DroppedFrames).ToString();
         MetricOutLatency.Text = _outLatencySmooth.Format(metrics.OutputLatencyMs);
+
+        // Tier/period transparency: which WASAPI rung each side achieved.
+        var inTier = metrics.Inputs.FirstOrDefault(d => d.PeriodMs > 0);
+        if (inTier is not null)
+            ToolTip.SetTip(MetricInLatency, $"Capture cadence {inTier.PeriodMs:0.##}ms · {inTier.TierName}");
+        var outTier = metrics.Outputs.FirstOrDefault(d => d.PeriodMs > 0);
+        if (outTier is not null)
+            ToolTip.SetTip(MetricOutLatency, $"Engine period {outTier.PeriodMs:0.##}ms · {outTier.TierName}");
         MetricOutSync.Text = metrics.Outputs.Sum(d => d.SyncCorrections).ToString();
         MetricOutUnderruns.Text = metrics.Outputs.Sum(d => d.Underruns).ToString();
         MetricOutDrops.Text = metrics.Outputs.Sum(d => d.DroppedFrames).ToString();

@@ -575,7 +575,9 @@ public sealed class AppController : IDisposable
                 DroppedFrames = !string.IsNullOrWhiteSpace(preferredConsumerId)
                     ? (d.RingBuffer?.GetDroppedFramesForConsumer(preferredConsumerId) ?? 0)
                     : (d.RingBuffer?.TotalFramesDropped ?? 0),
-                SyncCorrections = syncCorrectionsByInput.GetValueOrDefault(d.Info.Id)
+                SyncCorrections = syncCorrectionsByInput.GetValueOrDefault(d.Info.Id),
+                PeriodMs = d.Capture is { } cap ? Math.Round(cap.ActualPeriodMs, 2) : 0,
+                TierName = d.Capture?.Tier.ToString() ?? ""
             });
         }
 
@@ -596,7 +598,9 @@ public sealed class AppController : IDisposable
                 AppliedPpm = d.MixProvider?.OutputAppliedPpm,
                 FastCatchUpActive = d.MixProvider?.FastCatchUpActive ?? false,
                 FastCatchUpDutyPercent = d.MixProvider?.FastCatchUpDutyPercent ?? 0,
-                PostRecoveryUnderruns = d.MixProvider?.PostRecoveryUnderruns ?? 0
+                PostRecoveryUnderruns = d.MixProvider?.PostRecoveryUnderruns ?? 0,
+                PeriodMs = d.Render is { } rnd ? Math.Round(rnd.ActualPeriodMs, 2) : 0,
+                TierName = d.Render?.Tier.ToString() ?? ""
             });
         }
 

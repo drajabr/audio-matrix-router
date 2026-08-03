@@ -41,6 +41,10 @@ public sealed class DeviceMetrics
     public long DroppedFrames { get; set; }
     public long Underruns { get; set; }
     public long SyncCorrections { get; set; }
+    /// <summary>Real WASAPI engine period this endpoint runs at, ms (0 = n/a).</summary>
+    public double PeriodMs { get; set; }
+    /// <summary>Achieved period tier ("MinPeriod", "DefaultPeriod", "Legacy"...).</summary>
+    public string TierName { get; set; } = "";
     public long PostRecoveryUnderruns { get; set; }
     public double? LatencyMs { get; set; }
     public double? SyncErrorMs { get; set; }
