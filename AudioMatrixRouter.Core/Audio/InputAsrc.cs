@@ -101,8 +101,11 @@ public sealed class InputAsrc
     /// while keeping steady-state latency near what the knob promises. Tighter trips
     /// inside normal operation (a permanent stutter loop, not a recovery).
     /// </summary>
+    // A third of a target (min 10 ms). The sustained-minimum trigger makes a tight
+    // band safe: it only fires when the FLOOR of the fill stays above threshold for
+    // a full second, which normal interleave excursions never do.
     private static double HardDrainFrames(int targetFillFrames, int engineSampleRate) =>
-        Math.Max(targetFillFrames / 2.0, engineSampleRate * 20 / 1000.0);
+        Math.Max(targetFillFrames / 3.0, engineSampleRate * 10 / 1000.0);
 
     public void SetFillConsumer(string consumerId)
     {

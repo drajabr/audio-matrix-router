@@ -232,7 +232,7 @@ internal static class WasapiDiagnostics
     private static readonly string LogPath =
         Path.Combine(Path.GetTempPath(), "amr-wasapi-probe.log");
 
-    private static void Log(string line)
+    internal static void Log(string line)
     {
         System.Diagnostics.Debug.WriteLine(line);
         try { File.AppendAllText(LogPath, $"{DateTime.Now:HH:mm:ss} {line}{Environment.NewLine}"); }

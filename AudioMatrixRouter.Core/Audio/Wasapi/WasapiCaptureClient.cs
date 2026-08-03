@@ -153,10 +153,11 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                     if (signaled == 1) break;
                     if (signaled == WaitHandle.WaitTimeout)
                     {
-                        // Shared-mode mics deliver silence packets continuously; 40
-                        // periods of nothing = dead endpoint (classic BT/HFP death).
-                        Fault(0);
-                        break;
+                        // No event for 40 periods. Probe instead of assuming death
+                        // (a false fault restarts the whole engine): a packet-size
+                        // query on a dead endpoint returns DEVICE_INVALIDATED, which
+                        // the drain loop below turns into a real fault; S_OK means
+                        // the endpoint is alive and merely quiet.
                     }
                 }
 

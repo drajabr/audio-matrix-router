@@ -168,10 +168,12 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                 if (signaled == 1) break;              // stop
                 if (signaled == WaitHandle.WaitTimeout)
                 {
-                    // A live shared render engine pumps events continuously; 20 silent
-                    // periods = the stream is dead without an invalidation (BT walk-away).
-                    Fault(0);
-                    break;
+                    // No event for 20 periods. Some drivers legally pause the event
+                    // pump — do NOT assume death (a false fault causes an engine
+                    // restart LOOP). Probe liveness instead: a padding query on a
+                    // dead stream returns DEVICE_INVALIDATED, which faults below;
+                    // if it answers S_OK the stream is alive, so keep waiting and
+                    // top the buffer up like a normal wake.
                 }
 
                 hr = client.GetCurrentPadding(out var padding);

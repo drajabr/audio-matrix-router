@@ -144,7 +144,7 @@ public class AudioEngine : IDisposable
 
     private void OnEndpointFaulted(string deviceName, int hr)
     {
-        System.Diagnostics.Debug.WriteLine($"[Engine] endpoint faulted: {deviceName} hr=0x{hr:X8}");
+        Wasapi.WasapiDiagnostics.Log($"[Engine] endpoint FAULTED: {deviceName} hr=0x{hr:X8}");
         try { EngineFaulted?.Invoke(); } catch { }
     }
 
