@@ -9,8 +9,8 @@ public class ActiveDevice
     public required DeviceInfo Info { get; init; }
     public int GlobalChannelOffset { get; set; }
     public RingBuffer? RingBuffer { get; set; }
-    public WasapiCapture? Capture { get; set; }
-    public WasapiOut? Render { get; set; }
+    public ICaptureEndpoint? Capture { get; set; }
+    public IRenderEndpoint? Render { get; set; }
     public MixingSampleProvider? MixProvider { get; set; }
     public InputAsrc? InputAsrc { get; set; }
     public bool IsMasterDevice { get; set; }
@@ -19,6 +19,8 @@ public class ActiveDevice
     public long InputOverflowCount;
     public int CaptureLatencyMs { get; set; }
     public int RenderLatencyMs { get; set; }
+    /// <summary>Real capture delivery cadence, ms (from the endpoint; loopback 10).</summary>
+    public double CaptureCadenceMs { get; set; }
     // Read back from WASAPI after Initialize (0 = read-back unavailable): the REAL
     // allocated render buffer and engine period, not the requested values.
     public int RealRenderBufferMs { get; set; }
@@ -803,6 +805,17 @@ public class AudioEngine : IDisposable
             // ===== 1. Engine clock = master output's nominal rate =====
             _engineSampleRate = masterOutput.Info.SampleRate > 0 ? masterOutput.Info.SampleRate : 48000;
 
+            // Diagnostic: log each endpoint's real shared-mode period capabilities
+            // (%TEMP%\amr-wasapi-probe.log) — the numbers the small-period path uses.
+            try
+            {
+                Wasapi.WasapiDiagnostics.ProbeEnginePeriods("out " + masterOutput.Info.Name, masterOutput.Info.Id);
+                var probeMic = _inputDevices.FirstOrDefault(d => !d.IsLoopback);
+                if (probeMic != null)
+                    Wasapi.WasapiDiagnostics.ProbeEnginePeriods("in " + probeMic.Info.Name, probeMic.Info.Id);
+            }
+            catch { }
+
             // ===== 2. Allocate rings (engine-rate content) =====
             int ringFrames = Math.Max(_engineSampleRate * RingBufferCapacityMs / 1000, _engineSampleRate / 200);
             foreach (var dev in _inputDevices)
@@ -972,37 +985,17 @@ public class AudioEngine : IDisposable
     {
         try
         {
-            var render = new WasapiOut(mmDevice, AudioClientShareMode.Shared, true, latencyMs);
+            IRenderEndpoint render = new NAudioRenderEndpoint(mmDevice, latencyMs, dev.Info.SampleRate);
             render.Init(dev.MixProvider!);
             dev.Render = render;
-            dev.RenderLatencyMs = latencyMs; // fallback if the read-back below fails
 
-            // HONEST NUMBERS: Windows rounds the requested buffer up to whole engine
-            // periods (and to the endpoint's minimum), and NAudio keeps the buffer
-            // topped to FULL on every period event — so the real render FIFO depth is
-            // the real BufferSize plus ~one period of mix-ahead, not the request.
-            // NAudio never exposes these, so read its private AudioClient once.
-            try
-            {
-                var acField = typeof(WasapiOut).GetField("audioClient",
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                if (acField?.GetValue(render) is AudioClient ac)
-                {
-                    int rate = dev.Info.SampleRate > 0 ? dev.Info.SampleRate : 48000;
-                    int realBufferMs = (int)Math.Round(ac.BufferSize * 1000.0 / rate);
-                    int periodMs = (int)Math.Max(1, mmDevice.AudioClient.DefaultDevicePeriod / 10000);
-                    if (realBufferMs > 0)
-                    {
-                        dev.RealRenderBufferMs = realBufferMs;
-                        dev.RenderPeriodMs = periodMs;
-                        dev.RenderLatencyMs = realBufferMs + periodMs;
-                    }
-                }
-            }
-            catch
-            {
-                // Reflection shape changed — keep the requested value as the estimate.
-            }
+            // Honest numbers come from the endpoint (real buffer + one period of
+            // mix-ahead); fall back to the request when read-back was unavailable.
+            dev.RealRenderBufferMs = render.ActualBufferMs;
+            dev.RenderPeriodMs = (int)Math.Ceiling(render.ActualPeriodMs);
+            dev.RenderLatencyMs = render.ActualBufferMs > 0
+                ? render.ActualBufferMs + dev.RenderPeriodMs
+                : latencyMs;
             return true;
         }
         catch
@@ -1028,23 +1021,12 @@ public class AudioEngine : IDisposable
             return false;
         }
 
-        if (dev.IsLoopback)
-        {
-            // NOT WasapiLoopbackCapture: that hardcodes a 100 ms poll buffer (audio
-            // arrives in ~50 ms bursts). PolledLoopbackCapture wakes every ~10 ms.
-            dev.Capture = new PolledLoopbackCapture(mmDevice);
-        }
-        else
-        {
-            // Endpoint buffer DEPTH is not latency — the 10 ms event drains it every
-            // period regardless. A 1-period-deep buffer (the old _inputBufferMs=10)
-            // silently DROPPED a packet whenever the capture thread was one period
-            // late, and rebuilding the lost fill through the ±2000 ppm servo took
-            // seconds of elevated underruns. 4+ periods of depth costs nothing.
-            dev.Capture = new WasapiCapture(mmDevice, true, Math.Max(40, _inputBufferMs));
-        }
-
-        dev.Capture.WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dev.Info.SampleRate, dev.Info.Channels);
+        // Endpoint buffer DEPTH is not latency — the delivery cadence drains it every
+        // period regardless. A 1-period-deep buffer silently DROPPED a packet whenever
+        // the capture thread was one period late; 4+ periods of depth costs nothing.
+        // Loopbacks use the polled 20 ms / ~10 ms-cadence mode (see Endpoints.cs).
+        dev.Capture = new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
+            Math.Max(40, _inputBufferMs), dev.Info.SampleRate, dev.Info.Channels);
 
         // Capture-side ASRC: convert this device's stream into the engine clock domain.
         // Handles BOTH static rate mismatch (e.g. 44.1k capture → 48k engine) and crystal
@@ -1054,33 +1036,13 @@ public class AudioEngine : IDisposable
         dev.InputAsrc = asrc;
 
         int channels = dev.Info.Channels;
-        // Reusable scratch for the WASAPI capture thread; avoids per-callback GC pressure
-        // (allocation-triggered Gen0 collections were a real source of audio-thread stalls).
-        float[] captureScratch = [];
-        dev.Capture.DataAvailable += (s, e) =>
+        dev.Capture.DataAvailable += (buffer, frames) =>
         {
-            // NAudio's capture thread runs at NORMAL priority with no MMCSS — at low
-            // latency an ordinary scheduling delay starves the ring. Idempotent.
-            MmcssHelper.BoostCurrentThread();
-
-            var ring = dev.RingBuffer;
             var deviceAsrc = dev.InputAsrc;
-            if (ring == null || deviceAsrc == null)
+            if (dev.RingBuffer == null || deviceAsrc == null || frames <= 0)
             {
                 return;
             }
-
-            int floatCount = e.BytesRecorded / 4;
-            if (floatCount <= 0) return;
-            int frames = floatCount / channels;
-            if (frames <= 0) return;
-
-            if (captureScratch.Length < floatCount)
-            {
-                int newSize = Math.Max(floatCount, Math.Max(64, captureScratch.Length * 2));
-                captureScratch = new float[newSize];
-            }
-            Buffer.BlockCopy(e.Buffer, 0, captureScratch, 0, e.BytesRecorded);
 
             var peaks = dev.PeakLevels;
             if (peaks != null)
@@ -1090,14 +1052,14 @@ public class AudioEngine : IDisposable
                     int baseIdx = f * channels;
                     for (int c = 0; c < channels; c++)
                     {
-                        float v = captureScratch[baseIdx + c];
+                        float v = buffer[baseIdx + c];
                         if (v < 0) v = -v;
                         if (v > peaks[c]) peaks[c] = v;
                     }
                 }
             }
 
-            int written = deviceAsrc.ProcessAndWrite(captureScratch, frames);
+            int written = deviceAsrc.ProcessAndWrite(buffer, frames);
             if (written <= 0 && frames > 0)
             {
                 Interlocked.Increment(ref dev.InputOverflowCount);
@@ -1106,7 +1068,7 @@ public class AudioEngine : IDisposable
 
         try
         {
-            dev.Capture.StartRecording();
+            dev.Capture.Start();
         }
         catch
         {
@@ -1117,7 +1079,8 @@ public class AudioEngine : IDisposable
         }
 
         // Latency contribution = delivery cadence (one period), NOT buffer depth.
-        dev.CaptureLatencyMs = CaptureCadenceMs;
+        dev.CaptureCadenceMs = dev.Capture.ActualPeriodMs;
+        dev.CaptureLatencyMs = (int)Math.Ceiling(dev.CaptureCadenceMs);
         return true;
     }
 
@@ -1154,7 +1117,7 @@ public class AudioEngine : IDisposable
     {
         foreach (var dev in _inputDevices)
         {
-            try { dev.Capture?.StopRecording(); } catch { }
+            try { dev.Capture?.Stop(); } catch { }
             try { dev.Capture?.Dispose(); } catch { }
             dev.Capture = null;
             dev.InputAsrc = null;
