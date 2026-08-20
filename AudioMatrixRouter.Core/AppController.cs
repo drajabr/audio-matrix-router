@@ -66,6 +66,7 @@ public sealed class AppController : IDisposable
     private int _winW;
     private int _winH;
     private bool _startMinimized;
+    private bool _winMaximized;
 
     // In-app updater (Velopack against the GitHub releases of drajabr/audio-matrix-router).
     private Velopack.UpdateManager? _updateManager;
@@ -161,6 +162,7 @@ public sealed class AppController : IDisposable
                 _winW = loadedConfig.Window.Width;
                 _winH = loadedConfig.Window.Height;
                 _startMinimized = loadedConfig.Window.StartMinimized;
+                _winMaximized = loadedConfig.Window.Maximized;
 
                 _startupAtBoot = ApplyStartupAtBoot(_startupAtBoot) && _startupAtBoot;
 
@@ -399,7 +401,7 @@ public sealed class AppController : IDisposable
             _winX, _winY, _winW, _winH,
             _locked, _startMinimized, _startupAtBoot,
             _uiPreferencesJson, _inputDeviceMode,
-            _lastSavedConfig);
+            _lastSavedConfig, _winMaximized);
         config.Save();
         _lastSavedConfig = config;
     }
@@ -411,20 +413,27 @@ public sealed class AppController : IDisposable
         SaveConfig();
     }
 
-    /// <summary>Cache the host window geometry; it is written into the config on save.</summary>
-    public void SetWindowBounds(int x, int y, int w, int h, bool startMinimized)
+    /// <summary>Cache the host window geometry (always the NORMAL-state rect — the host
+    /// tracks it through maximize/hide); it is written into the config on save.</summary>
+    public void SetWindowBounds(int x, int y, int w, int h, bool startMinimized, bool maximized = false)
     {
+        bool changed = _winX != x || _winY != y || _winW != w || _winH != h
+                       || _startMinimized != startMinimized || _winMaximized != maximized;
         _winX = x;
         _winY = y;
         _winW = w;
         _winH = h;
         _startMinimized = startMinimized;
+        _winMaximized = maximized;
+        // Persist geometry changes on their own: a hard reboot skips the shutdown flush,
+        // and a session where ONLY the window moved used to leave the file stale.
+        if (changed) ScheduleSave();
     }
 
     /// <summary>Last persisted window geometry (seeded from config at Initialize) so the
     /// host can restore its placement.</summary>
-    public (int X, int Y, int W, int H, bool StartMinimized) GetWindowBounds() =>
-        (_winX, _winY, _winW, _winH, _startMinimized);
+    public (int X, int Y, int W, int H, bool StartMinimized, bool Maximized) GetWindowBounds() =>
+        (_winX, _winY, _winW, _winH, _startMinimized, _winMaximized);
 
     // ---------------------------------------------------------------- snapshots
 
@@ -804,18 +813,24 @@ public sealed class AppController : IDisposable
         RaiseStateChanged();
     }
 
-    public void SetInputMaster(string deviceId)
+    /// <summary>Returns false when the device is not currently attached to the engine —
+    /// the preference is still remembered and promoted when the device appears.</summary>
+    public bool SetInputMaster(string deviceId)
     {
-        Engine.SetInputMasterDevice(deviceId ?? string.Empty);
+        bool applied = Engine.SetInputMasterDevice(deviceId ?? string.Empty);
         ScheduleSave();
         RaiseStateChanged();
+        return applied;
     }
 
-    public void SetOutputMaster(string deviceId)
+    /// <summary>Returns false when the device is not currently attached to the engine —
+    /// the preference is still remembered and promoted when the device appears.</summary>
+    public bool SetOutputMaster(string deviceId)
     {
-        Engine.SetOutputMasterDevice(deviceId ?? string.Empty);
+        bool applied = Engine.SetOutputMasterDevice(deviceId ?? string.Empty);
         ScheduleSave();
         RaiseStateChanged();
+        return applied;
     }
 
     public void SetOutputDelayMs(string deviceId, int delayMs)

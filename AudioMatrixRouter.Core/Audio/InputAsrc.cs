@@ -233,8 +233,37 @@ public sealed class InputAsrc
         if (outFrames > 0)
         {
             _ring.Write(_outScratch, 0, outFrames);
+            TrimBurstBacklog();
         }
         return outFrames;
+    }
+
+    /// <summary>
+    /// Burst guard, evaluated straight AFTER the write (the servo samples fill at the
+    /// top of the block, which is one whole burst too late). A throttled virtual pump —
+    /// a Steam/HDMI loopback that only wakes when its device plays — can hand over
+    /// seconds of backlog in a couple of callbacks. Left alone that saturates the ring,
+    /// and the next writes force-advance every consumer's cursor, which is booked as
+    /// huge "dropped frames" spikes even though the audio was never timely. Cutting the
+    /// surplus back to target here is a deliberate latency resync (counted in
+    /// TotalFramesResynced), not a fault — and it keeps overflow drops for what they
+    /// really mean: the ring outran its capacity.
+    /// </summary>
+    private void TrimBurstBacklog()
+    {
+        int fill = string.IsNullOrEmpty(_fillConsumerId)
+            ? _ring.AvailableFrames
+            : _ring.GetAvailableFrames(_fillConsumerId);
+
+        // Trip well before capacity, and far enough above target that ordinary
+        // capture/render interleave never reaches it.
+        double capacityGuard = _ring.CapacityFrames - _engineSampleRate / 50.0; // 20 ms of headroom
+        double trigger = Math.Min(capacityGuard,
+            Math.Max(_ring.CapacityFrames * 0.75, _targetFillFrames + 4 * _hardDrainFrames));
+        if (fill > trigger)
+        {
+            _ring.TrimBacklogBy((int)Math.Min(fill - (double)_targetFillFrames, int.MaxValue));
+        }
     }
 
     private void UpdateServo()

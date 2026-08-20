@@ -591,10 +591,23 @@ public class MixingSampleProvider : ISampleProvider
     private int _deviceDelayMs;
     private int _outputBufferMs;
     private long _underrunCount;
-    // Per-source write position at the previous callback: distinguishes a live producer
-    // that we outran (real underrun) from a paused one (idle loopback — not a fault).
+    // Per-source write position at the previous callback plus a production-pace EMA
+    // (produced ÷ expected per block, seeded at 1.0). Only a producer running at
+    // roughly real time can cause an audible underrun; an idle OR TRICKLING one
+    // (Steam/HDMI virtual pumps throttle to sparse bursts when only silence plays)
+    // must neither count underruns nor hold the start barrier hostage.
     // Grown in EnsureScratchSizes with the other per-source arrays.
     private long[] _lastSourceWritePos;
+    private double[] _producerPaceEma;
+    private long[] _producedThisBlock;
+    private int[] _belowPaceBlocks;
+    private const double ProducerPaceAliveThreshold = 0.5; // ≥ half real-time = live
+    private const double ProducerPaceEmaAlpha = 0.1;       // ~10 blocks to adapt
+    // The START BARRIER only disregards a source once it has been slow for this many
+    // consecutive blocks (~0.5 s). A capture that is merely slow to deliver its first
+    // packets must still be waited for; releasing early would start playback on a
+    // half-filled ring and underrun immediately.
+    private const int BarrierIgnoreAfterSlowBlocks = 50;
     private readonly float[] _peakLevels;
     private readonly ConcurrentDictionary<string, long> _inputSyncDiscardedFramesByDevice = new(StringComparer.Ordinal);
 
@@ -626,6 +639,10 @@ public class MixingSampleProvider : ISampleProvider
         _outputBufferMs = Math.Clamp(outputBufferMs, 10, 200);
         _pendingSkipPerSource = new long[Math.Max(1, sources.Count)];
         _lastSourceWritePos = new long[Math.Max(1, sources.Count)];
+        _producerPaceEma = new double[Math.Max(1, sources.Count)];
+        Array.Fill(_producerPaceEma, 1.0); // benefit of the doubt until measured
+        _producedThisBlock = new long[Math.Max(1, sources.Count)];
+        _belowPaceBlocks = new int[Math.Max(1, sources.Count)];
         _syncCoordinator.RegisterConsumer(_consumerId, _sampleRate, _outputBufferMs);
         // Pin this consumer's cursor on every ring NOW (before captures produce data) so
         // all consumers share an identical zero reference.
@@ -731,6 +748,10 @@ public class MixingSampleProvider : ISampleProvider
         var front = _matrix.GetFrontBuffer();
         int matOutCh = _matrix.OutputChannels;
         float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
+
+        // Production pace per source, updated BEFORE the barrier check so an idle or
+        // trickling producer stops holding the barrier within a few blocks.
+        UpdateProducerPace(frames);
 
         _syncCoordinator.ReportConsumerRouteActivity(_consumerId, HasAnyActiveRouteForThisOutputCore(front, matOutCh));
         _syncCoordinator.ReportBufferedFrames(_consumerId, GetBufferedFramesForConsumer());
@@ -853,13 +874,11 @@ public class MixingSampleProvider : ISampleProvider
 
             int deficit = sourceFramesNeeded - framesRead;
             int audibleDeficitThreshold = Math.Max(8, _engineSampleRate / 2000); // ~0.5 ms
-            // Only a LIVE producer that still can't cover the block is an underrun. A
-            // paused source (idle WASAPI loopback delivers nothing while its device is
-            // silent) has a frozen write position — starving on it is expected and
-            // inaudible, and counting it made the tile climb ~500/s on idle loopbacks.
-            long writePos = src.Buffer.GetWritePositionFrames();
-            bool producerAlive = writePos > _lastSourceWritePos[srcIdx];
-            _lastSourceWritePos[srcIdx] = writePos;
+            // Only a producer running at roughly REAL TIME can cause an audible underrun.
+            // A paused source (idle WASAPI loopback) or a trickling one (a virtual pump
+            // throttled to sparse bursts while only silence plays) is expected to starve —
+            // counting it made the tile climb hundreds per second on idle loopbacks.
+            bool producerAlive = IsProducerKeepingUp(srcIdx);
             // pendingSkip > 0 = this source is catching its cursor up after an idle
             // spell (e.g. a loopback that just resumed). That churn is already booked
             // as sync-discarded frames; counting it here read as 100 underruns/s
@@ -1014,6 +1033,25 @@ public class MixingSampleProvider : ISampleProvider
             Array.Copy(_lastSourceWritePos, grown, _lastSourceWritePos.Length);
             _lastSourceWritePos = grown;
         }
+        if (_producerPaceEma.Length < sourceCount)
+        {
+            var grown = new double[Math.Max(sourceCount, _producerPaceEma.Length * 2)];
+            Array.Fill(grown, 1.0);
+            Array.Copy(_producerPaceEma, grown, _producerPaceEma.Length);
+            _producerPaceEma = grown;
+        }
+        if (_producedThisBlock.Length < sourceCount)
+        {
+            var grown = new long[Math.Max(sourceCount, _producedThisBlock.Length * 2)];
+            Array.Copy(_producedThisBlock, grown, _producedThisBlock.Length);
+            _producedThisBlock = grown;
+        }
+        if (_belowPaceBlocks.Length < sourceCount)
+        {
+            var grown = new int[Math.Max(sourceCount, _belowPaceBlocks.Length * 2)];
+            Array.Copy(_belowPaceBlocks, grown, _belowPaceBlocks.Length);
+            _belowPaceBlocks = grown;
+        }
     }
 
     private bool HasAnyActiveRouteForThisOutputCore(Crosspoint[] front, int matOutCh)
@@ -1058,20 +1096,64 @@ public class MixingSampleProvider : ISampleProvider
         _syncCoordinator.RemoveConsumer(_consumerId);
     }
 
+    /// <summary>
+    /// Samples every source's write head ONCE per callback and derives, per source:
+    /// frames produced since the previous callback, and an EMA of the production pace
+    /// (produced ÷ frames this block consumes). Runs before the barrier check so a dead
+    /// or trickling producer stops gating anything. The sampled write positions are
+    /// reused by <see cref="GetBufferedFramesForConsumer"/> and the underrun test, so
+    /// the ring lock is taken once per source per callback instead of three times.
+    /// </summary>
+    private void UpdateProducerPace(int deviceFrames)
+    {
+        double expected = Math.Max(1.0, deviceFrames * _baseRatio);
+        int count = Math.Min(_sources.Count, Math.Min(_belowPaceBlocks.Length,
+            Math.Min(_producedThisBlock.Length, Math.Min(_lastSourceWritePos.Length, _producerPaceEma.Length))));
+        for (int i = 0; i < count; i++)
+        {
+            long writePos = _sources[i].Buffer.GetWritePositionFrames();
+            long produced = Math.Max(0, writePos - _lastSourceWritePos[i]);
+            _lastSourceWritePos[i] = writePos;
+            _producedThisBlock[i] = produced;
+            // Cap the sample so one catch-up burst can't pin the EMA high for seconds.
+            double sample = Math.Min(2.0, produced / expected);
+            _producerPaceEma[i] += (sample - _producerPaceEma[i]) * ProducerPaceEmaAlpha;
+
+            if (_producerPaceEma[i] < ProducerPaceAliveThreshold)
+            {
+                if (_belowPaceBlocks[i] < int.MaxValue) _belowPaceBlocks[i]++;
+            }
+            else
+            {
+                _belowPaceBlocks[i] = 0;
+            }
+        }
+    }
+
+    /// <summary>True when this source delivered audio for THIS block at roughly real
+    /// time. Both halves matter: "produced &gt; 0" catches a pause on the very first
+    /// block (an EMA alone needs several blocks to decay), and the pace EMA catches a
+    /// producer that trickles sparse bursts instead of pausing outright.</summary>
+    private bool IsProducerKeepingUp(int srcIdx) =>
+        srcIdx < _producedThisBlock.Length && _producedThisBlock[srcIdx] > 0 &&
+        srcIdx < _producerPaceEma.Length && _producerPaceEma[srcIdx] >= ProducerPaceAliveThreshold;
+
     private int GetBufferedFramesForConsumer()
     {
         if (_sources.Count == 0) return 0;
         int min = int.MaxValue;
         bool anyLive = false;
-        foreach (var source in _sources)
+        for (int i = 0; i < _sources.Count; i++)
         {
             // Rings whose producer has never written (capture failed to start, device
-            // dead on arrival) must not hold the start barrier hostage or drag the fill
-            // measurement to zero forever. Once a ring has produced at least one frame
-            // it participates normally.
-            if (source.Buffer.GetWritePositionFrames() == 0) continue;
+            // dead on arrival) or is not keeping real-time pace (idle/trickling loopback
+            // of a silent virtual device) must not hold the start barrier hostage or
+            // drag the fill measurement to zero forever. Write positions come from this
+            // callback's single sampling pass — no extra lock.
+            if (i < _lastSourceWritePos.Length && _lastSourceWritePos[i] == 0) continue;
+            if (i < _belowPaceBlocks.Length && _belowPaceBlocks[i] >= BarrierIgnoreAfterSlowBlocks) continue;
             anyLive = true;
-            int available = source.Buffer.GetAvailableFrames(_consumerId);
+            int available = _sources[i].Buffer.GetAvailableFrames(_consumerId);
             if (available < min) min = available;
         }
         if (!anyLive || min == int.MaxValue) return 0;

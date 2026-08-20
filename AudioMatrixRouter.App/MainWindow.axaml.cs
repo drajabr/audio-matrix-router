@@ -53,6 +53,13 @@ public partial class MainWindow : Window
     private bool _allowClose;
     private bool _shutdownDone;
 
+    // Last NORMAL-state placement. SaveBounds persists THIS, never the live rect: the
+    // live rect while maximized is the whole work area, and a session saved that way
+    // used to reopen after reboot as a screen-sized non-maximized window.
+    private PixelPoint _normalPosition;
+    private Size _normalClientSize;
+    private bool _hasNormalBounds;
+
     private enum UpdateState { Idle, Checking, Current, Available, Downloading, Ready, Portable, Error }
     private UpdateState _updateState = UpdateState.Idle;
     private string _updateVersion = "";
@@ -99,6 +106,7 @@ public partial class MainWindow : Window
         WireHeader();
         WireCorner();
         WireMatrix();
+        WireDockCards();
 
         RebuildModel();
         UpdateCornerVisuals();
@@ -121,15 +129,18 @@ public partial class MainWindow : Window
             Banner.IsVisible = false;
         };
 
-        // Window bounds → controller config, debounced. NOTE (integrator seam): the
-        // AppController contract has SetWindowBounds but no getter, so restoring the
-        // previous placement needs either a controller-side restore or a new getter.
+        // Window bounds → controller config, debounced. Only the NORMAL-state rect is
+        // tracked; maximize/minimize/hide never overwrite it.
         _boundsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         _boundsTimer.Tick += (_, _) =>
         {
             _boundsTimer.Stop();
             SaveBounds();
         };
+        // Events only re-arm the debounce; the normal-rect snapshot is taken inside
+        // SaveBounds. Sampling per event would run a screen query ~60×/s during a drag,
+        // and sampling while a maximize is still settling recorded the maximized rect as
+        // the normal one.
         PositionChanged += (_, _) => KickBoundsSave();
         SizeChanged += (_, _) => KickBoundsSave();
 
@@ -293,22 +304,85 @@ public partial class MainWindow : Window
     {
         try
         {
-            var (x, y, w, h, _) = _controller.GetWindowBounds();
+            var (x, y, w, h, _, maximized) = _controller.GetWindowBounds();
             if (w > 300 && h > 200)
             {
+                var pos = new PixelPoint(x, y);
+                var hasPosition = x > int.MinValue && y > int.MinValue &&
+                                  x > -10000 && y > -10000 && (x != 0 || y != 0);
+
+                // Clamp to the target screen's working area: geometry saved on a bigger
+                // or differently-scaled monitor must never exceed the screen the window
+                // actually opens on.
+                if (TryGetWorkAreaDips(hasPosition ? pos : new PixelPoint(0, 0), out var workArea))
+                {
+                    w = Math.Min(w, (int)workArea.Width);
+                    h = Math.Min(h, (int)workArea.Height);
+                }
+
                 Width = w;
                 Height = h;
-                if (x > int.MinValue && y > int.MinValue && x > -10000 && y > -10000 && (x != 0 || y != 0))
+                if (hasPosition)
                 {
                     WindowStartupLocation = WindowStartupLocation.Manual;
-                    Position = new PixelPoint(x, y);
+                    Position = pos;
+                    _normalPosition = pos;
                 }
+                // Seed the tracked size even without a usable saved position: opening
+                // maximized means TrackNormalBounds never runs, and an unseeded tracker
+                // makes SaveBounds fall back to the live (maximized) rect — the very bug
+                // this restore path exists to prevent.
+                _normalClientSize = new Size(w, h);
+                _hasNormalBounds = true;
+                // Reopen maximized when it was left that way — the tracked normal rect
+                // above is what un-maximizing falls back to.
+                if (maximized) WindowState = WindowState.Maximized;
             }
         }
         catch
         {
             // Bad persisted geometry must never block startup.
         }
+    }
+
+    /// <summary>
+    /// Snapshots the current rect as the restore geometry, but only while the window is
+    /// genuinely in its normal state. Called from SaveBounds (debounced, and on
+    /// hide/shutdown), so it costs one screen query per settle instead of one per event.
+    /// </summary>
+    private void TrackNormalBounds()
+    {
+        if (WindowState != WindowState.Normal || !IsVisible) return;
+        try
+        {
+            // Belt under the state check: a rect already covering the screen's working
+            // area is never a "normal" rect worth remembering, whatever the state says.
+            if (TryGetWorkAreaDips(Position, out var workArea) &&
+                ClientSize.Width >= workArea.Width - 2 &&
+                ClientSize.Height >= workArea.Height - 2)
+            {
+                return;
+            }
+        }
+        catch
+        {
+            // Screen lookup is advisory only.
+        }
+        _normalPosition = Position;
+        _normalClientSize = ClientSize;
+        _hasNormalBounds = true;
+    }
+
+    /// <summary>Working area of the screen holding <paramref name="point"/>, in DIPs
+    /// (the unit Width/Height and ClientSize use).</summary>
+    private bool TryGetWorkAreaDips(PixelPoint point, out Size workArea)
+    {
+        workArea = default;
+        var screen = Screens.ScreenFromPoint(point) ?? Screens.Primary;
+        if (screen is null || screen.Scaling <= 0) return false;
+        workArea = new Size(screen.WorkingArea.Width / screen.Scaling,
+                            screen.WorkingArea.Height / screen.Scaling);
+        return true;
     }
 
     private void KickBoundsSave()
@@ -320,13 +394,19 @@ public partial class MainWindow : Window
     private void SaveBounds()
     {
         if (_controller is null || WindowState == WindowState.Minimized) return;
+        TrackNormalBounds();
         try
         {
-            var size = FrameSize ?? ClientSize;
+            // Persist the tracked NORMAL rect (client size — it is restored via
+            // Width/Height, so saving FrameSize inflated the window by the border
+            // thickness on every save/restore cycle).
+            var pos = _hasNormalBounds ? _normalPosition : Position;
+            var size = _hasNormalBounds ? _normalClientSize : ClientSize;
             _controller.SetWindowBounds(
-                Position.X, Position.Y,
+                pos.X, pos.Y,
                 (int)Math.Round(size.Width), (int)Math.Round(size.Height),
-                startMinimized: !IsVisible);
+                startMinimized: !IsVisible,
+                maximized: WindowState == WindowState.Maximized);
         }
         catch
         {
@@ -957,6 +1037,24 @@ public partial class MainWindow : Window
         };
     }
 
+    /// <summary>Double-click on a dock device card sets that device as master —
+    /// same gesture as on the matrix header cards.</summary>
+    private void WireDockCards()
+    {
+        SourceCard.DoubleTapped += (_, _) =>
+        {
+            var (sourceId, _) = ResolveDetailPair();
+            if (sourceId is not null) TrySetMaster(isInput: true, sourceId);
+        };
+        DestCard.DoubleTapped += (_, _) =>
+        {
+            var (_, destId) = ResolveDetailPair();
+            if (destId is not null) TrySetMaster(isInput: false, destId);
+        };
+        ToolTip.SetTip(SourceCard, "Double-click to make this input the master");
+        ToolTip.SetTip(DestCard, "Double-click to make this output the master (engine clock)");
+    }
+
     private void OnCellToggled(MatrixCellEvent e)
     {
         if (_snapshot.Locked) return;
@@ -1003,25 +1101,32 @@ public partial class MainWindow : Window
             RebuildModel();
     }
 
-    private void OnMasterRequested(MatrixHeaderEvent e)
+    private void OnMasterRequested(MatrixHeaderEvent e) => TrySetMaster(e.IsInput, e.DeviceId);
+
+    /// <summary>
+    /// Sets the master device. The preference is always recorded (and promoted by the
+    /// engine the moment the device attaches and carries a route), so the badge — which
+    /// follows the recorded choice — is the whole feedback; nothing is announced.
+    /// </summary>
+    private void TrySetMaster(bool isInput, string deviceId)
     {
         if (_snapshot.Locked) return;
         try
         {
-            if (e.IsInput)
+            if (isInput)
             {
-                _controller.SetInputMaster(e.DeviceId);
-                _prefs.InputMasterId = e.DeviceId;
+                _controller.SetInputMaster(deviceId);
+                _prefs.InputMasterId = deviceId;
             }
             else
             {
-                _controller.SetOutputMaster(e.DeviceId);
-                _prefs.OutputMasterId = e.DeviceId;
+                _controller.SetOutputMaster(deviceId);
+                _prefs.OutputMasterId = deviceId;
             }
         }
         catch (Exception ex)
         {
-            ShowBanner(ex.Message);
+            ShowBanner(ex.Message); // a real failure still deserves the error banner
         }
         RefreshSnapshotAndRebuild();
     }

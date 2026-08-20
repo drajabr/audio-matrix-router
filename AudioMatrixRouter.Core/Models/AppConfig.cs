@@ -11,6 +11,9 @@ public class WindowConfig
     public int Width { get; set; } = 0;
     public int Height { get; set; } = 0;
     public bool StartMinimized { get; set; }
+    /// <summary>Window was maximized when last saved. X/Y/Width/Height always hold the
+    /// NORMAL-state geometry, so un-maximizing restores a sane size.</summary>
+    public bool Maximized { get; set; }
 }
 
 public class DeviceConfig
@@ -188,21 +191,25 @@ public class AppConfig
         }
     }
 
-    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson, string inputDeviceMode, AppConfig? previousConfig = null)
+    public static AppConfig FromEngine(Audio.AudioEngine engine, int winX, int winY, int winW, int winH, bool locked, bool startMinimized, bool startupAtBoot, string uiPreferencesJson, string inputDeviceMode, AppConfig? previousConfig = null, bool winMaximized = false)
     {
         var config = new AppConfig
         {
-            Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized },
+            Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized, Maximized = winMaximized },
             Locked = locked,
             StartupAtBoot = startupAtBoot,
             InputBufferMs = engine.InputBufferMs,
             OutputBufferMs = engine.OutputBufferMs,
             EngineBackend = engine.Backend,
-            InputMasterDeviceId = engine.GetInputMasterDevice()?.Info.Id ?? "",
-            // Persist the durable preference, not just the session flags — a master that is
-            // currently offline must survive the save or it would never be promoted again.
+            // Persist the durable preference, else the flag the user's choice set — a
+            // master that is currently offline (or parked) must survive the save or it
+            // would never be promoted again. Deliberately NOT the runtime master:
+            // GetXxxMasterDevice() can answer with a live stand-in, and saving that
+            // would overwrite the user's choice with an incidental fallback.
+            InputMasterDeviceId = engine.PreferredInputMasterId
+                ?? engine.FlaggedInputMasterId ?? "",
             OutputMasterDeviceId = engine.PreferredOutputMasterId
-                ?? engine.GetOutputMasterDevice()?.Info.Id ?? "",
+                ?? engine.FlaggedOutputMasterId ?? "",
             InputDeviceMode = inputDeviceMode is "input" or "loopback" or "both" ? inputDeviceMode : "both",
             UiPreferencesJson = uiPreferencesJson ?? ""
         };

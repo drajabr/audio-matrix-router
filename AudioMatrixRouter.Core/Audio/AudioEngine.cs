@@ -90,6 +90,9 @@ public class AudioEngine : IDisposable
     // be promoted back the moment it reappears (the IsMasterDevice flags only reflect the
     // currently running session).
     private string? _preferredOutputMasterId;
+    // Same durable-preference semantics for the input master (UI/telemetry only — the
+    // sync architecture disciplines every input against the engine clock regardless).
+    private string? _preferredInputMasterId;
     // Device-batch state: while depth > 0, Add/Remove skip their per-call Stop/Start so a
     // multi-device operation costs at most one engine restart (performed on batch dispose).
     private int _deviceBatchDepth;
@@ -430,6 +433,7 @@ public class AudioEngine : IDisposable
         // no controller role anymore.
         if (string.IsNullOrWhiteSpace(deviceId))
         {
+            _preferredInputMasterId = null;
             bool cleared = false;
             foreach (var d in _inputDevices)
             {
@@ -448,8 +452,16 @@ public class AudioEngine : IDisposable
             return true;
         }
 
+        // Remember the choice even when the device is currently absent, so it can be
+        // promoted the moment it (re)appears — same semantics as the output master.
+        _preferredInputMasterId = deviceId;
+
         var device = _inputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
-        if (device == null) return false;
+        if (device == null)
+        {
+            StateChanged?.Invoke();
+            return false;
+        }
 
         bool changed = false;
         foreach (var d in _inputDevices)
@@ -503,8 +515,9 @@ public class AudioEngine : IDisposable
         var device = _outputDevices.FirstOrDefault(d => d.Info.Id == deviceId);
         if (device == null)
         {
+            // Preference remembered; false tells the caller it did not take effect yet.
             StateChanged?.Invoke();
-            return true;
+            return false;
         }
 
         bool changed = false;
@@ -516,6 +529,18 @@ public class AudioEngine : IDisposable
                 d.IsMasterDevice = next;
                 changed = true;
             }
+        }
+
+        // A parked output (no active route) cannot hold the engine clock: it has no
+        // render endpoint to derive one from. Record the choice, skip the restart —
+        // restarting would only re-elect the same routed device, glitching every
+        // playing output for nothing — and report that it is not the live clock yet.
+        var routedIds = _running ? GetRoutedOutputIdsFromMatrix() : null;
+        bool carriesRoute = routedIds is null || routedIds.Count == 0 || routedIds.Contains(deviceId);
+        if (!carriesRoute)
+        {
+            if (changed) StateChanged?.Invoke();
+            return false;
         }
 
         // The master output DEFINES the engine clock; switching it changes the clock
@@ -531,27 +556,120 @@ public class AudioEngine : IDisposable
     }
 
     public string? PreferredOutputMasterId => _preferredOutputMasterId;
+    public string? PreferredInputMasterId => _preferredInputMasterId;
+
+    // Masters for PERSISTENCE: the user's choice as carried by the session flags, with
+    // no runtime substitution. GetOutputMasterDevice() may answer with a live stand-in
+    // when the chosen device is parked or failed — writing THAT to disk would quietly
+    // promote a temporary fallback into the user's saved preference.
+    public string? FlaggedOutputMasterId => _outputDevices.FirstOrDefault(d => d.IsMasterDevice)?.Info.Id;
+    public string? FlaggedInputMasterId => _inputDevices.FirstOrDefault(d => d.IsMasterDevice)?.Info.Id;
 
     public ActiveDevice? GetInputMasterDevice() =>
         _inputDevices.FirstOrDefault(d => d.IsMasterDevice) ??
         _inputDevices.FirstOrDefault();
 
-    public ActiveDevice? GetOutputMasterDevice() =>
-        _outputDevices.FirstOrDefault(d => d.IsMasterDevice) ??
-        _outputDevices.FirstOrDefault();
+    /// <summary>
+    /// The output master for RUNTIME purposes (fill reference, metrics consumer). While
+    /// running, a device that is parked (no routes, hence no provider) cannot serve as
+    /// one, so a live device wins — the flag itself keeps carrying the user's choice for
+    /// the badge. Not running: the flag is the answer.
+    /// </summary>
+    public ActiveDevice? GetOutputMasterDevice()
+    {
+        if (_running)
+        {
+            var liveMaster = _outputDevices.FirstOrDefault(d => d.IsMasterDevice && d.MixProvider != null);
+            if (liveMaster != null) return liveMaster;
+
+            var coordinatorMasterId = _syncCoordinator?.GetMasterConsumerId();
+            if (!string.IsNullOrWhiteSpace(coordinatorMasterId))
+            {
+                var coordinatorMaster = _outputDevices.FirstOrDefault(
+                    d => d.MixProvider != null && d.ConsumerId == coordinatorMasterId);
+                if (coordinatorMaster != null) return coordinatorMaster;
+            }
+
+            var anyLive = _outputDevices.FirstOrDefault(d => d.MixProvider != null);
+            if (anyLive != null) return anyLive;
+        }
+
+        return _outputDevices.FirstOrDefault(d => d.IsMasterDevice) ??
+               _outputDevices.FirstOrDefault();
+    }
 
     /// <summary>
     /// Master to try first on a fresh Start(): the user's durable preference wins whenever
-    /// that device is currently attached; otherwise fall back to the session flags.
+    /// that device is currently attached, then the session flag, then any candidate.
+    /// <paramref name="eligibleIds"/> restricts the choice to the outputs that will
+    /// actually start (the routed set); null or empty means no restriction.
     /// </summary>
-    private ActiveDevice? ResolveStartMaster()
+    private ActiveDevice? ResolveStartMaster(HashSet<string>? eligibleIds = null)
     {
+        bool Eligible(ActiveDevice d) =>
+            eligibleIds is null || eligibleIds.Count == 0 || eligibleIds.Contains(d.Info.Id);
+
         if (!string.IsNullOrWhiteSpace(_preferredOutputMasterId))
         {
-            var preferred = _outputDevices.FirstOrDefault(d => d.Info.Id == _preferredOutputMasterId);
+            var preferred = _outputDevices.FirstOrDefault(
+                d => d.Info.Id == _preferredOutputMasterId && Eligible(d));
             if (preferred != null) return preferred;
         }
-        return GetOutputMasterDevice();
+        return _outputDevices.FirstOrDefault(d => d.IsMasterDevice && Eligible(d))
+               ?? _outputDevices.FirstOrDefault(Eligible);
+    }
+
+    /// <summary>Output device ids that carry at least one active crosspoint — the set
+    /// that actually participates in a start (everything else is parked).</summary>
+    private HashSet<string> GetRoutedOutputIdsFromMatrix()
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        var front = _routingMatrix.GetFrontBuffer();
+        int outChannels = _routingMatrix.OutputChannels;
+        if (front.Length == 0 || outChannels == 0) return ids;
+
+        foreach (var dev in _outputDevices)
+        {
+            int start = dev.GlobalChannelOffset;
+            int end = Math.Min(outChannels, start + dev.Info.Channels);
+            bool routed = false;
+            for (int outCh = start; outCh < end && !routed; outCh++)
+            {
+                for (int inCh = 0; inCh < _routingMatrix.InputChannels; inCh++)
+                {
+                    int idx = inCh * outChannels + outCh;
+                    if (idx >= 0 && idx < front.Length && front[idx].Active)
+                    {
+                        routed = true;
+                        break;
+                    }
+                }
+            }
+            if (routed) ids.Add(dev.Info.Id);
+        }
+        return ids;
+    }
+
+    /// <summary>
+    /// A route change that adds a first route to a parked output (or removes the last
+    /// route from a running one) changes which devices participate in the stream —
+    /// restart through the normal barrier path, exactly like a device add/remove.
+    /// </summary>
+    private void RestartIfOutputParticipationChanged(HashSet<string> before)
+    {
+        if (!_running) return;
+        var after = GetRoutedOutputIdsFromMatrix();
+        if (before.SetEquals(after)) return;
+
+        if (_deviceBatchDepth > 0)
+        {
+            Stop();
+            _batchRestart = true;
+        }
+        else
+        {
+            FullRestart();
+        }
     }
 
     /// <summary>
@@ -657,6 +775,15 @@ public class AudioEngine : IDisposable
         RecalcChannelOffsets();
 
         RestoreDormantRoutesForInputDevice(deviceId);
+
+        // Promote the durable input-master preference the moment its device appears.
+        if (found.Id == _preferredInputMasterId)
+        {
+            foreach (var d in _inputDevices)
+            {
+                d.IsMasterDevice = d.Info.Id == found.Id;
+            }
+        }
 
         if (_deviceBatchDepth == 0 && wasRunning && _inputDevices.Count > 0 && _outputDevices.Count > 0 && _routingMatrix.HasAnyCrosspoints()) Start();
 
@@ -850,6 +977,12 @@ public class AudioEngine : IDisposable
         // too, or the route would silently resurrect on the next restart/replug.
         if (!active) PruneDormantRoute(inCh, outCh);
 
+        // Only an Active flip can change which outputs participate; a gain/phase tweak
+        // never can, so it must not pay for the matrix scan (the wheel fires these tens
+        // of times a second), and neither must a stopped engine.
+        bool mayChangeParticipation = _running && _routingMatrix.GetCrosspoint(inCh, outCh).Active != active;
+        var routedBefore = mayChangeParticipation ? GetRoutedOutputIdsFromMatrix() : null;
+
         bool changed = _routingMatrix.SetCrosspoint(inCh, outCh, active, gainDb, phaseInverted);
         if (!changed)
         {
@@ -857,6 +990,7 @@ public class AudioEngine : IDisposable
         }
 
         _routingMatrix.Publish();
+        if (routedBefore is not null) RestartIfOutputParticipationChanged(routedBefore);
         StateChanged?.Invoke();
     }
 
@@ -868,9 +1002,25 @@ public class AudioEngine : IDisposable
             if (!update.Active) PruneDormantRoute(update.InCh, update.OutCh);
         }
 
+        // Same rule as SetCrosspoint: scan only when an Active bit actually flips.
+        bool mayChangeParticipation = false;
+        if (_running)
+        {
+            foreach (var update in list)
+            {
+                if (_routingMatrix.GetCrosspoint(update.InCh, update.OutCh).Active != update.Active)
+                {
+                    mayChangeParticipation = true;
+                    break;
+                }
+            }
+        }
+        var routedBefore = mayChangeParticipation ? GetRoutedOutputIdsFromMatrix() : null;
+
         var result = _routingMatrix.SetCrosspoints(list);
         if (result.Changed > 0)
         {
+            if (routedBefore is not null) RestartIfOutputParticipationChanged(routedBefore);
             StateChanged?.Invoke();
         }
 
@@ -922,7 +1072,27 @@ public class AudioEngine : IDisposable
 
         try
         {
-            var masterOutput = masterOverride ?? ResolveStartMaster() ?? _outputDevices.First();
+            // ===== 0. Outputs with no active route are PARKED: no render endpoint, no
+            // ring consumer, no coordinator entry. A parked virtual sink (Steam streaming
+            // speakers idle, a sleeping HDMI monitor…) used to be a full engine citizen:
+            // its stalling render callback let every input ring overflow past capacity
+            // (millions of "dropped frames" in bursts) and its oversized real buffer set
+            // the worst-gulp fill floor for ALL inputs, inflating reported input latency
+            // far above the knob. Routing to a parked output restarts the engine (see
+            // SetCrosspoints), exactly like adding a device does.
+            var routedOutputIds = GetRoutedOutputIdsFromMatrix();
+            bool ParticipatesInStart(ActiveDevice d) =>
+                routedOutputIds.Count == 0 || routedOutputIds.Contains(d.Info.Id);
+
+            // The CLOCK master must be a device that actually starts, so it is chosen
+            // among the routed outputs. The IsMasterDevice flags are deliberately NOT
+            // rewritten here: they carry the user's choice (that is what the MASTER
+            // badge shows, and what keeps a chosen row visible with show-all off).
+            // Runtime plumbing asks the coordinator or GetOutputMasterDevice(), both of
+            // which resolve to a live device.
+            var masterOutput = masterOverride
+                ?? ResolveStartMaster(routedOutputIds)
+                ?? _outputDevices.First();
 
             // ===== 1. Engine clock = master output's nominal rate =====
             _engineSampleRate = masterOutput.Info.SampleRate > 0 ? masterOutput.Info.SampleRate : 48000;
@@ -969,6 +1139,15 @@ public class AudioEngine : IDisposable
             var startedOutputs = new List<ActiveDevice>();
             foreach (var dev in _outputDevices)
             {
+                if (!ParticipatesInStart(dev))
+                {
+                    // Parked: clear stale endpoint read-backs so metrics report nothing.
+                    dev.RealRenderBufferMs = 0;
+                    dev.RenderPeriodMs = 0;
+                    dev.RenderLatencyMs = 0;
+                    continue;
+                }
+
                 var mmDevice = _enumerator.GetDevice(dev.Info.Id);
                 if (mmDevice == null) continue;
 
@@ -1387,12 +1566,18 @@ public class AudioEngine : IDisposable
 
     private void ApplyPreferredMasterConsumerToInputs()
     {
-        var masterOutput = GetOutputMasterDevice() ?? _outputDevices.FirstOrDefault();
-        if (masterOutput == null) return;
-
-        var preferredConsumerId = string.IsNullOrWhiteSpace(masterOutput.ConsumerId)
-            ? masterOutput.Info.Id
-            : masterOutput.ConsumerId;
+        // The fill reference must be a consumer that actually exists on the rings — the
+        // coordinator's master is authoritative (a flagged-but-parked output would hand
+        // the servos a cursor nobody advances, which reads as ever-growing fill).
+        var preferredConsumerId = _syncCoordinator?.GetMasterConsumerId();
+        if (string.IsNullOrWhiteSpace(preferredConsumerId))
+        {
+            var masterOutput = GetOutputMasterDevice() ?? _outputDevices.FirstOrDefault();
+            if (masterOutput == null) return;
+            preferredConsumerId = string.IsNullOrWhiteSpace(masterOutput.ConsumerId)
+                ? masterOutput.Info.Id
+                : masterOutput.ConsumerId;
+        }
 
         foreach (var input in _inputDevices)
         {
