@@ -6,7 +6,9 @@ namespace AudioMatrixRouter.Audio;
 
 public class ActiveDevice
 {
-    public required DeviceInfo Info { get; init; }
+    /// <summary>Enumerated identity and format. Replaced (never mutated) when the
+    /// endpoint's live mix format turns out to differ — see the format guards.</summary>
+    public required DeviceInfo Info { get; set; }
     public int GlobalChannelOffset { get; set; }
     public RingBuffer? RingBuffer { get; set; }
     public ICaptureEndpoint? Capture { get; set; }
@@ -221,9 +223,11 @@ public class AudioEngine : IDisposable
 
             if (demoted)
             {
-                // Timer thread, never an audio thread — a direct restart is safe here
-                // and goes through the proven barrier/fill path.
-                FullRestart();
+                // Timer thread: never mutate engine state here (the host thread may be
+                // inside SetCrosspoints/RefreshDevices). Ask the host for a restart
+                // through the same marshalled, debounced path a fault uses.
+                Wasapi.WasapiDiagnostics.Log("[Engine] adaptive degrade: tier demoted, requesting restart");
+                try { EngineFaulted?.Invoke(); } catch { }
             }
             else if (!anyEvaluating)
             {
@@ -1098,15 +1102,19 @@ public class AudioEngine : IDisposable
             _engineSampleRate = masterOutput.Info.SampleRate > 0 ? masterOutput.Info.SampleRate : 48000;
 
             // Diagnostic: log each endpoint's real shared-mode period capabilities
-            // (%TEMP%\amr-wasapi-probe.log) — the numbers the small-period path uses.
+            // (%TEMP%\amr-wasapi-probe.log) — once per endpoint per process (each probe
+            // is a COM activation, and this used to run on every restart).
             try
             {
-                Wasapi.WasapiDiagnostics.ProbeEnginePeriods("out " + masterOutput.Info.Name, masterOutput.Info.Id);
+                Wasapi.WasapiDiagnostics.ProbeEnginePeriodsOnce("out " + masterOutput.Info.Name, masterOutput.Info.Id);
                 var probeMic = _inputDevices.FirstOrDefault(d => !d.IsLoopback);
                 if (probeMic != null)
-                    Wasapi.WasapiDiagnostics.ProbeEnginePeriods("in " + probeMic.Info.Name, probeMic.Info.Id);
+                    Wasapi.WasapiDiagnostics.ProbeEnginePeriodsOnce("in " + probeMic.Info.Name, probeMic.Info.Id);
             }
             catch { }
+            Wasapi.WasapiDiagnostics.Log($"[Engine] start #{++_startSequence} attempt {attempt}: master '{masterOutput.Info.Name}' " +
+                $"engineRate {_engineSampleRate} knob {_outputBufferMs} in {_inputBufferMs} " +
+                $"routedOutputs {routedOutputIds.Count} inputs {_inputDevices.Count} outputs {_outputDevices.Count}");
 
             // ===== 2. Allocate rings (engine-rate content) =====
             int ringFrames = Math.Max(_engineSampleRate * RingBufferCapacityMs / 1000, _engineSampleRate / 200);
@@ -1124,6 +1132,22 @@ public class AudioEngine : IDisposable
             _syncCoordinator = new OutputSyncCoordinator(
                 masterOutput.Info.Id, _engineSampleRate, baseMasterTargetFrames, maxMasterTargetFrames);
             _syncCoordinator.ArmGlobalRefillHold();
+            var coordinatorForEvent = _syncCoordinator;
+            _syncCoordinator.MasterChanged += newMasterId =>
+            {
+                // Audio thread. Cheap work only: re-point the rings' preferred consumer
+                // (the servos already resolve the fill reference per update) and log.
+                // The old master, if it is merely asleep, will fault through the stall
+                // detector and the host handles recovery from there.
+                if (!ReferenceEquals(coordinatorForEvent, _syncCoordinator)) return;
+                var dev = _outputDevices.FirstOrDefault(d => d.ConsumerId == newMasterId);
+                Wasapi.WasapiDiagnostics.Log($"[Engine] master STALLED — promoted '{dev?.Info.Name ?? newMasterId}' as live clock master");
+                foreach (var input in _inputDevices)
+                {
+                    input.RingBuffer?.SetPreferredConsumer(newMasterId);
+                }
+                try { StateChanged?.Invoke(); } catch { }
+            };
 
             var sources = _inputDevices
                 .Where(d => d.RingBuffer != null)
@@ -1137,6 +1161,7 @@ public class AudioEngine : IDisposable
 
             // ===== 4. Providers + renders (consumer cursors pinned on EMPTY rings) =====
             var startedOutputs = new List<ActiveDevice>();
+            bool formatChanged = false;
             foreach (var dev in _outputDevices)
             {
                 if (!ParticipatesInStart(dev))
@@ -1170,12 +1195,40 @@ public class AudioEngine : IDisposable
                     continue; // Skip this device; engine continues with the remaining outputs.
                 }
 
+                // Render format guard: the custom client opened the endpoint at its LIVE
+                // mix format. If that differs from what we enumerated (HDMI sinks
+                // renegotiate on wake; the user edited Sound settings), the provider we
+                // just built would feed 48 k content into a 44.1 k stream (pitch -8.8 %)
+                // or mis-interleave a changed channel count (noise). Adopt the real
+                // format and rebuild once around it.
+                if (dev.Render is Wasapi.WasapiRenderClient wrc &&
+                    wrc.ActualSampleRate > 0 && wrc.ActualChannels > 0 &&
+                    (wrc.ActualSampleRate != dev.Info.SampleRate || wrc.ActualChannels != dev.Info.Channels))
+                {
+                    Wasapi.WasapiDiagnostics.Log($"[Engine] render format drift on '{dev.Info.Name}': " +
+                        $"enumerated {dev.Info.SampleRate}Hz/{dev.Info.Channels}ch, live {wrc.ActualSampleRate}Hz/{wrc.ActualChannels}ch — rebuilding");
+                    dev.Info = dev.Info with { SampleRate = wrc.ActualSampleRate, Channels = wrc.ActualChannels };
+                    formatChanged = true;
+                }
+
                 startedOutputs.Add(dev);
+            }
+
+            if (formatChanged && attempt < 1)
+            {
+                // Rebuild around the real formats: channel offsets, matrix, rings, engine
+                // rate (if the master changed) all derive from Info.
+                var routeSnapshot = CaptureRoutedCrosspoints();
+                Stop();
+                RecalcChannelOffsets();
+                RestoreRoutedCrosspoints(routeSnapshot);
+                return StartCore(null, attempt + 1);
             }
 
             // Startup is not valid without at least one active render endpoint.
             if (startedOutputs.Count == 0)
             {
+                Wasapi.WasapiDiagnostics.Log("[Engine] start aborted: no render endpoint could be opened");
                 Stop();
                 return false;
             }
@@ -1242,6 +1295,13 @@ public class AudioEngine : IDisposable
             }
             _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
+            Wasapi.WasapiDiagnostics.Log($"[Engine] budget: capture cadence {_worstCaptureCadenceMs:0.##} ms, " +
+                $"render gulp {_worstRenderGulpMs} ms (requested {RenderBufferMs}), ring target {InputFillTargetMs} ms, " +
+                $"effective total ≈ {Math.Ceiling(_worstCaptureCadenceMs) + InputFillTargetMs + startedOutputs.Max(d => d.RenderLatencyMs)} ms; " +
+                string.Join(", ", startedOutputs.Select(d => $"'{d.Info.Name}' {d.Render?.Tier} buf {d.RealRenderBufferMs} ms period {d.RenderPeriodMs} ms")) +
+                "; inputs " + string.Join(", ", _inputDevices.Where(d => d.Capture != null)
+                    .Select(d => $"'{d.Info.Name}' {d.Capture?.Tier} {d.CaptureCadenceMs:0.##} ms")));
+
             // ===== 6. Play all outputs together =====
             foreach (var dev in _outputDevices)
             {
@@ -1253,12 +1313,15 @@ public class AudioEngine : IDisposable
             StateChanged?.Invoke();
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            Wasapi.WasapiDiagnostics.Log($"[Engine] start FAILED: {ex.GetType().Name}: {ex.Message}");
             Stop();
             return false;
         }
     }
+
+    private int _startSequence;
 
     public bool SetOutputDelayMs(string deviceId, int delayMs)
     {
@@ -1306,30 +1369,38 @@ public class AudioEngine : IDisposable
         // under the ladder's own braces.
         if (!string.Equals(_backend, "legacy", StringComparison.OrdinalIgnoreCase))
         {
+            IRenderEndpoint? rc = null;
             try
             {
-                IRenderEndpoint rc = new Wasapi.WasapiRenderClient(
+                rc = new Wasapi.WasapiRenderClient(
                     dev.Info.Id, latencyMs, dev.RequestedRenderTier, dev.Info.Name);
                 rc.Init(dev.MixProvider!);
                 AdoptRender(dev, rc, latencyMs);
                 return true;
             }
-            catch
+            catch (Exception ex)
             {
+                Wasapi.WasapiDiagnostics.Log($"[Engine] custom render open failed for '{dev.Info.Name}': {ex.Message}");
+                // The client was never adopted: dispose it HERE or its wait handles
+                // leak on every failed attempt (hundreds per hour in a fault storm).
+                try { rc?.Dispose(); } catch { }
                 try { dev.Render?.Dispose(); } catch { }
                 dev.Render = null;
             }
         }
 
+        IRenderEndpoint? render = null;
         try
         {
-            IRenderEndpoint render = new NAudioRenderEndpoint(mmDevice, latencyMs, dev.Info.SampleRate);
+            render = new NAudioRenderEndpoint(mmDevice, latencyMs, dev.Info.SampleRate);
             render.Init(dev.MixProvider!);
             AdoptRender(dev, render, latencyMs);
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            Wasapi.WasapiDiagnostics.Log($"[Engine] legacy render open failed for '{dev.Info.Name}': {ex.Message}");
+            try { render?.Dispose(); } catch { }
             try { dev.Render?.Dispose(); } catch { }
             dev.Render = null;
             return false;
@@ -1391,7 +1462,10 @@ public class AudioEngine : IDisposable
         // Handles BOTH static rate mismatch (e.g. 44.1k capture → 48k engine) and crystal
         // drift (fill-level PI), so the rings always contain coherent engine-rate audio.
         var asrc = new InputAsrc(dev.RingBuffer, dev.Info.Channels, dev.Info.SampleRate, _engineSampleRate, fillTargetFrames);
-        asrc.SetFillConsumer(masterConsumerId);
+        // Fill reference = the coordinator's CURRENT master, resolved per update, so a
+        // live master promotion (stalled HDMI master) moves every servo with it.
+        var coordinator = _syncCoordinator;
+        asrc.SetFillConsumer(() => coordinator?.GetMasterConsumerId() is { Length: > 0 } id ? id : masterConsumerId);
         dev.InputAsrc = asrc;
 
         RewireCaptureHandler(dev);
@@ -1448,6 +1522,8 @@ public class AudioEngine : IDisposable
         // Latency contribution = delivery cadence (one period), NOT buffer depth.
         dev.CaptureCadenceMs = dev.Capture.ActualPeriodMs;
         dev.CaptureLatencyMs = (int)Math.Ceiling(dev.CaptureCadenceMs);
+        asrc.SetCadenceMs(dev.CaptureCadenceMs);
+        dev.RingBuffer.ProducerCadenceMs = dev.CaptureCadenceMs;
         dev.Capture.Faulted += hr => OnEndpointFaulted(dev.Info.Name, hr);
         dev.TierDiscontinuityBaseline = 0;
         return true;
@@ -1579,10 +1655,12 @@ public class AudioEngine : IDisposable
                 : masterOutput.ConsumerId;
         }
 
+        var coordinator = _syncCoordinator;
+        var fallback = preferredConsumerId;
         foreach (var input in _inputDevices)
         {
             input.RingBuffer?.SetPreferredConsumer(preferredConsumerId);
-            input.InputAsrc?.SetFillConsumer(preferredConsumerId);
+            input.InputAsrc?.SetFillConsumer(() => coordinator?.GetMasterConsumerId() is { Length: > 0 } id ? id : fallback);
         }
     }
 
@@ -1676,13 +1754,47 @@ public class AudioEngine : IDisposable
             .Distinct(StringComparer.Ordinal)
             .ToList();
 
+        // Format drift on devices that are still present (HDMI renegotiation, Sound
+        // settings edit): adopt the new rate/channel count — the rest of this method
+        // rebuilds offsets, matrix and (if running) the engine around it.
+        bool formatChanged = false;
+        foreach (var dev in _inputDevices)
+        {
+            var fresh = dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
+                ? renderDevices.FirstOrDefault(r => r.Id == dev.Info.Id.Substring("loop:".Length))
+                : captureDevices.FirstOrDefault(c => c.Id == dev.Info.Id);
+            if (fresh is null) continue;
+            if (fresh.SampleRate != dev.Info.SampleRate || fresh.Channels != dev.Info.Channels)
+            {
+                Wasapi.WasapiDiagnostics.Log($"[Engine] input format changed on '{dev.Info.Name}': " +
+                    $"{dev.Info.SampleRate}Hz/{dev.Info.Channels}ch → {fresh.SampleRate}Hz/{fresh.Channels}ch");
+                dev.Info = dev.Info with { SampleRate = fresh.SampleRate, Channels = fresh.Channels };
+                formatChanged = true;
+            }
+        }
+        foreach (var dev in _outputDevices)
+        {
+            var fresh = renderDevices.FirstOrDefault(r => r.Id == dev.Info.Id);
+            if (fresh is null) continue;
+            if (fresh.SampleRate != dev.Info.SampleRate || fresh.Channels != dev.Info.Channels)
+            {
+                Wasapi.WasapiDiagnostics.Log($"[Engine] output format changed on '{dev.Info.Name}': " +
+                    $"{dev.Info.SampleRate}Hz/{dev.Info.Channels}ch → {fresh.SampleRate}Hz/{fresh.Channels}ch");
+                dev.Info = dev.Info with { SampleRate = fresh.SampleRate, Channels = fresh.Channels };
+                formatChanged = true;
+            }
+        }
+
         bool changed = inputsToRemove.Count > 0 || outputsToRemove.Count > 0
-            || inputsToReattach.Count > 0 || outputsToReattach.Count > 0;
+            || inputsToReattach.Count > 0 || outputsToReattach.Count > 0 || formatChanged;
 
         if (!changed)
         {
             return;
         }
+
+        Wasapi.WasapiDiagnostics.Log($"[Engine] device refresh: -{inputsToRemove.Count} in, -{outputsToRemove.Count} out, " +
+            $"+{inputsToReattach.Count} in, +{outputsToReattach.Count} out, formatChanged {formatChanged}");
 
         // Capture routes for devices that are being removed, before removing them
         CaptureRoutesForRemovedDevices(inputsToRemove, outputsToRemove);

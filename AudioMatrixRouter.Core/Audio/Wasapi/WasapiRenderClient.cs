@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using NAudio.Wave;
@@ -71,12 +72,28 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
             Name = "wasapi-render:" + _label,
         };
         _thread.Start();
-        _initDone.Wait();
+        // Bounded: an NVIDIA HDMI endpoint mid display-handshake can sit inside
+        // Activate/Initialize for many seconds. Give up on THIS device (the thread
+        // finishes on its own and exits because Stop() was requested) instead of
+        // holding the whole engine start hostage.
+        if (!_initDone.Wait(InitTimeoutMs))
+        {
+            Stop();
+            throw new TimeoutException($"WASAPI render init timed out for {_label}");
+        }
         if (!_initOk)
         {
             throw new InvalidOperationException($"WASAPI render init failed for {_label}");
         }
     }
+
+    private const int InitTimeoutMs = 5000;
+    private const int DisposeJoinMs = 500;
+    // A consuming shared-mode stream frees at least one period every period. No free
+    // space for this long while the stream answers S_OK means the engine side stopped
+    // pulling (display asleep, driver wedged) — a stall, which must surface as a fault
+    // so the engine can promote another master and stop feeding a dead reference.
+    private const double StallMs = 1000.0;
 
     public void Play() => _playRequest.Set();
 
@@ -98,7 +115,7 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
         // Never Join our own thread (a Faulted handler could re-enter Dispose from it).
         if (_thread is { } t && t != Thread.CurrentThread)
         {
-            if (!t.Join(2000))
+            if (!t.Join(DisposeJoinMs))
             {
                 // Driver wedged inside a WASAPI call: deliberately leak the COM state
                 // (the thread owns it) rather than risk a use-after-free release.
@@ -161,6 +178,8 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
             int timeoutMs = Math.Max(250, (int)Math.Ceiling(ActualPeriodMs * 20));
             var waits = new WaitHandle[] { _frameEvent, _stopRequest.WaitHandle };
             int consecutiveBufferErrors = 0;
+            long lastProgressTicks = Stopwatch.GetTimestamp();
+            double ticksPerMs = Stopwatch.Frequency / 1000.0;
 
             while (!_stopRequest.IsSet)
             {
@@ -169,11 +188,11 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                 if (signaled == WaitHandle.WaitTimeout)
                 {
                     // No event for 20 periods. Some drivers legally pause the event
-                    // pump — do NOT assume death (a false fault causes an engine
-                    // restart LOOP). Probe liveness instead: a padding query on a
-                    // dead stream returns DEVICE_INVALIDATED, which faults below;
-                    // if it answers S_OK the stream is alive, so keep waiting and
-                    // top the buffer up like a normal wake.
+                    // pump — do NOT assume death from silence alone (a false fault
+                    // causes an engine restart LOOP). Probe instead: a padding query
+                    // on a dead stream returns DEVICE_INVALIDATED, which faults below;
+                    // a stream that answers S_OK but never frees space is handled by
+                    // the progress check under it.
                 }
 
                 hr = client.GetCurrentPadding(out var padding);
@@ -181,7 +200,17 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                 if (hr != WasapiConstants.S_OK) continue;
 
                 uint frames = bufferFrames - padding;
-                if (frames == 0) continue;
+                if (frames == 0)
+                {
+                    if ((Stopwatch.GetTimestamp() - lastProgressTicks) / ticksPerMs > StallMs)
+                    {
+                        WasapiDiagnostics.Log($"[WASAPI] render {_label}: no buffer progress for {StallMs:0} ms — stalled");
+                        Fault(WasapiConstants.AUDCLNT_E_STALLED);
+                        break;
+                    }
+                    continue;
+                }
+                lastProgressTicks = Stopwatch.GetTimestamp();
 
                 hr = renderService.GetBuffer(frames, out var dataPtr);
                 if (hr == WasapiConstants.AUDCLNT_E_BUFFER_ERROR)

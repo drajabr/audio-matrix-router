@@ -51,7 +51,22 @@ public sealed class InputAsrc
     private int _surplusSamples;
     private double _trimPpm;
     private double _integralFrames;
+    // The fill reference consumer. Resolved on every update so it can follow a live
+    // master promotion in the coordinator (a dead master's cursor used to pin the
+    // servo at -2000 ppm and trigger a hard drain every second on every healthy output).
+    private Func<string>? _fillConsumerResolver;
     private string _fillConsumerId = string.Empty;
+
+    // Producer liveness for the idle-resume re-anchor: a source that resumes after a
+    // pause (a loopback whose device went quiet, Steam starting a stream into the
+    // virtual cable) must rejoin at the target fill, not fight the consumers' pending
+    // skips for seconds. 0 = never written since construction.
+    private long _lastWriteTicks;
+    private double _cadenceMs = 10;
+    private static readonly double s_ticksPerMs = System.Diagnostics.Stopwatch.Frequency / 1000.0;
+
+    /// <summary>Number of idle-resume re-anchors performed (telemetry / tests).</summary>
+    public long ReanchorCount { get; private set; }
 
     // Real jitter measurement: peak-to-peak ring-fill excursion observed since the last
     // harvest by the UI. Because the fill servo holds the mean at target, this excursion
@@ -65,7 +80,12 @@ public sealed class InputAsrc
     // callback boundaries) and the fractional source position carried between blocks.
     private readonly float[] _lastFrame;
     private bool _hasLastFrame;
-    private double _srcFrac; // in [0,1): fractional offset into the source, measured from _lastFrame
+    // Source cursor carried between blocks, measured from the PREVIOUS block's last frame
+    // (_lastFrame sits at position -1 of the next block, so the next block starts at
+    // s = _srcFrac - 1). Range is (0, step]: exactly 1.0 at unity ratio means "start on
+    // capture[0]", and it must NOT be wrapped into [0,1) — doing so re-emitted the
+    // previous frame every block (+1 frame per callback = +2083 ppm at 10 ms).
+    private double _srcFrac;
 
     private float[] _outScratch = [];
 
@@ -110,6 +130,38 @@ public sealed class InputAsrc
     public void SetFillConsumer(string consumerId)
     {
         _fillConsumerId = consumerId ?? string.Empty;
+        _fillConsumerResolver = null;
+    }
+
+    /// <summary>Fill reference resolved per update (follows live master promotion).</summary>
+    public void SetFillConsumer(Func<string> resolver)
+    {
+        _fillConsumerResolver = resolver;
+    }
+
+    /// <summary>Real delivery cadence of this capture, ms. Drives the idle-resume gap
+    /// detection (a gap of more than three cadences is a pause, not jitter).</summary>
+    public void SetCadenceMs(double cadenceMs)
+    {
+        _cadenceMs = cadenceMs > 0 ? cadenceMs : 10;
+    }
+
+    private string ResolveFillConsumer()
+    {
+        var resolver = _fillConsumerResolver;
+        if (resolver is not null)
+        {
+            try { return resolver() ?? string.Empty; } catch { return string.Empty; }
+        }
+        return _fillConsumerId;
+    }
+
+    private int MeasureFill()
+    {
+        string consumer = ResolveFillConsumer();
+        return string.IsNullOrEmpty(consumer)
+            ? _ring.AvailableFrames
+            : _ring.GetAvailableFrames(consumer);
     }
 
     /// <summary>
@@ -139,6 +191,25 @@ public sealed class InputAsrc
     public int ProcessAndWrite(float[] capture, int captureFrames)
     {
         if (captureFrames <= 0) return 0;
+
+        // Idle-resume re-anchor. First write after start, or a gap longer than three
+        // cadences (min 50 ms): every consumer cursor on this ring moves to
+        // writePos - target and that window is zeroed, so the outputs play one target's
+        // worth of silence (what they were playing anyway) and then the fresh audio at
+        // exactly the configured latency. All consumers move identically, so the
+        // output-to-output phase is untouched. Without this a resumed source was
+        // skipped block-by-block as "late" and starved for ~5 s, then crackled for ~20 s
+        // while the servo rebuilt fill at 2000 ppm.
+        long now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (_lastWriteTicks == 0 ||
+            (now - _lastWriteTicks) / s_ticksPerMs > Math.Max(50.0, 3.0 * _cadenceMs))
+        {
+            _ring.ReanchorAllConsumers(_targetFillFrames);
+            _surplusSamples = 0;
+            _surplusMinFrames = double.MaxValue;
+            ReanchorCount++;
+        }
+        _lastWriteTicks = now;
 
         UpdateServo();
 
@@ -215,12 +286,12 @@ public sealed class InputAsrc
             s += step;
         }
 
-        // Carry state to the next block: the new fractional position is how far past the
-        // final source frame the cursor ended up (in [0, step)), and _lastFrame becomes
-        // this block's final frame.
+        // Carry state to the next block: how far past the final source frame the cursor
+        // ended up, in (0, step]. Unity ratio lands on exactly 1.0 (= "start the next
+        // block on capture[0]"); a step > 1 (capture rate above engine rate) can land
+        // further inside the next block. Never wrap it (see the _srcFrac comment).
         double overshoot = s - (captureFrames - 1);
         if (overshoot < 0) overshoot = 0;
-        if (overshoot >= 1.0) overshoot -= Math.Floor(overshoot);
         _srcFrac = overshoot;
 
         int last = (captureFrames - 1) * _channels;
@@ -251,9 +322,7 @@ public sealed class InputAsrc
     /// </summary>
     private void TrimBurstBacklog()
     {
-        int fill = string.IsNullOrEmpty(_fillConsumerId)
-            ? _ring.AvailableFrames
-            : _ring.GetAvailableFrames(_fillConsumerId);
+        int fill = MeasureFill();
 
         // Trip well before capacity, and far enough above target that ordinary
         // capture/render interleave never reaches it.
@@ -268,10 +337,7 @@ public sealed class InputAsrc
 
     private void UpdateServo()
     {
-        string consumer = _fillConsumerId;
-        int fill = string.IsNullOrEmpty(consumer)
-            ? _ring.AvailableFrames
-            : _ring.GetAvailableFrames(consumer);
+        int fill = MeasureFill();
 
         lock (_jitterLock)
         {

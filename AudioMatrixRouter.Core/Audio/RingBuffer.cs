@@ -46,11 +46,44 @@ public class RingBuffer
     private long _totalFramesDropped;
     private long _totalFramesResynced;
 
+    // Producer liveness: Stopwatch tick of the last Write (0 = never). Consumers use it
+    // to decide whether a shortfall is a real underrun (producer alive) or an idle
+    // source (nothing to count), and the start barrier uses it to ignore rings nobody
+    // feeds. Owned here, once, instead of being inferred per consumer from per-block
+    // production (which missed every jitter-induced starvation).
+    private long _lastWriteTicks;
+    private int _anchorGeneration;
+    private static readonly double s_ticksPerMs = System.Diagnostics.Stopwatch.Frequency / 1000.0;
+
     public long TotalFramesDropped => Interlocked.Read(ref _totalFramesDropped);
 
     /// <summary>Frames discarded by deliberate latency resyncs (not a fault).</summary>
     public long TotalFramesResynced => Interlocked.Read(ref _totalFramesResynced);
     public int CapacityFrames => _capacityFrames;
+
+    /// <summary>Nominal delivery cadence of this ring's producer, ms (set by the engine).</summary>
+    public double ProducerCadenceMs { get; set; } = 10;
+
+    /// <summary>True when the producer has written at all.</summary>
+    public bool HasProducerWritten => Interlocked.Read(ref _lastWriteTicks) != 0;
+
+    /// <summary>True when the producer wrote within <paramref name="windowMs"/>.</summary>
+    public bool IsProducerLive(double windowMs)
+    {
+        long last = Interlocked.Read(ref _lastWriteTicks);
+        if (last == 0) return false;
+        return (System.Diagnostics.Stopwatch.GetTimestamp() - last) / s_ticksPerMs <= windowMs;
+    }
+
+    /// <summary>True when the producer wrote within three cadences (min 50 ms).</summary>
+    public bool IsProducerLive() => IsProducerLive(Math.Max(50.0, 3.0 * ProducerCadenceMs));
+
+    /// <summary>
+    /// Bumped by every <see cref="ReanchorAllConsumers"/>. A consumer that sees a new
+    /// value must drop any pending-skip bookkeeping for this ring: its cursor was moved
+    /// deliberately and no longer lags a timeline.
+    /// </summary>
+    public int AnchorGeneration => Volatile.Read(ref _anchorGeneration);
 
     public RingBuffer(int frameCount, int channels)
     {
@@ -247,9 +280,53 @@ public class RingBuffer
             }
 
             _writeFramePos = newWp;
+            Interlocked.Exchange(ref _lastWriteTicks, System.Diagnostics.Stopwatch.GetTimestamp());
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Idle-resume / join anchor: moves EVERY consumer cursor to writePos − <paramref name="fillFrames"/>
+    /// and zeroes that window, so each consumer sees exactly <paramref name="fillFrames"/> of
+    /// silence followed by whatever the producer writes next. Identical for all consumers,
+    /// so output-to-output phase is preserved. Not booked as dropped or force-advanced
+    /// (the cursor did not lag anything — it was placed). Bumps <see cref="AnchorGeneration"/>.
+    /// </summary>
+    public void ReanchorAllConsumers(int fillFrames)
+    {
+        int fill = Math.Clamp(fillFrames, 0, _capacityFrames - 1);
+        lock (_cursorLock)
+        {
+            long anchor = _writeFramePos - fill;
+            for (int f = 0; f < fill; f++)
+            {
+                int frame = (int)((anchor + f) & _frameMask);
+                Array.Clear(_buffer, frame * _channels, _channels);
+            }
+            foreach (var c in _consumers.Values)
+            {
+                c.ReadFramePos = anchor;
+                c.ForceAdvancedPending = 0;
+            }
+            Interlocked.Increment(ref _anchorGeneration);
+        }
+    }
+
+    /// <summary>
+    /// Live join: pins ONE consumer at writePos − <paramref name="fillFrames"/> (the window
+    /// the other consumers are playing right now) without touching anyone else or the
+    /// data. Used when an output joins a running engine.
+    /// </summary>
+    public void RegisterConsumerAt(string consumerId, int fillFrames)
+    {
+        int fill = Math.Clamp(fillFrames, 0, _capacityFrames - 1);
+        lock (_cursorLock)
+        {
+            var c = GetOrAddConsumerNoLock(consumerId);
+            c.ReadFramePos = _writeFramePos - fill;
+            c.ForceAdvancedPending = 0;
+        }
     }
 
     public int ReadForConsumer(string consumerId, float[] dest, int offset, int frameCount)

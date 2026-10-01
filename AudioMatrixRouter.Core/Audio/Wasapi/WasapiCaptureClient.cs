@@ -67,12 +67,21 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
             Name = "wasapi-capture:" + _label,
         };
         _thread.Start();
-        _initDone.Wait();
+        // Bounded (see WasapiRenderClient.Init): a wedged driver fails THIS device
+        // instead of blocking the engine start.
+        if (!_initDone.Wait(InitTimeoutMs))
+        {
+            Stop();
+            throw new TimeoutException($"WASAPI capture init timed out for {_label}");
+        }
         if (!_initOk)
         {
             throw new InvalidOperationException($"WASAPI capture init failed for {_label}");
         }
     }
+
+    private const int InitTimeoutMs = 5000;
+    private const int DisposeJoinMs = 500;
 
     public void Stop()
     {
@@ -90,7 +99,7 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
         Stop();
         if (_thread is { } t && t != Thread.CurrentThread)
         {
-            if (!t.Join(2000))
+            if (!t.Join(DisposeJoinMs))
             {
                 return; // leak COM state deliberately rather than release under a live thread
             }

@@ -41,6 +41,9 @@ internal static class WasapiConstants
     public const int AUDCLNT_E_RESOURCES_INVALIDATED = unchecked((int)0x88890026);
     public const int AUDCLNT_E_ENGINE_PERIODICITY_LOCKED = unchecked((int)0x88890028);
     public const int AUDCLNT_E_ENGINE_FORMAT_LOCKED = unchecked((int)0x88890029);
+    /// <summary>Internal sentinel (not a Windows code): the stream answers but has not
+    /// consumed anything for a second — a stalled engine side.</summary>
+    public const int AUDCLNT_E_STALLED = unchecked((int)0x8889FFFF);
 
     public static readonly Guid CLSID_MMDeviceEnumerator = new("BCDE0395-E52F-467C-8E3D-C4579291692E");
     public static readonly Guid IID_IAudioClient = new("1CB9AD4C-DBFA-4C32-B178-C2F568A703B2");
@@ -231,12 +234,41 @@ internal static class WasapiDiagnostics
 {
     private static readonly string LogPath =
         Path.Combine(Path.GetTempPath(), "amr-wasapi-probe.log");
+    private const long RotateBytes = 1024 * 1024;
+    private static readonly object s_logLock = new();
+    private static readonly HashSet<string> s_probed = new(StringComparer.Ordinal);
+
+    /// <summary>Full path of the diagnostic log (shown in the UI).</summary>
+    public static string Path_ => LogPath;
 
     internal static void Log(string line)
     {
         System.Diagnostics.Debug.WriteLine(line);
-        try { File.AppendAllText(LogPath, $"{DateTime.Now:HH:mm:ss} {line}{Environment.NewLine}"); }
-        catch { }
+        lock (s_logLock)
+        {
+            try
+            {
+                var fi = new FileInfo(LogPath);
+                if (fi.Exists && fi.Length > RotateBytes)
+                {
+                    var old = LogPath + ".1";
+                    try { File.Delete(old); } catch { }
+                    File.Move(LogPath, old);
+                }
+                File.AppendAllText(LogPath, $"{DateTime.Now:HH:mm:ss.fff} {line}{Environment.NewLine}");
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>Period probe, once per endpoint per process (it costs a COM activation).</summary>
+    public static void ProbeEnginePeriodsOnce(string label, string endpointId)
+    {
+        lock (s_probed)
+        {
+            if (!s_probed.Add(endpointId)) return;
+        }
+        ProbeEnginePeriods(label, endpointId);
     }
 
     /// <summary>Logs the shared-mode engine period capabilities of an endpoint

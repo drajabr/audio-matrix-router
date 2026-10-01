@@ -94,17 +94,48 @@ public sealed class AppController : IDisposable
     }
 
     private const int FaultRestartDebounceMs = 300;
+    private const int FaultRestartMaxDelayMs = 30_000;
+    private const int FaultRestartCalmMs = 60_000;
     private readonly System.Threading.Timer _faultRestartTimer;
+    // Fault-restart backoff: a device that faults again right after every restart
+    // (an HDMI sink mid display-handshake, a stalled driver) used to drive a restart
+    // every ~1 s, silencing every healthy output each time. Each restart that is
+    // followed by another fault within the calm window doubles the next delay, up
+    // to 30 s; a minute without faults resets it.
+    private int _faultRestartDelayMs = FaultRestartDebounceMs;
+    private long _lastFaultRestartAt;
 
     private void OnEngineFaulted()
     {
         if (_disposed) return;
-        try { _faultRestartTimer.Change(FaultRestartDebounceMs, Timeout.Infinite); } catch { }
+        try
+        {
+            _marshal(() =>
+            {
+                if (_disposed) return;
+                long now = Environment.TickCount64;
+                if (_lastFaultRestartAt != 0 && now - _lastFaultRestartAt > FaultRestartCalmMs)
+                {
+                    _faultRestartDelayMs = FaultRestartDebounceMs;
+                }
+                _faultRestartTimer.Change(_faultRestartDelayMs, Timeout.Infinite);
+            });
+        }
+        catch (InvalidOperationException)
+        {
+            // Host torn down mid-callback.
+        }
     }
 
     private void OnFaultRestartTick()
     {
         if (_disposed) return;
+        long now = Environment.TickCount64;
+        bool repeat = _lastFaultRestartAt != 0 && now - _lastFaultRestartAt <= FaultRestartCalmMs;
+        _lastFaultRestartAt = now;
+        _faultRestartDelayMs = repeat
+            ? Math.Min(FaultRestartMaxDelayMs, _faultRestartDelayMs * 2)
+            : FaultRestartDebounceMs;
         ReloadEngine();
     }
 

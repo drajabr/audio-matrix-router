@@ -53,7 +53,18 @@ public class DeviceEnumerator : IMMNotificationClient, IDisposable
     public void OnDeviceAdded(string pwstrDeviceId) => _onDeviceChange?.Invoke();
     public void OnDeviceRemoved(string deviceId) => _onDeviceChange?.Invoke();
     public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId) { }
-    public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key) { }
+
+    // PKEY_AudioEngine_DeviceFormat {F19F064D-082C-4E27-BC73-6882A1BB8E4C}: the shared
+    // mix format changed (user edited it in Sound settings, or an HDMI sink
+    // renegotiated on wake). An endpoint we stream to at the old rate/channel count
+    // now plays at the wrong pitch or with scrambled interleave, so it is a device
+    // change: the engine re-reads the format and reopens that endpoint.
+    private static readonly Guid DeviceFormatKey = new("F19F064D-082C-4E27-BC73-6882A1BB8E4C");
+
+    public void OnPropertyValueChanged(string pwstrDeviceId, PropertyKey key)
+    {
+        if (key.formatId == DeviceFormatKey) _onDeviceChange?.Invoke();
+    }
 
     public void Dispose()
     {

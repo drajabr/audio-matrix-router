@@ -51,18 +51,36 @@ public sealed class OutputSyncCoordinator
     private const double ErrorFastPassFrames = 48.0; // ~1 ms: big steps pass unsmoothed
     private const double FastModeErrorFrames = 240.0; // ~5 ms: telemetry "catching up" flag
     // Above this phase error a trim-only walk-back takes tens of seconds (2000 ppm walks
-    // 20 ms in ~10 s); do a one-shot hard re-anchor (skip or hold) instead.
-    private const double HardResyncThresholdMs = 20.0;
+    // 30 ms in ~15 s); do a one-shot hard re-anchor (skip or hold) instead — but only
+    // once the gross error has PERSISTED for a few blocks. A single late master block
+    // used to trip a skip, then (after the master's catch-up report) a hold: two
+    // audible glitches on every follower for one master hiccup.
+    private const double HardResyncThresholdMs = 30.0;
+    private const int HardResyncPersistBlocks = 3;
     // Minimum interval between hard re-anchors per consumer, so a re-anchor in progress
     // (whose error is still being consumed) can't re-trigger itself.
     private const double HardResyncCooldownSec = 2.0;
     // The start barrier must never hold outputs silent forever (a capture that delivers
     // one frame then stalls used to pin the fill measurement at 0 with no way out).
     private const double BarrierWatchdogMinMs = 1500.0;
+    // A master whose render thread has not reported for this long is stalled (device
+    // asleep, driver wedged). Followers must not keep locking to a dead reference, and
+    // — far worse — the input fill servos measure fill at the master's cursor: a dead
+    // cursor reads as ever-growing fill, pins every servo at -2000 ppm and hard-drains
+    // all healthy outputs every second. Promote the freshest live follower instead.
+    private const double MasterStallPromoteMs = 300.0;
+    private const double PromoteCandidateFreshMs = 100.0;
 
     private readonly object _lock = new();
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
-    private string _masterConsumerId;
+    private volatile string _masterConsumerId;
+
+    /// <summary>Raised (from an audio thread, under no lock) when a stalled master was
+    /// replaced by a live follower. Handlers must only do cheap, lock-free work.</summary>
+    public event Action<string>? MasterChanged;
+
+    /// <summary>Number of live promotions performed (telemetry / tests).</summary>
+    public long MasterPromotions { get; private set; }
     private int _engineSampleRate;
     private int _baseMasterTargetFrames;
     private int _maxMasterTargetFrames;
@@ -79,6 +97,7 @@ public sealed class OutputSyncCoordinator
         public int BufferedFrames = -1;     // last reported ring fill (engine frames); -1 = no report yet
         public bool HasActiveRoutes;
         public long FramesRendered;         // device frames pushed to WASAPI
+        public double LastBlockEngineFrames; // engine frames of the last reported block (projection cap)
         public double TimelinePos;          // engine-rate source frames consumed since barrier release
         public long LastReportTicks;        // Stopwatch instant of last timeline report
         public double SmoothedErrorFrames;  // engine frames; + → behind master → speed up
@@ -95,6 +114,7 @@ public sealed class OutputSyncCoordinator
         // many engine frames (we were ahead, e.g. after a master stall recovered).
         public double PendingHardResyncFrames;
         public long LastHardResyncTicks;
+        public int GrossErrorBlocks;        // consecutive blocks above the hard threshold
     }
 
     public OutputSyncCoordinator(string masterConsumerId, int engineSampleRate, int baseMasterTargetFrames, int maxMasterTargetFrames)
@@ -114,6 +134,83 @@ public sealed class OutputSyncCoordinator
             _masterConsumerId = masterConsumerId ?? string.Empty;
             ResetAllNoLock();
         }
+    }
+
+    /// <summary>
+    /// Live join for a consumer that starts while the engine is running: it enters at
+    /// the master's current timeline (its ring cursors were pinned at the same fill the
+    /// master has, so this is phase-aligned by construction) and skips the barrier.
+    /// </summary>
+    public void JoinLive(string consumerId)
+    {
+        lock (_lock)
+        {
+            if (!_states.TryGetValue(consumerId, out var s)) return;
+            long now = Stopwatch.GetTimestamp();
+            double pos = 0;
+            if (_states.TryGetValue(_masterConsumerId, out var m) && m.LastReportTicks != 0)
+            {
+                pos = m.TimelinePos + (now - m.LastReportTicks) * _engineSampleRate / s_ticksPerSecond;
+            }
+            s.TimelinePos = pos;
+            s.LastReportTicks = now;
+            s.BufferedFrames = -1;
+            s.SmoothedErrorFrames = 0;
+            s.ErrorInitialized = false;
+            s.TrimPpm = 0;
+            s.IntegralFrames = 0;
+            s.LastAppliedPpm = 0;
+            s.PendingHardResyncFrames = 0;
+            s.GrossErrorBlocks = 0;
+            s.LastObservedFrames = s.FramesRendered;
+        }
+    }
+
+    /// <summary>
+    /// If the master has not reported for <see cref="MasterStallPromoteMs"/>, promote the
+    /// follower with the freshest report. Timelines and integrators are left alone (the
+    /// survivors were locked to each other already); only the new master's trim is
+    /// zeroed. Returns the new master id, or null when nothing changed.
+    /// </summary>
+    private string? PromoteMasterIfStalledNoLock(long now)
+    {
+        if (!_states.TryGetValue(_masterConsumerId, out var m)) return null;
+        if (m.LastReportTicks == 0) return null;
+        double ageMs = (now - m.LastReportTicks) * 1000.0 / s_ticksPerSecond;
+        if (ageMs < MasterStallPromoteMs) return null;
+
+        string? bestId = null;
+        long bestTicks = 0;
+        foreach (var pair in _states)
+        {
+            if (pair.Key == _masterConsumerId) continue;
+            var st = pair.Value;
+            if (st.LastReportTicks == 0) continue;
+            double candAgeMs = (now - st.LastReportTicks) * 1000.0 / s_ticksPerSecond;
+            if (candAgeMs > PromoteCandidateFreshMs) continue;
+            if (st.LastReportTicks > bestTicks)
+            {
+                bestTicks = st.LastReportTicks;
+                bestId = pair.Key;
+            }
+        }
+        if (bestId is null) return null;
+
+        _masterConsumerId = bestId;
+        var nm = _states[bestId];
+        nm.TrimPpm = 0;
+        nm.LastAppliedPpm = 0;
+        nm.IntegralFrames = 0;
+        nm.FastCatchUpActive = false;
+        nm.PendingHardResyncFrames = 0;
+        nm.GrossErrorBlocks = 0;
+        // The old master, if it ever comes back, is a follower now: it will measure
+        // against the new reference and walk back whatever it missed.
+        m.TrimPpm = 0;
+        m.IntegralFrames = 0;
+        m.GrossErrorBlocks = 0;
+        MasterPromotions++;
+        return bestId;
     }
 
     public void SetMasterBufferTarget(int baseMasterTargetFrames, int maxMasterTargetFrames)
@@ -327,15 +424,35 @@ public sealed class OutputSyncCoordinator
     /// </summary>
     public double ReportConsumedAndUpdate(string consumerId, double engineFramesConsumed, int deviceFramesRendered)
     {
+        string? promoted = null;
+        double result;
         lock (_lock)
         {
             if (!_states.TryGetValue(consumerId, out var s)) return 0;
 
             long now = Stopwatch.GetTimestamp();
             s.TimelinePos += Math.Max(0, engineFramesConsumed);
+            s.LastBlockEngineFrames = Math.Max(0, engineFramesConsumed);
             s.LastReportTicks = now;
             s.FramesRendered += Math.Max(0, deviceFramesRendered);
 
+            // A stalled master is replaced here, on the next live report of anyone,
+            // because the stalled thread itself will never report again.
+            promoted = PromoteMasterIfStalledNoLock(now);
+
+            result = UpdateFollowerNoLock(consumerId, s, now, deviceFramesRendered);
+        }
+        if (promoted is not null)
+        {
+            try { MasterChanged?.Invoke(promoted); } catch { }
+        }
+        return result;
+    }
+
+    private double UpdateFollowerNoLock(string consumerId, OutputState s, long now, int deviceFramesRendered)
+    {
+        // (kept at the original indentation: this is the former body of ReportConsumedAndUpdate)
+        {
             bool isMaster = consumerId == _masterConsumerId;
             if (isMaster)
             {
@@ -343,6 +460,7 @@ public sealed class OutputSyncCoordinator
                 s.LastAppliedPpm = 0;
                 s.IntegralFrames = 0;
                 s.FastCatchUpActive = false;
+                s.GrossErrorBlocks = 0;
                 return 0;
             }
 
@@ -352,34 +470,41 @@ public sealed class OutputSyncCoordinator
                 return s.TrimPpm;
             }
 
-            // Stale-master guard: if the master's render thread has stopped reporting
-            // (device unplugged / driver stall), the wall-clock projection would grow
-            // without bound and drive every follower to its trim cap, desynchronising the
-            // survivors against each other. Freeze the loop instead and let device
-            // recovery (RefreshDevices → restart) re-anchor cleanly.
+            // Stale-master guard (promotion needs a fresh candidate; until one exists,
+            // or while the master is merely a little late, freeze the loop rather than
+            // chase a projection that grows without bound).
             double masterAgeSec = (now - m.LastReportTicks) / s_ticksPerSecond;
-            if (masterAgeSec > 0.5)
+            if (masterAgeSec > MasterStallPromoteMs / 1000.0)
             {
                 return s.TrimPpm;
             }
 
             // Project the master's timeline to 'now' at the ENGINE rate (both timelines are
             // in engine frames, so this is dimensionally exact regardless of device rates).
-            double masterPos = m.TimelinePos + (now - m.LastReportTicks) * _engineSampleRate / s_ticksPerSecond;
+            // The projection is capped at one master block: a master that is late has NOT
+            // advanced, and pretending it has produced a phantom error on every follower.
+            double projectFrames = (now - m.LastReportTicks) * _engineSampleRate / s_ticksPerSecond;
+            double maxProject = Math.Max(1, m.LastBlockEngineFrames);
+            if (projectFrames > maxProject) projectFrames = maxProject;
+            double masterPos = m.TimelinePos + projectFrames;
             double rawError = masterPos - s.TimelinePos; // + → we are behind → speed up
 
             // Hard re-anchor for gross desyncs (master stall recovery, follower device
             // glitch): trim alone would need tens of seconds at 2000 ppm; one brief
-            // skip/hold realigns immediately. Cooldown prevents re-triggering while the
-            // provider is still consuming a previous re-anchor.
+            // skip/hold realigns immediately — once the gross error has persisted for
+            // HardResyncPersistBlocks consecutive blocks, so a single late block never
+            // trips it. Cooldown prevents re-triggering while the provider is still
+            // consuming a previous re-anchor.
             double hardThresholdFrames = _engineSampleRate * HardResyncThresholdMs / 1000.0;
             if (Math.Abs(rawError) >= hardThresholdFrames)
             {
+                s.GrossErrorBlocks++;
                 double sinceLastSec = s.LastHardResyncTicks == 0
                     ? double.MaxValue
                     : (now - s.LastHardResyncTicks) / s_ticksPerSecond;
-                if (sinceLastSec >= HardResyncCooldownSec)
+                if (s.GrossErrorBlocks >= HardResyncPersistBlocks && sinceLastSec >= HardResyncCooldownSec)
                 {
+                    s.GrossErrorBlocks = 0;
                     s.LastHardResyncTicks = now;
                     s.PendingHardResyncFrames += rawError;
                     if (rawError > 0)
@@ -396,6 +521,10 @@ public sealed class OutputSyncCoordinator
                     s.LastAppliedPpm = 0;
                     return 0;
                 }
+            }
+            else
+            {
+                s.GrossErrorBlocks = 0;
             }
 
             // Light smoothing for callback-instant jitter; big steps pass through raw so a
@@ -591,23 +720,19 @@ public class MixingSampleProvider : ISampleProvider
     private int _deviceDelayMs;
     private int _outputBufferMs;
     private long _underrunCount;
-    // Per-source write position at the previous callback plus a production-pace EMA
-    // (produced ÷ expected per block, seeded at 1.0). Only a producer running at
-    // roughly real time can cause an audible underrun; an idle OR TRICKLING one
-    // (Steam/HDMI virtual pumps throttle to sparse bursts when only silence plays)
-    // must neither count underruns nor hold the start barrier hostage.
-    // Grown in EnsureScratchSizes with the other per-source arrays.
-    private long[] _lastSourceWritePos;
-    private double[] _producerPaceEma;
-    private long[] _producedThisBlock;
-    private int[] _belowPaceBlocks;
-    private const double ProducerPaceAliveThreshold = 0.5; // ≥ half real-time = live
-    private const double ProducerPaceEmaAlpha = 0.1;       // ~10 blocks to adapt
-    // The START BARRIER only disregards a source once it has been slow for this many
-    // consecutive blocks (~0.5 s). A capture that is merely slow to deliver its first
-    // packets must still be waited for; releasing early would start playback on a
-    // half-filled ring and underrun immediately.
-    private const int BarrierIgnoreAfterSlowBlocks = 50;
+    // Per-source anchor generation last seen (RingBuffer.AnchorGeneration). When the
+    // ring re-anchors every consumer (idle-resume / join), any pending skip on that
+    // source is void: the cursor was placed deliberately and no longer lags a timeline.
+    private int[] _anchorGenSeen;
+    // Engine frames the ring force-advanced this consumer by (overflow trimming) since
+    // the last coordinator report. A force-advance IS a skip: it is folded into the
+    // timeline instead of being "paid back" by under-consuming, which re-filled the
+    // ring to capacity and overflowed again on the next write, forever.
+    private long _forcedAdvanceSinceReport;
+    // Producer liveness window for underrun accounting and the start barrier: a ring
+    // that was written within three cadences (min 50 ms) has a live producer. Owned by
+    // the ring (one truth), not inferred per consumer from per-block production — that
+    // inference missed every jitter-induced starvation (blocks with zero production).
     private readonly float[] _peakLevels;
     private readonly ConcurrentDictionary<string, long> _inputSyncDiscardedFramesByDevice = new(StringComparer.Ordinal);
 
@@ -638,19 +763,32 @@ public class MixingSampleProvider : ISampleProvider
         _deviceDelayMs = Math.Clamp(outputDelayMs, 0, 5000);
         _outputBufferMs = Math.Clamp(outputBufferMs, 10, 200);
         _pendingSkipPerSource = new long[Math.Max(1, sources.Count)];
-        _lastSourceWritePos = new long[Math.Max(1, sources.Count)];
-        _producerPaceEma = new double[Math.Max(1, sources.Count)];
-        Array.Fill(_producerPaceEma, 1.0); // benefit of the doubt until measured
-        _producedThisBlock = new long[Math.Max(1, sources.Count)];
-        _belowPaceBlocks = new int[Math.Max(1, sources.Count)];
+        _anchorGenSeen = new int[Math.Max(1, sources.Count)];
         _syncCoordinator.RegisterConsumer(_consumerId, _sampleRate, _outputBufferMs);
         // Pin this consumer's cursor on every ring NOW (before captures produce data) so
         // all consumers share an identical zero reference.
-        foreach (var src in _sources)
+        for (int i = 0; i < _sources.Count; i++)
         {
-            src.Buffer.RegisterConsumer(_consumerId);
+            _sources[i].Buffer.RegisterConsumer(_consumerId);
+            _anchorGenSeen[i] = _sources[i].Buffer.AnchorGeneration;
         }
         RebuildDelayBuffer();
+    }
+
+    /// <summary>
+    /// Live join: pins this consumer on every ring at writePos − <paramref name="fillFrames"/>
+    /// (the window every other consumer is playing right now) and enters the
+    /// coordinator at the master's timeline. No barrier, no restart of anyone else.
+    /// </summary>
+    public void JoinLive(int fillFrames)
+    {
+        for (int i = 0; i < _sources.Count; i++)
+        {
+            _sources[i].Buffer.RegisterConsumerAt(_consumerId, fillFrames);
+            _anchorGenSeen[i] = _sources[i].Buffer.AnchorGeneration;
+            _pendingSkipPerSource[i] = 0;
+        }
+        _syncCoordinator.JoinLive(_consumerId);
     }
 
     public WaveFormat WaveFormat => _waveFormat;
@@ -749,10 +887,6 @@ public class MixingSampleProvider : ISampleProvider
         int matOutCh = _matrix.OutputChannels;
         float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
 
-        // Production pace per source, updated BEFORE the barrier check so an idle or
-        // trickling producer stops holding the barrier within a few blocks.
-        UpdateProducerPace(frames);
-
         _syncCoordinator.ReportConsumerRouteActivity(_consumerId, HasAnyActiveRouteForThisOutputCore(front, matOutCh));
         _syncCoordinator.ReportBufferedFrames(_consumerId, GetBufferedFramesForConsumer());
 
@@ -828,16 +962,26 @@ public class MixingSampleProvider : ISampleProvider
             var src = _sources[srcIdx];
             _framesReadPerSource[srcIdx] = 0;
 
-            // Reconcile overflow trims: the ring may have force-advanced this consumer's
-            // cursor while it lagged (producer never stalls). That advancement satisfies
-            // pending skips first; any excess leaves the cursor AHEAD of the timeline
-            // (negative pending), which step 3 pays back by consuming less. Without this
-            // the phase controller reported zero error while outputs played different
-            // content.
+            // A ring re-anchor (idle-resume / join) placed this cursor deliberately:
+            // whatever skip it was owed no longer applies.
+            int gen = src.Buffer.AnchorGeneration;
+            if (gen != _anchorGenSeen[srcIdx])
+            {
+                _anchorGenSeen[srcIdx] = gen;
+                _pendingSkipPerSource[srcIdx] = 0;
+            }
+
+            // Reconcile overflow trims: the ring force-advanced this cursor while it
+            // lagged (the producer never stalls). That advancement satisfies pending
+            // skips first; any excess is a skip the timeline must absorb (reported to
+            // the coordinator below) — never "paid back" by under-consuming.
             long forced = src.Buffer.TakeForceAdvancedFrames(_consumerId);
             if (forced > 0)
             {
-                _pendingSkipPerSource[srcIdx] -= forced;
+                long pendingBefore = _pendingSkipPerSource[srcIdx];
+                long satisfied = Math.Min(Math.Max(0, pendingBefore), forced);
+                _pendingSkipPerSource[srcIdx] = pendingBefore - satisfied;
+                _forcedAdvanceSinceReport += forced - satisfied;
             }
 
             // Realign: if this source previously starved, its cursor lags this output's
@@ -874,17 +1018,14 @@ public class MixingSampleProvider : ISampleProvider
 
             int deficit = sourceFramesNeeded - framesRead;
             int audibleDeficitThreshold = Math.Max(8, _engineSampleRate / 2000); // ~0.5 ms
-            // Only a producer running at roughly REAL TIME can cause an audible underrun.
-            // A paused source (idle WASAPI loopback) or a trickling one (a virtual pump
-            // throttled to sparse bursts while only silence plays) is expected to starve —
-            // counting it made the tile climb hundreds per second on idle loopbacks.
-            bool producerAlive = IsProducerKeepingUp(srcIdx);
-            // pendingSkip > 0 = this source is catching its cursor up after an idle
-            // spell (e.g. a loopback that just resumed). That churn is already booked
-            // as sync-discarded frames; counting it here read as 100 underruns/s
-            // against audio nobody could have heard.
+            // Only a LIVE producer can cause an audible underrun: a paused source (idle
+            // loopback of a silent device, Steam not streaming) is expected to starve
+            // and must not count. Liveness comes from the ring's last-write time, so a
+            // block that merely saw no production (10 ms capture jitter against a 10 ms
+            // render block) is still counted when its data really was late.
+            bool producerAlive = src.Buffer.IsProducerLive();
             if ((useAll || _sourceActiveMask[srcIdx]) && deficit >= audibleDeficitThreshold
-                && producerAlive && _pendingSkipPerSource[srcIdx] <= 0)
+                && producerAlive)
             {
                 Interlocked.Increment(ref _underrunCount);
             }
@@ -924,16 +1065,6 @@ public class MixingSampleProvider : ISampleProvider
         {
             var src = _sources[srcIdx];
             int want = integerConsume;
-
-            // Negative pending: the ring force-advanced this cursor past the timeline
-            // (overflow trim). Pay it back by consuming less until they rejoin.
-            long pend = _pendingSkipPerSource[srcIdx];
-            if (pend < 0)
-            {
-                long payback = Math.Min(-pend, want);
-                want -= (int)payback;
-                _pendingSkipPerSource[srcIdx] = pend + payback;
-            }
 
             int advance = Math.Min(want, _framesReadPerSource[srcIdx]);
             if (advance > 0)
@@ -999,8 +1130,10 @@ public class MixingSampleProvider : ISampleProvider
             }
         }
 
-        // ===== 5. Report exact consumption; receive next block's trim =====
-        _currentTrimPpm = _syncCoordinator.ReportConsumedAndUpdate(_consumerId, frames * effRatio, frames);
+        // ===== 5. Report exact consumption (plus any overflow skip); receive next block's trim =====
+        double consumedThisBlock = frames * effRatio + _forcedAdvanceSinceReport;
+        _forcedAdvanceSinceReport = 0;
+        _currentTrimPpm = _syncCoordinator.ReportConsumedAndUpdate(_consumerId, consumedThisBlock, frames);
 
         long underrunDelta = UnderrunCount - underrunsAtStart;
         if (underrunDelta > 0)
@@ -1027,30 +1160,11 @@ public class MixingSampleProvider : ISampleProvider
             Array.Copy(_pendingSkipPerSource, grown, _pendingSkipPerSource.Length);
             _pendingSkipPerSource = grown;
         }
-        if (_lastSourceWritePos.Length < sourceCount)
+        if (_anchorGenSeen.Length < sourceCount)
         {
-            var grown = new long[Math.Max(sourceCount, _lastSourceWritePos.Length * 2)];
-            Array.Copy(_lastSourceWritePos, grown, _lastSourceWritePos.Length);
-            _lastSourceWritePos = grown;
-        }
-        if (_producerPaceEma.Length < sourceCount)
-        {
-            var grown = new double[Math.Max(sourceCount, _producerPaceEma.Length * 2)];
-            Array.Fill(grown, 1.0);
-            Array.Copy(_producerPaceEma, grown, _producerPaceEma.Length);
-            _producerPaceEma = grown;
-        }
-        if (_producedThisBlock.Length < sourceCount)
-        {
-            var grown = new long[Math.Max(sourceCount, _producedThisBlock.Length * 2)];
-            Array.Copy(_producedThisBlock, grown, _producedThisBlock.Length);
-            _producedThisBlock = grown;
-        }
-        if (_belowPaceBlocks.Length < sourceCount)
-        {
-            var grown = new int[Math.Max(sourceCount, _belowPaceBlocks.Length * 2)];
-            Array.Copy(_belowPaceBlocks, grown, _belowPaceBlocks.Length);
-            _belowPaceBlocks = grown;
+            var grown = new int[Math.Max(sourceCount, _anchorGenSeen.Length * 2)];
+            Array.Copy(_anchorGenSeen, grown, _anchorGenSeen.Length);
+            _anchorGenSeen = grown;
         }
     }
 
@@ -1096,48 +1210,6 @@ public class MixingSampleProvider : ISampleProvider
         _syncCoordinator.RemoveConsumer(_consumerId);
     }
 
-    /// <summary>
-    /// Samples every source's write head ONCE per callback and derives, per source:
-    /// frames produced since the previous callback, and an EMA of the production pace
-    /// (produced ÷ frames this block consumes). Runs before the barrier check so a dead
-    /// or trickling producer stops gating anything. The sampled write positions are
-    /// reused by <see cref="GetBufferedFramesForConsumer"/> and the underrun test, so
-    /// the ring lock is taken once per source per callback instead of three times.
-    /// </summary>
-    private void UpdateProducerPace(int deviceFrames)
-    {
-        double expected = Math.Max(1.0, deviceFrames * _baseRatio);
-        int count = Math.Min(_sources.Count, Math.Min(_belowPaceBlocks.Length,
-            Math.Min(_producedThisBlock.Length, Math.Min(_lastSourceWritePos.Length, _producerPaceEma.Length))));
-        for (int i = 0; i < count; i++)
-        {
-            long writePos = _sources[i].Buffer.GetWritePositionFrames();
-            long produced = Math.Max(0, writePos - _lastSourceWritePos[i]);
-            _lastSourceWritePos[i] = writePos;
-            _producedThisBlock[i] = produced;
-            // Cap the sample so one catch-up burst can't pin the EMA high for seconds.
-            double sample = Math.Min(2.0, produced / expected);
-            _producerPaceEma[i] += (sample - _producerPaceEma[i]) * ProducerPaceEmaAlpha;
-
-            if (_producerPaceEma[i] < ProducerPaceAliveThreshold)
-            {
-                if (_belowPaceBlocks[i] < int.MaxValue) _belowPaceBlocks[i]++;
-            }
-            else
-            {
-                _belowPaceBlocks[i] = 0;
-            }
-        }
-    }
-
-    /// <summary>True when this source delivered audio for THIS block at roughly real
-    /// time. Both halves matter: "produced &gt; 0" catches a pause on the very first
-    /// block (an EMA alone needs several blocks to decay), and the pace EMA catches a
-    /// producer that trickles sparse bursts instead of pausing outright.</summary>
-    private bool IsProducerKeepingUp(int srcIdx) =>
-        srcIdx < _producedThisBlock.Length && _producedThisBlock[srcIdx] > 0 &&
-        srcIdx < _producerPaceEma.Length && _producerPaceEma[srcIdx] >= ProducerPaceAliveThreshold;
-
     private int GetBufferedFramesForConsumer()
     {
         if (_sources.Count == 0) return 0;
@@ -1146,14 +1218,14 @@ public class MixingSampleProvider : ISampleProvider
         for (int i = 0; i < _sources.Count; i++)
         {
             // Rings whose producer has never written (capture failed to start, device
-            // dead on arrival) or is not keeping real-time pace (idle/trickling loopback
-            // of a silent virtual device) must not hold the start barrier hostage or
-            // drag the fill measurement to zero forever. Write positions come from this
-            // callback's single sampling pass — no extra lock.
-            if (i < _lastSourceWritePos.Length && _lastSourceWritePos[i] == 0) continue;
-            if (i < _belowPaceBlocks.Length && _belowPaceBlocks[i] >= BarrierIgnoreAfterSlowBlocks) continue;
+            // dead on arrival) or has gone quiet (idle loopback of a silent virtual
+            // device) must not hold the start barrier hostage or drag the fill
+            // measurement to zero forever. A quiet-for-500 ms producer is ignored; when
+            // it resumes it re-anchors every consumer at the target fill anyway.
+            var ring = _sources[i].Buffer;
+            if (!ring.HasProducerWritten || !ring.IsProducerLive(500)) continue;
             anyLive = true;
-            int available = _sources[i].Buffer.GetAvailableFrames(_consumerId);
+            int available = ring.GetAvailableFrames(_consumerId);
             if (available < min) min = available;
         }
         if (!anyLive || min == int.MaxValue) return 0;

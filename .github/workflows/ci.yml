@@ -95,6 +95,11 @@ jobs:
       - name: Restore .NET dependencies
         run: dotnet restore AudioMatrixRouter.App/AudioMatrixRouter.App.csproj
 
+      # Pure engine tests (resampler frame conservation, ring re-anchor/overflow
+      # semantics, sync-coordinator master promotion). No audio device needed.
+      - name: Run engine tests
+        run: dotnet test AudioMatrixRouter.Tests/AudioMatrixRouter.Tests.csproj -c Release -p:Platform=x64 --nologo
+
       - name: Publish binary
         run: >-
           dotnet publish AudioMatrixRouter.App/AudioMatrixRouter.App.csproj
