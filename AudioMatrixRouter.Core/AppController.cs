@@ -36,6 +36,7 @@ public sealed class AppController : IDisposable
 
     private bool _locked;
     private bool _startupAtBoot;
+    private bool _keepSystemAwake;
     private string _uiPreferencesJson = "";
     private string _inputDeviceMode = "both";
     private bool _suppressConfigSave;
@@ -184,6 +185,7 @@ public sealed class AppController : IDisposable
                 _locked = loadedConfig.Locked;
                 _uiPreferencesJson = loadedConfig.UiPreferencesJson ?? "";
                 _startupAtBoot = loadedConfig.StartupAtBoot;
+                _keepSystemAwake = loadedConfig.KeepSystemAwakeWhileRunning;
                 _inputDeviceMode = loadedConfig.InputDeviceMode is "input" or "loopback" or "both"
                     ? loadedConfig.InputDeviceMode
                     : "both";
@@ -281,6 +283,8 @@ public sealed class AppController : IDisposable
                 if (_disposed) return;
                 if (save) ScheduleSave();
                 if (push) RaiseStateChanged();
+                // Per-thread state, so it is always set from the UI thread here.
+                PowerManagement.SetKeepSystemAwake(_keepSystemAwake && Engine.IsRunning);
             });
         }
         catch (InvalidOperationException)
@@ -659,6 +663,7 @@ public sealed class AppController : IDisposable
                 ? Math.Round(outputPathLatency, 1)
                 : null;
 
+        var budget = Engine.CurrentBudget;
         return new MetricsSnapshot
         {
             Running = Engine.IsRunning,
@@ -668,6 +673,11 @@ public sealed class AppController : IDisposable
             InputJitterMs = Engine.TryGetInputJitterMs(out var inputJitter)
                 ? Math.Round(inputJitter, 1)
                 : null,
+            KnobMs = Engine.OutputBufferMs,
+            EffectiveLatencyMs = Engine.IsRunning ? budget.EffectiveTotalMs : 0,
+            LatencyFloorMs = Engine.IsRunning ? budget.FloorTotalMs : 0,
+            AutoHeadroomMs = Engine.AutoHeadroomMs,
+            SafetyTier = Engine.SafetyTier,
             Inputs = inputMetrics,
             Outputs = outputMetrics,
             RouteLatencies = routeLatencies

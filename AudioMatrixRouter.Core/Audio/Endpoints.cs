@@ -22,10 +22,15 @@ public interface IRenderEndpoint : IDisposable
     void Init(ISampleProvider provider);
     void Play();
     void Stop();
-    /// <summary>Real FIFO depth (read back), ms. 0 = unknown.</summary>
+    /// <summary>Real allocated buffer (read back), ms. 0 = unknown.</summary>
     int ActualBufferMs { get; }
     /// <summary>Real engine period (read back), ms. 0 = unknown.</summary>
     double ActualPeriodMs { get; }
+    /// <summary>FIFO depth the render loop keeps queued, ms (= the output latency the
+    /// endpoint adds on top of its engine period). Settable live; endpoints that cannot
+    /// control it (legacy) report their full buffer.</summary>
+    int FifoMs { get; }
+    void SetTargetPaddingMs(int paddingMs);
     EndpointTier Tier { get; }
     /// <summary>Mid-stream death (device invalidated / stalled). Fired at most once,
     /// from the audio thread - subscribers must marshal, never restart inline.</summary>
@@ -60,6 +65,8 @@ internal sealed class NAudioRenderEndpoint : IRenderEndpoint
 
     public int ActualBufferMs { get; private set; }
     public double ActualPeriodMs { get; private set; }
+    public int FifoMs => ActualBufferMs; // NAudio always tops its buffer to full
+    public void SetTargetPaddingMs(int paddingMs) { }
     public EndpointTier Tier => EndpointTier.Legacy;
     public event Action<int>? Faulted { add { } remove { } } // NAudio surfaces no faults
 

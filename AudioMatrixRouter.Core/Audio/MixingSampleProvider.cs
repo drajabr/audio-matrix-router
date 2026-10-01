@@ -599,6 +599,16 @@ public sealed class OutputSyncCoordinator
 
     // ===== Telemetry accessors (UI thread) =====
 
+    /// <summary>Milliseconds since this consumer last reported a block; -1 = never.</summary>
+    public double GetConsumerReportAgeMs(string consumerId)
+    {
+        lock (_lock)
+        {
+            if (!_states.TryGetValue(consumerId, out var s) || s.LastReportTicks == 0) return -1;
+            return (Stopwatch.GetTimestamp() - s.LastReportTicks) * 1000.0 / s_ticksPerSecond;
+        }
+    }
+
     public double GetConsumerSmoothedErrorFrames(string consumerId)
     {
         lock (_lock)
@@ -776,6 +786,20 @@ public class MixingSampleProvider : ISampleProvider
     }
 
     /// <summary>
+    /// Live ring-target increase: render that many engine frames of silence without
+    /// consuming, so the ring fill rises by exactly that amount. Applied equally to
+    /// every output by the engine, so output-to-output phase is untouched (one small
+    /// gap instead of a full restart).
+    /// </summary>
+    public void HoldFor(int engineFrames)
+    {
+        if (engineFrames <= 0) return;
+        Interlocked.Exchange(ref _pendingHoldFrames, engineFrames);
+    }
+
+    private int _pendingHoldFrames;
+
+    /// <summary>
     /// Live join: pins this consumer on every ring at writePos − <paramref name="fillFrames"/>
     /// (the window every other consumer is playing right now) and enters the
     /// coordinator at the master's timeline. No barrier, no restart of anyone else.
@@ -916,6 +940,9 @@ public class MixingSampleProvider : ISampleProvider
         {
             _holdEngineFramesRemaining += -hardResync;
         }
+
+        int liveHold = Interlocked.Exchange(ref _pendingHoldFrames, 0);
+        if (liveHold > 0) _holdEngineFramesRemaining += liveHold;
 
         if (_holdEngineFramesRemaining > 0)
         {

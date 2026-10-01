@@ -63,6 +63,16 @@ public sealed class MetricsSnapshot
     public double? InputLatencyMs { get; set; }
     public double? OutputLatencyMs { get; set; }
     public double? InputJitterMs { get; set; }
+    /// <summary>The knob as applied (0 = AUTO).</summary>
+    public int KnobMs { get; set; }
+    /// <summary>What the budget is really running at (cadence + ring target + render), ms.</summary>
+    public int EffectiveLatencyMs { get; set; }
+    /// <summary>The lowest total this hardware allows right now (the AUTO value), ms.</summary>
+    public int LatencyFloorMs { get; set; }
+    /// <summary>Headroom the AUTO loop added because of underruns, ms.</summary>
+    public int AutoHeadroomMs { get; set; }
+    /// <summary>Safety tier engaged (extra render period) because headroom alone was not enough.</summary>
+    public bool SafetyTier { get; set; }
     public List<DeviceMetrics> Inputs { get; set; } = [];
     public List<DeviceMetrics> Outputs { get; set; } = [];
     public List<RouteLatency> RouteLatencies { get; set; } = [];

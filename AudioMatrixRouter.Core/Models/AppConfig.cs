@@ -84,8 +84,18 @@ public class AppConfig
     public List<KnownDeviceConfig> KnownDevices { get; set; } = [];
     public bool Locked { get; set; }
     public bool StartupAtBoot { get; set; }
-    public int InputBufferMs { get; set; } = 40;
-    public int OutputBufferMs { get; set; } = 40;
+    /// <summary>Schema version. 0/1 = pre-v0.5 (two knobs); 2 = one LATENCY knob with AUTO.</summary>
+    public int ConfigVersion { get; set; }
+    public const int CurrentConfigVersion = 2;
+    /// <summary>Unused since v0.5 (kept so older builds can still read the file).</summary>
+    public int InputBufferMs { get; set; } = 10;
+    /// <summary>The LATENCY knob: 0 = AUTO (run at the measured floor), else a target in ms.</summary>
+    public int OutputBufferMs { get; set; } = 0;
+    /// <summary>Spawn the keep-alive watchdog that relaunches the app after a crash or hang.</summary>
+    public bool KeepAlive { get; set; } = true;
+    /// <summary>Hold a system-required power request while the engine is running
+    /// (stops a laptop from idling into standby mid-stream). Costs battery; off by default.</summary>
+    public bool KeepSystemAwakeWhileRunning { get; set; }
     public string InputMasterDeviceId { get; set; } = "";
     public string OutputMasterDeviceId { get; set; } = "";
     public string InputDeviceMode { get; set; } = "both";
@@ -138,7 +148,11 @@ public class AppConfig
             {
                 var json = File.ReadAllText(path);
                 var config = JsonSerializer.Deserialize<AppConfig>(json, _jsonOptions);
-                if (config != null) return config;
+                if (config != null)
+                {
+                    config.Migrate();
+                    return config;
+                }
             }
             catch (Exception ex)
             {
@@ -146,6 +160,19 @@ public class AppConfig
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// v1 → v2: the knobs changed meaning. Pre-v0.5 the LATENCY knob could not go
+    /// below the ~50 ms floor whatever it said, and IN did nothing on the custom
+    /// backend; a saved knob under 50 was therefore "as low as it goes" = AUTO.
+    /// </summary>
+    private void Migrate()
+    {
+        if (ConfigVersion >= CurrentConfigVersion) return;
+        if (OutputBufferMs < 50) OutputBufferMs = 0;
+        InputBufferMs = 10;
+        ConfigVersion = CurrentConfigVersion;
     }
 
     public void Save()
@@ -198,8 +225,11 @@ public class AppConfig
             Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized, Maximized = winMaximized },
             Locked = locked,
             StartupAtBoot = startupAtBoot,
+            ConfigVersion = CurrentConfigVersion,
             InputBufferMs = engine.InputBufferMs,
             OutputBufferMs = engine.OutputBufferMs,
+            KeepAlive = previousConfig?.KeepAlive ?? true,
+            KeepSystemAwakeWhileRunning = previousConfig?.KeepSystemAwakeWhileRunning ?? false,
             EngineBackend = engine.Backend,
             // Persist the durable preference, else the flag the user's choice set — a
             // master that is currently offline (or parked) must survive the save or it
@@ -400,8 +430,8 @@ public class AppConfig
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
         engine.SetBackend(EngineBackend);
-        engine.SetInputBufferMs(InputBufferMs > 0 ? InputBufferMs : 40);
-        engine.SetOutputBufferMs(OutputBufferMs > 0 ? OutputBufferMs : 40);
+        engine.SetInputBufferMs(InputBufferMs > 0 ? InputBufferMs : 10);
+        engine.SetOutputBufferMs(Math.Max(0, OutputBufferMs)); // 0 = AUTO
 
         // Build saved offset maps using persisted config order and channel counts so saved
         // global crosspoint indices can be converted to device-relative routes even when

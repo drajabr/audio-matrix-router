@@ -59,9 +59,14 @@ public sealed class MeterBars : Control
         StartAnimation();
     }
 
+    // A frame requested while the window was hidden may never arrive; without this
+    // guard the flag stays set and the meters freeze after the window is shown again.
+    private long _animRequestedAt;
+    private const long AnimRequestStaleMs = 1000;
+
     private void StartAnimation()
     {
-        if (_animating) return;
+        if (_animating && Environment.TickCount64 - _animRequestedAt < AnimRequestStaleMs) return;
         var top = TopLevel.GetTopLevel(this);
         if (top is null)
         {
@@ -70,6 +75,7 @@ public sealed class MeterBars : Control
             return;
         }
         _animating = true;
+        _animRequestedAt = Environment.TickCount64;
         top.RequestAnimationFrame(Tick);
     }
 
@@ -101,6 +107,7 @@ public sealed class MeterBars : Control
             if (top is not null)
             {
                 _animating = true;
+                _animRequestedAt = Environment.TickCount64;
                 top.RequestAnimationFrame(Tick);
             }
         }

@@ -309,33 +309,42 @@ UNDERRUNS < 5; start the engine with Steam idle, then start streaming: audio wit
 window; put the master TV to sleep: other outputs keep playing uninterrupted, log shows a promotion, not a drain
 loop.
 
-### Phase 2 — Latency budget that the knobs actually control (ship as v0.5.0 with Phase 3)
+### Phase 2 — One LATENCY knob with AUTO, a budget the knob really controls (ship as v0.5.0)
+
+Revised after v0.4.6: the IN knob is dropped (its only honest job, headroom for a bursty input, is done better
+from measurements), and the engine owns headroom through a self-tuning loop that reacts to underruns.
 
 2.1 `WasapiRenderClient`: `TargetPaddingFrames` (settable live); pre-roll **target** frames of silence; per event
-    write `clamp(target − padding, 0, bufferFrames − padding)`; `PeriodFrames` exposed; `ActualBufferMs` renamed
-    to `FifoMs` = target padding. Default-period rung requests buffer = `max(2 periods, target + period)`.
-2.2 `AudioEngine` budget (`:1589-1616` rewrite):
-    - `renderBufferMs = clamp(knob / 2, 2·period, 100)` (allocation)
-    - `renderPaddingMs = clamp(knob / 4, period + 2, renderBufferMs − period)` (latency)
-    - `renderLatencyMs = renderPaddingMs + period` (reported)
-    - `ringFloorMs = renderPaddingMs + IN` where **IN is the capture-side headroom knob** (10..40, default 10)
-    - `ringTargetMs = max(ringFloorMs, knob − cadence − renderLatencyMs)`
-    - `effectiveTotalMs = cadence + ringTargetMs + renderLatencyMs` → exposed on `UiSnapshot` as `LatencyFloorMs`
-      and `EffectiveLatencyMs`.
-    `AppConfig`: default `InputBufferMs` 10; add `ConfigVersion`; migration v1→v2 resets a saved 40 to 10 (it was
-    never effective).
-2.3 Live retarget on knob change (no restart): `InputAsrc.SetTargetFillFrames` + coordinator release target +
-    render `TargetPaddingFrames`; a target decrease > 5 ms applies one `TrimBacklogBy` on all rings (one small
-    skip, outputs stay aligned); an increase is absorbed by the servo (no gap). Restart only when the allocation
-    `renderBufferMs` changes by more than one period.
-2.4 UI: `OutDrum` shows the knob; when `EffectiveLatencyMs > knob` the caption reads `LATENCY · min 46` and the
-    tooltip explains which term set the floor. `InDrum` tooltip: "Extra ring headroom for bursty inputs; adds
-    directly to input latency." Metrics tiles unchanged but now honest.
-2.5 (optional, flag `adaptiveHeadroom`, default off until field data): raise `ringFloorMs` by one cadence per
-    minute with > 3 underruns on a live producer, cap +30 ms, decay one cadence per 5 clean minutes.
+    write `clamp(target − padding, 0, bufferFrames − padding)`; stall = no progress for 1 s. `ActualBufferMs`
+    stays the allocation; `FifoMs` = target padding is what latency reports. Thread exit without a Stop request is
+    a fault (both clients).
+2.2 Pure `LatencyBudget` (tested) replaces the ad-hoc math:
+    - `period` = worst render engine period, `cadence` = worst capture cadence, `buffer` = smallest real render buffer
+    - `renderBufferRequestMs = clamp(knob / 2, 2·period, 100)` (allocation; AUTO → 2 periods)
+    - `renderPaddingMs = clamp(knob / 4, period + 2 + safetyPeriods·period, buffer)` — uniform across outputs so
+      FIFO depths stay equal (the sync coordinator assumes that)
+    - `renderLatencyMs = renderPaddingMs + period`
+    - `ringFloorMs = renderPaddingMs + cadence + autoHeadroomMs`
+    - `ringTargetMs = AUTO ? ringFloorMs : max(ringFloorMs, knob − cadence − renderLatencyMs)`
+    - `effectiveTotalMs = cadence + ringTargetMs + renderLatencyMs`
+    `MetricsSnapshot` carries `EffectiveLatencyMs`, `LatencyFloorMs`, `AutoHeadroomMs`, `SafetyTier`.
+2.3 Live retarget on knob change (no restart): ASRC targets, coordinator release target and render padding update
+    in place; a ring-target decrease > 5 ms applies one `TrimBacklogBy` on every ring (one small skip, outputs stay
+    aligned); an increase applies one equal `HoldFor` on every provider (one small gap). Restart only when the
+    needed padding exceeds the allocated buffer.
+2.4 **AUTO headroom loop** (engine health tick, 1 s): per output, underruns over the last 10 s against live
+    producers. ≥ 3 → `autoHeadroomMs += cadence` (cap 40, 10 s cooldown), logged. Still ≥ 3 at the cap for 30 s →
+    safety tier (render padding +1 period). 5 clean minutes → step back down one notch at a time. Latency creeps
+    only as far as the machine needs and comes back when load drops.
+2.5 Config: `ConfigVersion` 2; `OutputBufferMs` 0 = AUTO (default); migration resets a saved knob < 50 to AUTO and
+    `InputBufferMs` to 10 (unused). `KeepAlive` (default on) and `KeepSystemAwakeWhileRunning` (default off).
+2.6 UI: the IN drum is removed; the LATENCY drum spans its slot, minimum position reads **AUTO**, and its caption
+    always shows the effective value (`LATENCY · 54`), so "nothing happens" cannot recur. Metrics timer pauses
+    while hidden; meter animations cannot wedge after a hidden spell.
 
-Acceptance: knob sweep 10→200 moves the total tile monotonically; at knob 10 total ≈ 45 ms on this setup;
-UNDERRUNS unchanged vs Phase 1 at equal effective latency; knob changes no longer silence the outputs.
+Acceptance: AUTO total ≈ 55 ms on this setup (was ~80–90); knob sweep above the floor moves the total tile
+monotonically with no restart; a CPU-load test (compile in the background) raises headroom automatically and the
+drum caption shows it; UNDERRUNS stop climbing once headroom settles.
 
 ### Phase 3 — Threading, hotplug, recovery
 
@@ -368,6 +377,18 @@ UNDERRUNS unchanged vs Phase 1 at equal effective latency; knob changes no longe
     `BeginDeviceBatch` becomes unnecessary and is removed.
 3.8 Shutdown: `Stop` joins with 250 ms per endpoint, threads are background; quit waits ≤ 1.5 s total.
 3.9 Bounded enumeration: `RefreshDevices` logs its duration; anything > 500 ms is a log warning with the slow ID.
+3.10 **OS load immunity** (ships with Phase 2): opt the process out of Windows 11 power throttling
+    (`SetProcessInformation(ProcessPowerThrottling)`, execution speed + ignore-timer-resolution), because a tray
+    process otherwise loses its 1 ms timer resolution and gets EcoQoS under load — the "bad while I work on the
+    laptop" case. Optional `SetThreadExecutionState(SYSTEM_REQUIRED)` while routing (config, off by default).
+3.11 **In-process health monitor** (ships with Phase 2, engine health tick): per-output coordinator report age
+    > 2 s with routes active → fault that device through the normal backoff path; audio thread exit without a
+    Stop request → fault; UI-thread heartbeat age > 15 s → stop the process heartbeat so the watchdog acts.
+3.12 **Keep-alive watchdog** (ships with Phase 2): the same exe in `--watchdog <pid>` mode, spawned by the app
+    (mutex-guarded, `--no-watchdog` disables). The engine health tick writes a timestamp to a memory-mapped
+    heartbeat every second. Heartbeat older than 10 s, or a non-zero exit, → kill and relaunch with `--startup`;
+    clean exit → the watchdog exits; crash-loop guard: three relaunches within five minutes pause it for five
+    minutes. Unhandled exceptions are logged with their stack before the process dies.
 
 Acceptance: TV sleep/wake drills (×10) with a continuous stream: no silence on the other outputs, routes restored
 on the new ID without touching the UI, no UI stall > 50 ms (measured with a dispatcher watchdog in debug builds),

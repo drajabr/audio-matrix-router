@@ -224,6 +224,9 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
         }
         finally
         {
+            // Leaving without a Stop request = the stream broke in a way nothing above
+            // latched; the engine must hear about it or this input stays silent forever.
+            if (_initOk && !_stopRequest.IsSet) Fault(WasapiConstants.AUDCLNT_E_STALLED);
             try { if (captureService is not null) Marshal.ReleaseComObject(captureService); } catch { }
             WasapiActivation.ReleaseActivation(enumerator, device, client);
             WasapiActivation.ExitComThread(comInit);

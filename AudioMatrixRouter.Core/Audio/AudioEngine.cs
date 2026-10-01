@@ -38,6 +38,8 @@ public class ActiveDevice
     public long TierStartTimestamp { get; set; }
     public int TierDegradeCount { get; set; }
     public double BaseLatencyMs { get; set; }
+    /// <summary>Set once the health monitor has faulted this endpoint (no repeats per session).</summary>
+    public bool HealthFaulted { get; set; }
     // Per-channel running peak (0..1). Producer writes; UI samples and resets atomically.
     public float[]? PeakLevels;
 }
@@ -162,20 +164,149 @@ public class AudioEngine : IDisposable
     // the device at the default period for the session. The timer self-disarms
     // when nothing is left to evaluate.
 
-    private Timer? _degradeTimer;
-    private int _degradeBusy;
+    private Timer? _healthTimer;
+    private int _healthBusy;
 
-    private void ArmDegradeTimer()
+    // ===================================================================== health tick
+    // One 1 s timer for everything that watches the engine from outside the audio
+    // threads: adaptive tier degrade, the AUTO headroom loop, endpoint health, and the
+    // process heartbeat the keep-alive watchdog reads. Runs for the life of the
+    // engine (armed in Init); each step checks _running itself.
+
+    private void ArmHealthTimer()
     {
-        _degradeTimer?.Dispose();
-        _degradeTimer = new Timer(_ => EvaluateAdaptiveDegrade(), null, 1000, 1000);
+        _healthTimer?.Dispose();
+        _healthTimer = new Timer(_ => HealthTick(), null, 1000, 1000);
+    }
+
+    private void HealthTick()
+    {
+        if (Interlocked.CompareExchange(ref _healthBusy, 1, 0) != 0) return;
+        try
+        {
+            ProcessHeartbeat.Beat();
+            if (!_running) return;
+            EvaluateAdaptiveDegrade();
+            EvaluateAutoHeadroom();
+            CheckEndpointHealth();
+        }
+        catch (Exception ex)
+        {
+            Wasapi.WasapiDiagnostics.Log($"[Engine] health tick error: {ex.GetType().Name}: {ex.Message}");
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _healthBusy, 0);
+        }
+    }
+
+    // ----- AUTO headroom loop -----
+    // Underruns must never just climb. Per tick: underruns over the last 10 s across
+    // started outputs (already counted only against LIVE producers). Three or more →
+    // one capture cadence of extra ring headroom (cap 40 ms, 10 s cooldown). Still
+    // underrunning at the cap for 30 s → safety tier (one more render period of
+    // padding). Five clean minutes → step back down, one notch at a time. The drum
+    // caption shows the effective value, so the user sees it move.
+    private const int AutoWindowSec = 10;
+    private const long AutoRaiseThreshold = 3;
+    private const int AutoCooldownMs = 10_000;
+    private const int AutoSafetyAfterMs = 30_000;
+    private const int AutoDecayAfterMs = 300_000;
+    private readonly long[] _underrunWindow = new long[AutoWindowSec];
+    private int _underrunWindowIdx;
+    private long _lastUnderrunTotal;
+    private long _lastAutoChangeAt;
+    private long _atMaxSince;
+    private long _lastUnderrunSeenAt;
+
+    private void ResetAutoWindow()
+    {
+        Array.Clear(_underrunWindow);
+        _underrunWindowIdx = 0;
+        _lastUnderrunTotal = 0;
+    }
+
+    private void EvaluateAutoHeadroom()
+    {
+        long total = 0;
+        foreach (var dev in _outputDevices.ToArray())
+        {
+            if (dev.MixProvider is { } p) total += p.UnderrunCount;
+        }
+        long delta = total >= _lastUnderrunTotal ? total - _lastUnderrunTotal : 0;
+        _lastUnderrunTotal = total;
+        _underrunWindow[_underrunWindowIdx] = delta;
+        _underrunWindowIdx = (_underrunWindowIdx + 1) % _underrunWindow.Length;
+        long windowSum = 0;
+        foreach (var v in _underrunWindow) windowSum += v;
+
+        long now = Environment.TickCount64;
+        if (windowSum > 0) _lastUnderrunSeenAt = now;
+        int step = (int)Math.Ceiling(_worstCaptureCadenceMs > 0 ? _worstCaptureCadenceMs : 10);
+
+        if (windowSum >= AutoRaiseThreshold && now - _lastAutoChangeAt >= AutoCooldownMs)
+        {
+            if (_autoHeadroomMs < LatencyBudget.MaxAutoHeadroomMs)
+            {
+                _autoHeadroomMs = Math.Min(LatencyBudget.MaxAutoHeadroomMs, _autoHeadroomMs + step);
+                _lastAutoChangeAt = now;
+                _atMaxSince = _autoHeadroomMs >= LatencyBudget.MaxAutoHeadroomMs ? now : 0;
+                ResetAutoWindow();
+                _lastUnderrunTotal = total;
+                ApplyBudgetLive($"auto headroom +{step} ms after {windowSum} underruns in {AutoWindowSec} s");
+            }
+            else if (_safetyPeriods == 0 && _atMaxSince != 0 && now - _atMaxSince >= AutoSafetyAfterMs)
+            {
+                _safetyPeriods = 1;
+                _lastAutoChangeAt = now;
+                ResetAutoWindow();
+                _lastUnderrunTotal = total;
+                ApplyBudgetLive($"safety tier ON: {windowSum} underruns in {AutoWindowSec} s at max headroom");
+            }
+            return;
+        }
+
+        if ((_autoHeadroomMs > 0 || _safetyPeriods > 0)
+            && now - _lastUnderrunSeenAt >= AutoDecayAfterMs
+            && now - _lastAutoChangeAt >= AutoDecayAfterMs)
+        {
+            if (_safetyPeriods > 0) _safetyPeriods = 0;
+            else _autoHeadroomMs = Math.Max(0, _autoHeadroomMs - step);
+            _lastAutoChangeAt = now;
+            _atMaxSince = 0;
+            ApplyBudgetLive("auto headroom decay after 5 clean minutes");
+        }
+    }
+
+    // ----- endpoint health -----
+    // A render thread that stops reporting blocks while the engine runs (device
+    // asleep, thread dead) is faulted through the normal backoff path. The client's
+    // own stall detector usually fires first; this is the belt under it.
+    private const double RenderSilentFaultMs = 2000;
+    private const double RenderNeverReportedFaultMs = 5000;
+
+    private void CheckEndpointHealth()
+    {
+        var coordinator = _syncCoordinator;
+        if (coordinator is null) return;
+        double freq = System.Diagnostics.Stopwatch.Frequency;
+        foreach (var dev in _outputDevices.ToArray())
+        {
+            if (dev.Render is null || dev.MixProvider is null || dev.HealthFaulted) continue;
+            double age = coordinator.GetConsumerReportAgeMs(dev.ConsumerId);
+            double sinceStartMs = (System.Diagnostics.Stopwatch.GetTimestamp() - dev.TierStartTimestamp) * 1000.0 / freq;
+            bool silent = age >= 0 ? age > RenderSilentFaultMs : sinceStartMs > RenderNeverReportedFaultMs;
+            if (!silent) continue;
+            dev.HealthFaulted = true;
+            Wasapi.WasapiDiagnostics.Log($"[Engine] health: '{dev.Info.Name}' render silent for " +
+                $"{(age >= 0 ? age : sinceStartMs):0} ms — faulting");
+            OnEndpointFaulted(dev.Info.Name, Wasapi.WasapiConstants.AUDCLNT_E_STALLED);
+        }
     }
 
     private void EvaluateAdaptiveDegrade()
     {
         if (!_running) return;
-        if (Interlocked.CompareExchange(ref _degradeBusy, 1, 0) != 0) return;
-        try
         {
             const double WindowSec = 10;
             const long Threshold = 5;
@@ -229,19 +360,7 @@ public class AudioEngine : IDisposable
                 Wasapi.WasapiDiagnostics.Log("[Engine] adaptive degrade: tier demoted, requesting restart");
                 try { EngineFaulted?.Invoke(); } catch { }
             }
-            else if (!anyEvaluating)
-            {
-                _degradeTimer?.Dispose();
-                _degradeTimer = null; // self-disarm: zero steady-state cost
-            }
-        }
-        catch
-        {
-            // Degrade evaluation must never take the engine down.
-        }
-        finally
-        {
-            Interlocked.Exchange(ref _degradeBusy, 0);
+            _ = anyEvaluating;
         }
     }
 
@@ -428,6 +547,7 @@ public class AudioEngine : IDisposable
     public void Init()
     {
         _enumerator.SetChangeCallback(() => DevicesChanged?.Invoke());
+        ArmHealthTimer();
     }
 
     public bool SetInputMasterDevice(string deviceId)
@@ -1127,7 +1247,7 @@ public class AudioEngine : IDisposable
             }
 
             // ===== 3. Coordinator =====
-            _worstRenderGulpMs = 0; // real render numbers arrive in step 4
+            ResetAutoWindow();
             var (baseMasterTargetFrames, maxMasterTargetFrames) = CalculateSyncTargetFrames();
             _syncCoordinator = new OutputSyncCoordinator(
                 masterOutput.Info.Id, _engineSampleRate, baseMasterTargetFrames, maxMasterTargetFrames);
@@ -1187,7 +1307,7 @@ public class AudioEngine : IDisposable
                     dev.ConsumerId,
                     _syncCoordinator);
 
-                if (!TryInitRender(dev, mmDevice, RenderBufferMs))
+                if (!TryInitRender(dev, mmDevice, RenderBufferRequestMs))
                 {
                     try { dev.MixProvider?.DetachConsumer(); } catch { }
                     dev.MixProvider = null;
@@ -1259,17 +1379,29 @@ public class AudioEngine : IDisposable
             // Preferred consumer for ring trim ordering + the input ASRC fill reference.
             ApplyPreferredMasterConsumerToInputs();
 
-            // Real render buffers are known now — pin the fill floor to the worst REAL
-            // gulp and make the barrier release at EXACTLY the servo's fill target.
-            // (The old path reconstructed this as knob+headroom and clamped the
-            // headroom at 0, so any knob > ~40 released above target and hard-drained
-            // an audible skip right after every start.)
-            _worstRenderGulpMs = startedOutputs.Max(d =>
-                d.RealRenderBufferMs > 0 ? d.RealRenderBufferMs : RenderBufferMs);
+            // Real render periods and buffers are known now: compute the budget, hand
+            // every output the SAME padding target (equal FIFO depths — the sync
+            // coordinator assumes that), and make the barrier release at exactly the
+            // servo's fill target.
+            _worstRenderPeriodMs = startedOutputs.Max(d => d.Render!.ActualPeriodMs > 0 ? d.Render.ActualPeriodMs : 10);
+            _minRealRenderBufferMs = startedOutputs.Min(d => d.RealRenderBufferMs > 0 ? d.RealRenderBufferMs : int.MaxValue);
+            if (_minRealRenderBufferMs == int.MaxValue) _minRealRenderBufferMs = 0;
+            _budget = ComputeBudget();
+            if (_budget.NeedsReallocation && attempt < 1)
+            {
+                // The padding this budget needs (safety tier / a big knob) does not fit
+                // the buffers we were given; reopen once with the request sized from
+                // the now-known period.
+                Wasapi.WasapiDiagnostics.Log($"[Engine] render buffers too small for padding {_budget.RenderPaddingMs} ms — reopening");
+                Stop();
+                return StartCore(masterOutput, attempt + 1);
+            }
+            ApplyRenderPadding(startedOutputs);
             _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
             // ===== 5. Start captures (rings begin filling; cursors already pinned) =====
             _worstCaptureCadenceMs = 10; // provisional until real cadences are known
+            _budget = ComputeBudget();
             int inputFillTargetFrames = CalculateInputFillTargetFrames();
             foreach (var dev in _inputDevices)
             {
@@ -1288,6 +1420,7 @@ public class AudioEngine : IDisposable
                 .Select(d => d.CaptureCadenceMs)
                 .DefaultIfEmpty(10)
                 .Max();
+            _budget = ComputeBudget();
             int refinedFillFrames = CalculateInputFillTargetFrames();
             foreach (var dev in _inputDevices)
             {
@@ -1295,12 +1428,7 @@ public class AudioEngine : IDisposable
             }
             _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
-            Wasapi.WasapiDiagnostics.Log($"[Engine] budget: capture cadence {_worstCaptureCadenceMs:0.##} ms, " +
-                $"render gulp {_worstRenderGulpMs} ms (requested {RenderBufferMs}), ring target {InputFillTargetMs} ms, " +
-                $"effective total ≈ {Math.Ceiling(_worstCaptureCadenceMs) + InputFillTargetMs + startedOutputs.Max(d => d.RenderLatencyMs)} ms; " +
-                string.Join(", ", startedOutputs.Select(d => $"'{d.Info.Name}' {d.Render?.Tier} buf {d.RealRenderBufferMs} ms period {d.RenderPeriodMs} ms")) +
-                "; inputs " + string.Join(", ", _inputDevices.Where(d => d.Capture != null)
-                    .Select(d => $"'{d.Info.Name}' {d.Capture?.Tier} {d.CaptureCadenceMs:0.##} ms")));
+            LogBudget("start", startedOutputs);
 
             // ===== 6. Play all outputs together =====
             foreach (var dev in _outputDevices)
@@ -1309,7 +1437,6 @@ public class AudioEngine : IDisposable
             }
 
             _running = true;
-            ArmDegradeTimer();
             StateChanged?.Invoke();
             return true;
         }
@@ -1338,27 +1465,10 @@ public class AudioEngine : IDisposable
         return true;
     }
 
+    /// <summary>Kept for config compatibility; the budget no longer uses it.</summary>
     public bool SetInputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 10, 200);
-        if (_inputBufferMs == clamped)
-        {
-            return true;
-        }
-
-        _inputBufferMs = clamped;
-
-        foreach (var dev in _inputDevices)
-        {
-            dev.CaptureLatencyMs = clamped;
-        }
-
-        if (_running)
-        {
-            FullRestart();
-        }
-
-        StateChanged?.Invoke();
+        _inputBufferMs = Math.Clamp(bufferMs, 10, 200);
         return true;
     }
 
@@ -1412,6 +1522,7 @@ public class AudioEngine : IDisposable
         dev.Render = render;
         render.Faulted += hr => OnEndpointFaulted(dev.Info.Name, hr);
         dev.TierUnderrunBaseline = 0;
+        dev.HealthFaulted = false;
         dev.TierStartTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
         // Honest numbers come from the endpoint (real buffer + one period of
         // mix-ahead); fall back to the request when read-back was unavailable.
@@ -1561,23 +1672,20 @@ public class AudioEngine : IDisposable
         };
     }
 
+    /// <summary>The LATENCY knob: 0 = AUTO, else the end-to-end target in ms. Applied
+    /// live when running (no restart unless the render buffers must be reallocated).</summary>
     public bool SetOutputBufferMs(int bufferMs)
     {
-        int clamped = Math.Clamp(bufferMs, 10, 200);
+        int clamped = Math.Clamp(bufferMs, LatencyBudget.AutoKnob, LatencyBudget.MaxKnobMs);
         if (_outputBufferMs == clamped)
         {
             return true;
         }
 
         _outputBufferMs = clamped;
-        foreach (var dev in _outputDevices)
-        {
-            dev.MixProvider?.SetOutputBufferMs(clamped);
-        }
-
         if (_running)
         {
-            FullRestart();
+            ApplyBudgetLive(clamped == LatencyBudget.AutoKnob ? "knob → AUTO" : $"knob → {clamped} ms");
         }
 
         StateChanged?.Invoke();
@@ -1592,9 +1700,6 @@ public class AudioEngine : IDisposable
 
     public void Stop()
     {
-        _degradeTimer?.Dispose();
-        _degradeTimer = null;
-
         foreach (var dev in _inputDevices)
         {
             try { dev.Capture?.Stop(); } catch { }
@@ -1664,34 +1769,102 @@ public class AudioEngine : IDisposable
         }
     }
 
-    /// <summary>Render buffer share of the latency budget (see the budget comment).</summary>
-    private int RenderBufferMs => Math.Clamp(_outputBufferMs / 4, 10, 50);
+    // ===================================================================== latency budget
+    // See LatencyBudget: everything derives from the measured render period, real
+    // render buffer and capture cadence, plus the knob and the AUTO loop's headroom.
 
-    // Worst REAL render gulp across started outputs (WASAPI tops the buffer to full
-    // each period, so the gulp = the real buffer size). 0 until renders initialize.
-    private int _worstRenderGulpMs;
+    private double _worstRenderPeriodMs = 10;   // worst render engine period across started outputs
+    private int _minRealRenderBufferMs;          // smallest real render allocation (0 until opened)
+    private double _worstCaptureCadenceMs = 10;  // worst capture delivery cadence across started inputs
+    private int _autoHeadroomMs;                 // AUTO loop: extra ring fill because of underruns
+    private int _safetyPeriods;                  // AUTO loop: extra render periods of padding
+    private LatencyBudgetResult _budget;
 
-    // Worst REAL capture delivery cadence across started inputs (2.67-10ms for
-    // small-period mics, 10 for default periods and polled loopbacks).
-    private double _worstCaptureCadenceMs = 10;
+    /// <summary>The budget currently applied (for metrics / UI).</summary>
+    public LatencyBudgetResult CurrentBudget => _budget;
+    public int AutoHeadroomMs => _autoHeadroomMs;
+    public bool SafetyTier => _safetyPeriods > 0;
 
-    /// <summary>Ring fill target: the budget minus capture cadence and render, floored
-    /// so one REAL render gulp + one capture block + safety can never starve the ring.</summary>
-    private int InputFillTargetMs
-    {
-        get
-        {
-            int gulp = _worstRenderGulpMs > 0 ? _worstRenderGulpMs : RenderBufferMs;
-            int cadence = (int)Math.Ceiling(_worstCaptureCadenceMs > 0 ? _worstCaptureCadenceMs : 10);
-            return Math.Clamp(
-                _outputBufferMs - cadence - RenderBufferMs,
-                gulp + cadence + 5,
-                RingBufferCapacityMs * 3 / 4);
-        }
-    }
+    private int RenderBufferRequestMs => LatencyBudget.RenderBufferRequestMs(_outputBufferMs, _worstRenderPeriodMs);
+
+    private LatencyBudgetResult ComputeBudget() => LatencyBudget.Compute(new LatencyBudgetInput(
+        _outputBufferMs, _worstCaptureCadenceMs, _worstRenderPeriodMs, _minRealRenderBufferMs,
+        _autoHeadroomMs, _safetyPeriods));
+
+    private int InputFillTargetMs => Math.Max(1, _budget.RingTargetMs);
 
     private int CalculateInputFillTargetFrames() =>
         Math.Max(64, _engineSampleRate * InputFillTargetMs / 1000);
+
+    private void ApplyRenderPadding(IEnumerable<ActiveDevice> outputs)
+    {
+        foreach (var dev in outputs)
+        {
+            if (dev.Render is null) continue;
+            dev.Render.SetTargetPaddingMs(_budget.RenderPaddingMs);
+            dev.RenderLatencyMs = dev.Render.FifoMs + dev.RenderPeriodMs;
+        }
+    }
+
+    /// <summary>
+    /// Re-targets a RUNNING engine to the current knob/headroom without a restart:
+    /// render padding, every input servo's fill target and the barrier release
+    /// target move in place. A ring-target decrease is one equal backlog trim on
+    /// every ring (one small skip, outputs stay aligned); an increase is one equal
+    /// hold on every output (one small gap). Only a padding that no longer fits the
+    /// allocated render buffers forces a reopen.
+    /// </summary>
+    private void ApplyBudgetLive(string reason)
+    {
+        if (!_running || _syncCoordinator is null) return;
+        var old = _budget;
+        var next = ComputeBudget();
+        if (next.NeedsReallocation)
+        {
+            Wasapi.WasapiDiagnostics.Log($"[Engine] retarget ({reason}): padding {next.RenderPaddingMs} ms exceeds the render buffers — restarting");
+            FullRestart();
+            return;
+        }
+        _budget = next;
+
+        var outputs = _outputDevices.ToArray();
+        var inputs = _inputDevices.ToArray();
+        ApplyRenderPadding(outputs);
+
+        int frames = CalculateInputFillTargetFrames();
+        foreach (var input in inputs)
+        {
+            input.InputAsrc?.SetTargetFillFrames(frames);
+        }
+        _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
+
+        int deltaMs = next.RingTargetMs - old.RingTargetMs;
+        int deltaFrames = Math.Abs(deltaMs) * _engineSampleRate / 1000;
+        if (deltaMs <= -5)
+        {
+            foreach (var input in inputs) input.RingBuffer?.TrimBacklogBy(deltaFrames);
+        }
+        else if (deltaMs >= 5)
+        {
+            foreach (var output in outputs) output.MixProvider?.HoldFor(deltaFrames);
+        }
+
+        LogBudget($"retarget: {reason}", outputs.Where(d => d.Render != null));
+        try { StateChanged?.Invoke(); } catch { }
+    }
+
+    private void LogBudget(string what, IEnumerable<ActiveDevice> started)
+    {
+        var b = _budget;
+        Wasapi.WasapiDiagnostics.Log($"[Engine] budget ({what}): knob {(b.IsAuto ? "AUTO" : _outputBufferMs + " ms")}, " +
+            $"capture cadence {_worstCaptureCadenceMs:0.##} ms, render period {_worstRenderPeriodMs:0.##} ms, " +
+            $"render buffer {_minRealRenderBufferMs} ms (requested {b.RenderBufferRequestMs}), padding {b.RenderPaddingMs} ms, " +
+            $"ring target {b.RingTargetMs} ms (floor {b.RingFloorMs}, headroom {_autoHeadroomMs}, safety {_safetyPeriods}), " +
+            $"effective total {b.EffectiveTotalMs} ms (floor {b.FloorTotalMs}); " +
+            string.Join(", ", started.Select(d => $"'{d.Info.Name}' {d.Render?.Tier} buf {d.RealRenderBufferMs} ms period {d.RenderPeriodMs} ms")) +
+            "; inputs " + string.Join(", ", _inputDevices.Where(d => d.Capture != null)
+                .Select(d => $"'{d.Info.Name}' {d.Capture?.Tier} {d.CaptureCadenceMs:0.##} ms")));
+    }
 
     private (int BaseMasterTargetFrames, int MaxMasterTargetFrames) CalculateSyncTargetFrames()
     {
@@ -1976,6 +2149,8 @@ public class AudioEngine : IDisposable
 
     public void Dispose()
     {
+        _healthTimer?.Dispose();
+        _healthTimer = null;
         Stop();
         _enumerator.Dispose();
     }

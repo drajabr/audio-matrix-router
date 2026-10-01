@@ -311,9 +311,13 @@ public sealed class MatrixControl : Control
         return arr;
     }
 
+    // A frame requested while hidden may never arrive (see MeterBars): treat a stale
+    // request as "not animating" so the header meters cannot freeze after a tray spell.
+    private long _meterAnimRequestedAt;
+
     private void StartMeterAnimation()
     {
-        if (_meterAnimating) return;
+        if (_meterAnimating && Environment.TickCount64 - _meterAnimRequestedAt < 1000) return;
         var top = TopLevel.GetTopLevel(this);
         if (top is null)
         {
@@ -322,6 +326,7 @@ public sealed class MatrixControl : Control
             return;
         }
         _meterAnimating = true;
+        _meterAnimRequestedAt = Environment.TickCount64;
         top.RequestAnimationFrame(MeterTick);
     }
 

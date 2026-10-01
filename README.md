@@ -75,6 +75,19 @@ dotnet run --project AudioMatrixRouter.App
 - Supported startup args:
 	- --startup
 	- --minimized
+	- --no-watchdog (disable the keep-alive watchdog for this launch)
+
+## Keep-alive and health
+
+- The app spawns a watchdog (a second instance of the same exe in `--watchdog` mode). It relaunches the app
+  after a crash or when the engine heartbeat stops for 10 s, with a crash-loop guard. Disable it with
+  `--no-watchdog` or `"keepAlive": false` in config.json.
+- The engine runs a 1 s health tick: endpoints that stop consuming are faulted and recovered with backoff,
+  and underruns raise the ring headroom automatically (see LATENCY below).
+- The process opts out of Windows 11 power throttling so timer resolution and scheduling stay honest while
+  the window is hidden in the tray.
+- Diagnostics: `%TEMP%\amr-wasapi-probe.log` (rotates at 1 MB) records every start with the latency budget,
+  faults, stalls, master promotions and auto-headroom changes.
 
 ## Updates
 
@@ -106,8 +119,14 @@ Saved fields include:
 	- Refresh devices from the UI (↻ in the corner block).
 	- Re-check active crosspoints and gain values.
 
+- Latency: one LATENCY drum. Its lowest position is AUTO: the engine runs at the floor the devices allow
+  (about 54 ms end to end on 10 ms shared-mode endpoints) and adds headroom by itself when an input underruns,
+  then takes it back after five clean minutes. Turn the drum up for a manual end-to-end target. The caption
+  always shows the effective value; a trailing + means auto headroom is in effect.
+
 - Underruns counting up:
-	- Raise the BUFFER drum (40ms is a safe default); very small buffers are aggressive for shared-mode WASAPI.
+	- Leave LATENCY on AUTO and let the headroom loop settle, or raise it manually. Check the log for
+	  `auto headroom` and `safety tier` lines to see what the engine did.
 
 ## Links
 

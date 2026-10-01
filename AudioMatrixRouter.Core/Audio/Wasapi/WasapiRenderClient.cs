@@ -50,6 +50,32 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
     public long ProviderErrorCount => Interlocked.Read(ref _providerErrors);
     private long _providerErrors;
 
+    // FIFO depth to keep queued, in device frames. The old loop topped the buffer up
+    // to FULL on every event, so the output latency was the whole allocation (~22 ms
+    // for a 10 ms request) whatever the knob said. Now each event writes only up to
+    // this target; 0 = "full buffer" until the engine sets it.
+    private volatile int _targetPaddingFrames;
+    private uint _bufferFrames;
+
+    public int FifoMs
+    {
+        get
+        {
+            int t = _targetPaddingFrames;
+            if (t <= 0 || ActualSampleRate <= 0) return ActualBufferMs;
+            return (int)Math.Round(t * 1000.0 / ActualSampleRate);
+        }
+    }
+
+    public void SetTargetPaddingMs(int paddingMs)
+    {
+        if (ActualSampleRate <= 0) return;
+        int frames = (int)Math.Round(paddingMs * ActualSampleRate / 1000.0);
+        uint buffer = _bufferFrames;
+        if (buffer > 0) frames = (int)Math.Min(frames, buffer);
+        _targetPaddingFrames = Math.Max(1, frames);
+    }
+
     public event Action<int>? Faulted;
 
     public WasapiRenderClient(string endpointId, int requestedBufferMs, EndpointTier requestedTier, string label)
@@ -153,19 +179,24 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                 return;
             }
 
-            // Pre-roll: fill the whole buffer with silence so the FIFO depth is
-            // deterministic at t0 and the first period can never glitch.
-            if (renderService!.GetBuffer(bufferFrames, out var prePtr) == WasapiConstants.S_OK)
-            {
-                renderService.ReleaseBuffer(bufferFrames, WasapiConstants.BUFFERFLAGS_SILENT);
-            }
-
+            _bufferFrames = bufferFrames;
             _initOk = true;
             _initDone.Set();
 
-            // Wait for Play (engine starts all outputs together after captures).
+            // Wait for Play (engine starts all outputs together after captures). The
+            // engine sets the padding target in between, once it knows every output's
+            // real buffer and period.
             _playRequest.Wait();
             if (_stopRequest.IsSet) return;
+
+            // Pre-roll: queue TARGET frames of silence so the FIFO depth is deterministic
+            // at t0 and the first period can never glitch. (Not the whole buffer: that
+            // pinned the output latency at the full allocation.)
+            uint preroll = TargetFrames(bufferFrames);
+            if (renderService!.GetBuffer(preroll, out _) == WasapiConstants.S_OK)
+            {
+                renderService.ReleaseBuffer(preroll, WasapiConstants.BUFFERFLAGS_SILENT);
+            }
 
             int hr = client!.Start();
             if (hr != WasapiConstants.S_OK)
@@ -180,6 +211,7 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
             int consecutiveBufferErrors = 0;
             long lastProgressTicks = Stopwatch.GetTimestamp();
             double ticksPerMs = Stopwatch.Frequency / 1000.0;
+            uint lastPadding = uint.MaxValue;
 
             while (!_stopRequest.IsSet)
             {
@@ -199,18 +231,27 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                 if (IsFatal(hr)) { Fault(hr); break; }
                 if (hr != WasapiConstants.S_OK) continue;
 
-                uint frames = bufferFrames - padding;
-                if (frames == 0)
+                // Progress = the engine consumed something since we last looked. A
+                // consuming shared-mode stream lowers padding every period; one that
+                // answers S_OK but never does is stalled (display asleep, driver wedged).
+                if (padding != lastPadding)
                 {
-                    if ((Stopwatch.GetTimestamp() - lastProgressTicks) / ticksPerMs > StallMs)
-                    {
-                        WasapiDiagnostics.Log($"[WASAPI] render {_label}: no buffer progress for {StallMs:0} ms — stalled");
-                        Fault(WasapiConstants.AUDCLNT_E_STALLED);
-                        break;
-                    }
-                    continue;
+                    lastPadding = padding;
+                    lastProgressTicks = Stopwatch.GetTimestamp();
                 }
-                lastProgressTicks = Stopwatch.GetTimestamp();
+                else if ((Stopwatch.GetTimestamp() - lastProgressTicks) / ticksPerMs > StallMs)
+                {
+                    WasapiDiagnostics.Log($"[WASAPI] render {_label}: no buffer progress for {StallMs:0} ms — stalled");
+                    Fault(WasapiConstants.AUDCLNT_E_STALLED);
+                    break;
+                }
+
+                // Top up to the padding TARGET, never to the whole buffer.
+                uint free = bufferFrames - padding;
+                uint target = TargetFrames(bufferFrames);
+                uint frames = padding >= target ? 0 : Math.Min(free, target - padding);
+                if (frames == 0) continue;
+                lastPadding = padding + frames; // what GetCurrentPadding reports next if nothing was consumed
 
                 hr = renderService.GetBuffer(frames, out var dataPtr);
                 if (hr == WasapiConstants.AUDCLNT_E_BUFFER_ERROR)
@@ -258,9 +299,15 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
 
             try { client.Stop(); } catch { }
             try { client.Reset(); } catch { }
+
+            // Leaving the loop without a Stop request means the stream broke in a way
+            // that was not latched above — the engine must know, or this output goes
+            // silent forever while everything else looks fine.
+            if (!_stopRequest.IsSet) Fault(WasapiConstants.AUDCLNT_E_STALLED);
         }
-        catch
+        catch (Exception ex)
         {
+            WasapiDiagnostics.Log($"[WASAPI] render {_label}: thread exception {ex.GetType().Name}: {ex.Message}");
             if (!_initDone.IsSet) { _initOk = false; _initDone.Set(); }
             Fault(WasapiConstants.AUDCLNT_E_DEVICE_INVALIDATED);
         }
@@ -465,6 +512,13 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
         }
         ActualPeriodMs = periodMs;
         return true;
+    }
+
+    private uint TargetFrames(uint bufferFrames)
+    {
+        int t = _targetPaddingFrames;
+        if (t <= 0) return bufferFrames;
+        return (uint)Math.Min(bufferFrames, (uint)t);
     }
 
     private static bool IsFatal(int hr) =>

@@ -40,7 +40,8 @@ public partial class MainWindow : Window
     private float _masterGainDb;
     private float _appliedMasterGainDb;        // master gain the snapshot's gains include
     private int? _pendingBufferMs;
-    private int? _pendingInBufferMs;
+    private readonly DispatcherTimer _uiHeartbeat;
+    private string _latencyCaption = "LATENCY";
     private readonly DispatcherTimer _gainApplyTimer;
     private readonly DispatcherTimer _bufferApplyTimer;
     private bool _showAll;
@@ -116,6 +117,13 @@ public partial class MainWindow : Window
         _metricsTimer.Tick += (_, _) => OnMetricsTick();
         _metricsTimer.Start();
 
+        // UI-thread liveness for the keep-alive watchdog: the engine health tick only
+        // writes the process heartbeat while this has ticked recently, so a frozen
+        // window gets the process recycled.
+        _uiHeartbeat = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+        _uiHeartbeat.Tick += (_, _) => ProcessHeartbeat.NoteUiAlive();
+        _uiHeartbeat.Start();
+
         _gainApplyTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
         _gainApplyTimer.Tick += (_, _) => { _gainApplyTimer.Stop(); ApplyPendingMasterGain(); };
 
@@ -153,6 +161,19 @@ public partial class MainWindow : Window
             SaveBounds();
             _prefs.Flush();
         };
+    }
+
+    /// <summary>Metrics polling (10 Hz, ring/coordinator locks) and the 60 fps meter
+    /// animations only make sense while the window can be seen; while hidden in the
+    /// tray they only steal CPU from the audio threads under load.</summary>
+    protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+    {
+        base.OnPropertyChanged(change);
+        if (change.Property == IsVisibleProperty && _metricsTimer is not null && !_shutdownDone)
+        {
+            if (IsVisible) _metricsTimer.Start();
+            else _metricsTimer.Stop();
+        }
     }
 
     // =====================================================================
@@ -684,29 +705,18 @@ public partial class MainWindow : Window
             UpdateCornerVisuals();
         };
 
-        InDrum.ValueFormatter = v => v.ToString("0") + "ms";
-        OutDrum.ValueFormatter = v => v.ToString("0") + "ms";
+        OutDrum.ValueFormatter = v => v < 0.5 ? "AUTO" : v.ToString("0") + "ms";
         GainDrum.ValueFormatter = v => v.ToString("+0.0;-0.0;0.0");
         GainDrum.ShowGlow = true; // only the master gain wheel carries the accent glow
-        ToolTip.SetTip(InDrum, "Capture buffer. Leave at 10ms unless an input device glitches; " +
-                               "the latency budget rebalances around it.");
-        ToolTip.SetTip(OutDrum, "Target end-to-end latency. The engine splits it across " +
-                                "capture, ring and render buffers.");
+        ToolTip.SetTip(OutDrum, "End-to-end latency. AUTO (lowest position) runs at the floor this hardware " +
+                                "allows and adds headroom by itself when an input underruns; turn up for a manual " +
+                                "target. The caption shows the effective value.");
 
-        // ONE buffer knob: OUT is the knob that actually governs stability/latency
-        // (render buffer + ASRC fill target + barrier); IN is derived. DEBOUNCED:
-        // applying a buffer change restarts the whole engine, so per-tick application
-        // froze the wheel — the drum spins freely and the engine restarts once, 450ms
-        // after the last tick (the web app did the same with a 500ms timer).
+        // ONE knob. DEBOUNCED: the drum spins freely and the engine retargets once,
+        // 450ms after the last tick (live, no restart).
         OutDrum.ValueCommitted += (_, v) =>
         {
             _pendingBufferMs = (int)Math.Round(v);
-            _bufferApplyTimer.Stop();
-            _bufferApplyTimer.Start();
-        };
-        InDrum.ValueCommitted += (_, v) =>
-        {
-            _pendingInBufferMs = (int)Math.Round(v);
             _bufferApplyTimer.Stop();
             _bufferApplyTimer.Start();
         };
@@ -994,18 +1004,13 @@ public partial class MainWindow : Window
 
     private void ApplyPendingBufferMs()
     {
-        if (_pendingBufferMs is null && _pendingInBufferMs is null) return;
+        if (_pendingBufferMs is null) return;
         try
         {
-            // LATENCY = the end-to-end budget the engine splits; IN = capture-buffer
-            // override for glitchy capture devices (the budget rebalances around it,
-            // so total latency still tracks the LATENCY knob).
             if (_pendingBufferMs is { } outMs) _controller.SetOutputBufferMs(outMs);
-            if (_pendingInBufferMs is { } inMs) _controller.SetInputBufferMs(inMs);
         }
         catch (Exception ex) { ShowBanner(ex.Message); }
         _pendingBufferMs = null;
-        _pendingInBufferMs = null;
     }
 
     // =====================================================================
@@ -1291,8 +1296,6 @@ public partial class MainWindow : Window
         {
             if (Math.Abs(OutDrum.Value - _snapshot.OutputBufferMs) >= 0.5)
                 OutDrum.Value = _snapshot.OutputBufferMs;
-            if (Math.Abs(InDrum.Value - _snapshot.InputBufferMs) >= 0.5)
-                InDrum.Value = _snapshot.InputBufferMs;
         }
     }
 
@@ -1614,6 +1617,25 @@ public partial class MainWindow : Window
         MetricOutSync.Text = metrics.Outputs.Sum(d => d.SyncCorrections).ToString();
         MetricOutUnderruns.Text = metrics.Outputs.Sum(d => d.Underruns).ToString();
         MetricOutDrops.Text = metrics.Outputs.Sum(d => d.DroppedFrames).ToString();
+
+        // The LATENCY drum caption always carries the EFFECTIVE value, so a knob that
+        // sits below the floor (or AUTO) still tells the truth; a trailing + marks
+        // headroom the AUTO loop added because of underruns.
+        var caption = metrics.Running && metrics.EffectiveLatencyMs > 0
+            ? $"LATENCY · {metrics.EffectiveLatencyMs}" + (metrics.AutoHeadroomMs > 0 || metrics.SafetyTier ? "+" : "")
+            : "LATENCY";
+        if (caption != _latencyCaption)
+        {
+            _latencyCaption = caption;
+            OutDrum.Caption = caption;
+            OutDrum.InvalidateVisual();
+            ToolTip.SetTip(OutDrum, metrics.Running
+                ? $"Effective {metrics.EffectiveLatencyMs} ms (floor on this hardware {metrics.LatencyFloorMs} ms" +
+                  (metrics.AutoHeadroomMs > 0 ? $", +{metrics.AutoHeadroomMs} ms auto headroom after underruns" : "") +
+                  (metrics.SafetyTier ? ", safety tier on" : "") + "). " +
+                  "AUTO = run at the floor and self-manage headroom; turn up for a manual target."
+                : "End-to-end latency. AUTO runs at the floor this hardware allows; turn up for a manual target.");
+        }
 
         // Dock card meters follow the detail pair.
         var (sourceId, destId) = ResolveDetailPair();
