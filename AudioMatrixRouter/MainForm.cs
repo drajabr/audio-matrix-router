@@ -1036,19 +1036,19 @@ public sealed class MainForm : Form
                     await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
-                case "setInputBufferMs":
-                    if (request.Params.TryGetProperty("bufferMs", out var inputBufferMs))
+                case "setBufferMarginMs":
+                    if (request.Params.TryGetProperty("marginMs", out var bufferMarginMs))
                     {
-                        _engine.SetInputBufferMs(inputBufferMs.GetInt32());
+                        _engine.SetBufferMarginMs(bufferMarginMs.GetInt32());
                         ScheduleSave();
                     }
                     await SendResultAsync(request.Id, BuildUiState(true));
                     return;
 
-                case "setOutputBufferMs":
-                    if (request.Params.TryGetProperty("bufferMs", out var outputBufferMs))
+                case "setHighPerformanceMode":
+                    if (request.Params.TryGetProperty("enabled", out var highPerfEnabled))
                     {
-                        _engine.SetOutputBufferMs(outputBufferMs.GetInt32());
+                        _engine.SetHighPerformanceMode(highPerfEnabled.GetBoolean());
                         ScheduleSave();
                     }
                     await SendResultAsync(request.Id, BuildUiState(true));
@@ -1197,8 +1197,8 @@ public sealed class MainForm : Form
             Running = _engine.IsRunning,
             Locked = _locked,
             StartupAtBoot = _startupAtBoot,
-            InputBufferMs = _engine.InputBufferMs,
-            OutputBufferMs = _engine.OutputBufferMs,
+            BufferMarginMs = _engine.BufferMarginMs,
+            HighPerformanceMode = _engine.HighPerformanceMode,
             InputDeviceMode = _inputDeviceMode,
             TotalLatencyMs = maxWorkingLatencyMs,
             InputLatencyMs = inputPathLatencyMs,
@@ -1218,7 +1218,10 @@ public sealed class MainForm : Form
                 IsMaster = d.IsMasterDevice,
                 DelayMs = 0,
                 SampleRate = d.Info.SampleRate,
-                DriverLatencyMs = d.CaptureLatencyMs,
+                DriverLatencyMs = Math.Round(d.CaptureLatencyMs, 2),
+                PeriodMs = Math.Round(d.CapturePeriodMs, 2),
+                LowLatencyPeriod = d.LowLatencyPeriod,
+                Transport = d.TransportLabel,
                 Overflows = Interlocked.Read(ref d.InputOverflowCount),
                 DroppedFrames = !string.IsNullOrWhiteSpace(preferredConsumerId)
                     ? (d.RingBuffer?.GetDroppedFramesForConsumer(preferredConsumerId) ?? 0)
@@ -1236,9 +1239,12 @@ public sealed class MainForm : Form
                 IsMaster = d.IsMasterDevice,
                 DelayMs = d.OutputDelayMs,
                 SampleRate = d.Info.SampleRate,
-                DriverLatencyMs = d.RenderLatencyMs,
+                DriverLatencyMs = Math.Round(d.RenderLatencyMs, 2),
+                PeriodMs = Math.Round(d.RenderPeriodMs, 2),
+                LowLatencyPeriod = d.LowLatencyPeriod,
+                Transport = d.TransportLabel,
                 LatencyMs = d.RenderLatencyMs > 0
-                    ? Math.Round((double)d.RenderLatencyMs + d.OutputDelayMs, 1)
+                    ? Math.Round(d.RenderLatencyMs + d.OutputDelayMs, 1)
                     : (double?)null,
                 Underruns = d.MixProvider?.UnderrunCount ?? 0,
                 DroppedFrames = d.MixProvider?.DroppedFrames ?? 0,
@@ -1405,7 +1411,10 @@ public sealed class MainForm : Form
         public bool IsMaster { get; set; }
         public int DelayMs { get; set; }
         public int SampleRate { get; set; }
-        public int DriverLatencyMs { get; set; }
+        public double DriverLatencyMs { get; set; }
+        public double PeriodMs { get; set; }
+        public bool LowLatencyPeriod { get; set; }
+        public string Transport { get; set; } = string.Empty;
         public double? LatencyMs { get; set; }
         public long Underruns { get; set; }
         public double? VariationRangeMs { get; set; }
@@ -1438,8 +1447,8 @@ public sealed class MainForm : Form
         public bool Running { get; set; }
         public bool Locked { get; set; }
         public bool StartupAtBoot { get; set; }
-        public int InputBufferMs { get; set; }
-        public int OutputBufferMs { get; set; }
+        public int BufferMarginMs { get; set; }
+        public bool HighPerformanceMode { get; set; }
         public string InputDeviceMode { get; set; } = "both";
         public double? TotalLatencyMs { get; set; }
         public double? InputLatencyMs { get; set; }

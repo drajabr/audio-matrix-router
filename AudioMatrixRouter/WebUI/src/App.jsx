@@ -24,19 +24,33 @@ const FONT_SIZE_KEY = "amrFontSizePreference";
 const UI_SCALE_KEY = "amrUiScalePreference";
 const QUICK_CONTROLS_COLLAPSED_KEY = "amrQuickControlsCollapsed";
 const POWER_ON_KEY = "amrPowerOn";
-const CAPTURE_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
-const CAPTURE_BUFFER_MIN = 10;
-const CAPTURE_BUFFER_MAX = 200;
-const CAPTURE_BUFFER_DEFAULT = 40;
-const OUTPUT_BUFFER_OPTIONS = Array.from({ length: 39 }, (_, i) => 10 + i * 5);
-const OUTPUT_BUFFER_MIN = 10;
-const OUTPUT_BUFFER_MAX = 200;
-const OUTPUT_BUFFER_DEFAULT = 40;
-const outputBufferStepFor = (_cur) => 5;
-const snapOutputBuffer = (raw) => {
-  const c = Math.max(OUTPUT_BUFFER_MIN, Math.min(OUTPUT_BUFFER_MAX, raw));
-  return Math.round(c / 5) * 5;
+// Single buffering knob: a SAFETY MARGIN (ms) the engine adds on top of the real device
+// periods for every buffer (render depth = 2 periods + margin, ring fill = capture period +
+// render period + margin). Fine 1 ms steps below 10 ms, where high-performance mode lives.
+const BUFFER_MARGIN_MIN = 0;
+const BUFFER_MARGIN_MAX = 100;
+const BUFFER_MARGIN_DEFAULT = 20;
+const BUFFER_MARGIN_HP_DEFAULT = 4;
+const BUFFER_MARGIN_OPTIONS = [
+  ...Array.from({ length: 11 }, (_, i) => i),
+  ...Array.from({ length: 18 }, (_, i) => 15 + i * 5),
+];
+const snapBufferMargin = (raw) => {
+  const c = Math.max(BUFFER_MARGIN_MIN, Math.min(BUFFER_MARGIN_MAX, Math.round(Number(raw) || 0)));
+  return c > 10 ? Math.round(c / 5) * 5 : c;
 };
+const stepBufferMargin = (value, steps) => {
+  let v = snapBufferMargin(value);
+  const n = Math.abs(Math.trunc(steps));
+  for (let i = 0; i < n; i += 1) {
+    const step = steps > 0 ? (v < 10 ? 1 : 5) : (v <= 10 ? 1 : 5);
+    v = snapBufferMargin(v + (steps > 0 ? step : -step));
+  }
+  return v;
+};
+const bufferMarginWheelOffsetPx = (value) => Math.round(Number(value) || 0) * 2;
+// Native meter frames are considered live for this long after the last state push.
+const NATIVE_METER_FRESH_MS = 60;
 
 const BACKGROUND_PRESETS = [
   { key: "black", bg: "#090909", surface: "#121212", panel: "#101010", border: "#2a2a2a", text: "#ececec", muted: "#9a9a9a", swatch: "#121212" },
@@ -868,14 +882,13 @@ export default function App() {
   const [fontIndex, setFontIndex] = useState(() => getStoredIndex(FONT_KEY, FONT_PRESETS, Math.max(0, FONT_PRESETS.findIndex((p) => p.key === "consolas"))));
   const [fontSizeIndex, setFontSizeIndex] = useState(() => getStoredIndex(FONT_SIZE_KEY, FONT_SIZE_PRESETS, 4));
   const [uiScaleIndex, setUiScaleIndex] = useState(() => getStoredIndex(UI_SCALE_KEY, UI_SCALE_PRESETS, Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === "md"))));
-  const [captureBufferMs, setCaptureBufferMs] = useState(CAPTURE_BUFFER_DEFAULT);
-  const [outputBufferMs, setOutputBufferMs] = useState(OUTPUT_BUFFER_DEFAULT);
+  const [bufferMarginMs, setBufferMarginMs] = useState(BUFFER_MARGIN_DEFAULT);
+  const [highPerformanceMode, setHighPerformanceMode] = useState(false);
   const [masterGainDb, setMasterGainDb] = useState(0);
   const [wheelVisualOffsetPx, setWheelVisualOffsetPx] = useState(0);
-  const [inputBufferWheelOffsetPx, setInputBufferWheelOffsetPx] = useState(0);
-  const [outputBufferWheelOffsetPx, setOutputBufferWheelOffsetPx] = useState(0);
-  const [isApplyingCaptureBuffer, setIsApplyingCaptureBuffer] = useState(false);
-  const [isApplyingOutputBuffer, setIsApplyingOutputBuffer] = useState(false);
+  const [bufferWheelOffsetPx, setBufferWheelOffsetPx] = useState(0);
+  const [isApplyingBufferMargin, setIsApplyingBufferMargin] = useState(false);
+  const [isApplyingHighPerf, setIsApplyingHighPerf] = useState(false);
   const [nativeTotalLatencyMs, setNativeTotalLatencyMs] = useState(null);
   const [nativeRouteLatencyByCh, setNativeRouteLatencyByCh] = useState({});
   const [nativeInputChannelMeta, setNativeInputChannelMeta] = useState({});
@@ -960,14 +973,11 @@ export default function App() {
   const latencyMissingSinceRef = useRef(0);
   const wheelDragRef = useRef(null);
   const wheelDragSuppressClickRef = useRef(false);
-  const inputBufferDragRef = useRef(null);
-  const inputBufferDragSuppressClickRef = useRef(false);
-  const outputBufferDragRef = useRef(null);
-  const outputBufferDragSuppressClickRef = useRef(false);
-  const captureBufferApplyTimerRef = useRef(null);
-  const pendingCaptureBufferRef = useRef(null);
-  const outputBufferApplyTimerRef = useRef(null);
-  const pendingOutputBufferRef = useRef(null);
+  const bufferDragRef = useRef(null);
+  const bufferDragSuppressClickRef = useRef(false);
+  const bufferMarginApplyTimerRef = useRef(null);
+  const pendingBufferMarginRef = useRef(null);
+  const pendingHighPerfRef = useRef(null);
   const masterGainSyncTimerRef = useRef(null);
   const masterGainDbRef = useRef(masterGainDb);
   const inputLatencyLastRef = useRef(null);
@@ -981,16 +991,10 @@ export default function App() {
   }, [masterGainDb]);
 
   useEffect(() => {
-    if (!inputBufferDragRef.current) {
-      setInputBufferWheelOffsetPx(Math.round(captureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+    if (!bufferDragRef.current) {
+      setBufferWheelOffsetPx(bufferMarginWheelOffsetPx(bufferMarginMs));
     }
-  }, [captureBufferMs]);
-
-  useEffect(() => {
-    if (!outputBufferDragRef.current) {
-      setOutputBufferWheelOffsetPx(Math.round(outputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
-    }
-  }, [outputBufferMs]);
+  }, [bufferMarginMs]);
 
   useEffect(() => {
     matrixRef.current = matrixByView;
@@ -1179,23 +1183,21 @@ export default function App() {
         setInputDeviceMode(state.inputDeviceMode);
       }
 
-      if (Number.isFinite(state?.inputBufferMs)) {
-        const pendingCaptureBuffer = pendingCaptureBufferRef.current;
-        if (!Number.isFinite(pendingCaptureBuffer)) {
-          setCaptureBufferMs(state.inputBufferMs);
-        } else if (Math.abs(state.inputBufferMs - pendingCaptureBuffer) < 0.5) {
-          pendingCaptureBufferRef.current = null;
-          setCaptureBufferMs(state.inputBufferMs);
+      if (Number.isFinite(state?.bufferMarginMs)) {
+        const pendingMargin = pendingBufferMarginRef.current;
+        if (!Number.isFinite(pendingMargin)) {
+          setBufferMarginMs(state.bufferMarginMs);
+        } else if (Math.abs(state.bufferMarginMs - pendingMargin) < 0.5) {
+          pendingBufferMarginRef.current = null;
+          setBufferMarginMs(state.bufferMarginMs);
         }
       }
 
-      if (Number.isFinite(state?.outputBufferMs)) {
-        const pendingOutputBuffer = pendingOutputBufferRef.current;
-        if (!Number.isFinite(pendingOutputBuffer)) {
-          setOutputBufferMs(state.outputBufferMs);
-        } else if (Math.abs(state.outputBufferMs - pendingOutputBuffer) < 0.5) {
-          pendingOutputBufferRef.current = null;
-          setOutputBufferMs(state.outputBufferMs);
+      if (typeof state?.highPerformanceMode === "boolean") {
+        const pendingHp = pendingHighPerfRef.current;
+        if (pendingHp == null || pendingHp === state.highPerformanceMode) {
+          pendingHighPerfRef.current = null;
+          setHighPerformanceMode(state.highPerformanceMode);
         }
       }
 
@@ -1244,6 +1246,9 @@ export default function App() {
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          periodMs: Number.isFinite(d?.periodMs) ? d.periodMs : null,
+          transport: typeof d?.transport === "string" ? d.transport : "",
+          lowLatencyPeriod: !!d?.lowLatencyPeriod,
           overflows: Number.isFinite(d?.overflows) ? d.overflows : 0,
           droppedFrames: Number.isFinite(d?.droppedFrames) ? d.droppedFrames : 0,
           syncCorrections: Number.isFinite(d?.syncCorrections) ? d.syncCorrections : 0,
@@ -1264,6 +1269,9 @@ export default function App() {
           channels: Number.isFinite(d?.channels) ? d.channels : 0,
           sampleRate: Number.isFinite(d?.sampleRate) ? d.sampleRate : 0,
           driverLatencyMs: Number.isFinite(d?.driverLatencyMs) ? d.driverLatencyMs : 0,
+          periodMs: Number.isFinite(d?.periodMs) ? d.periodMs : null,
+          transport: typeof d?.transport === "string" ? d.transport : "",
+          lowLatencyPeriod: !!d?.lowLatencyPeriod,
           latencyMs: Number.isFinite(d?.latencyMs) ? Math.round(Number(d.latencyMs) * 10) / 10 : null,
           variationRangeMs: Number.isFinite(d?.variationRangeMs) ? Number(d.variationRangeMs) : null,
           variationOffsetMs: Number.isFinite(d?.variationOffsetMs) ? Number(d.variationOffsetMs) : null,
@@ -1466,7 +1474,7 @@ export default function App() {
   useEffect(() => {
     if (!hasNativeBridge) return undefined;
 
-    const staleAfterMs = Math.max(300, Number(captureBufferMs) || 1);
+    const staleAfterMs = 300;
     const intervalMs = Math.max(16, Math.min(100, Math.round(staleAfterMs / 2)));
 
     const id = setInterval(() => {
@@ -1511,7 +1519,7 @@ export default function App() {
     }, intervalMs);
 
     return () => clearInterval(id);
-  }, [hasNativeBridge, captureBufferMs]);
+  }, [hasNativeBridge]);
 
   const rows = useMemo(() => {
     if (viewMode === "device") {
@@ -1806,8 +1814,8 @@ export default function App() {
     fontKey: FONT_PRESETS[fontIndex]?.key,
     fontSizeKey: FONT_SIZE_PRESETS[fontSizeIndex]?.key,
     uiScaleKey: UI_SCALE_PRESETS[uiScaleIndex]?.key,
-    inputBufferMs: captureBufferMs,
-    outputBufferMs,
+    bufferMarginMs,
+    highPerformanceMode,
     masterGainDb,
     controlsCollapsed,
     showAllDevices,
@@ -1836,8 +1844,8 @@ export default function App() {
             fontKey: next?.fontKey,
             fontSizeKey: next?.fontSizeKey,
             uiScaleKey: next?.uiScaleKey,
-            inputBufferMs: next?.inputBufferMs,
-            outputBufferMs: next?.outputBufferMs,
+            bufferMarginMs: next?.bufferMarginMs,
+            highPerformanceMode: next?.highPerformanceMode,
             masterGainDb: next?.masterGainDb,
             controlsCollapsed: next?.controlsCollapsed,
             showAllDevices: next?.showAllDevices,
@@ -1972,8 +1980,13 @@ export default function App() {
         setInputDeviceMode(requestedInputDeviceMode);
       }
       if (typeof saved?.powerOn === "boolean") setPowerOn(saved.powerOn);
-      if (Number.isFinite(saved?.inputBufferMs)) setCaptureBufferMs(saved.inputBufferMs);
-      if (Number.isFinite(saved?.outputBufferMs)) setOutputBufferMs(saved.outputBufferMs);
+      if (Number.isFinite(saved?.bufferMarginMs)) {
+        setBufferMarginMs(snapBufferMargin(saved.bufferMarginMs));
+      } else if (Number.isFinite(saved?.outputBufferMs)) {
+        // Migration from the old OUT knob (render buffer = 2 x 10 ms period + margin).
+        setBufferMarginMs(snapBufferMargin(saved.outputBufferMs - 20));
+      }
+      if (typeof saved?.highPerformanceMode === "boolean") setHighPerformanceMode(saved.highPerformanceMode);
       if (Number.isFinite(saved?.masterGainDb)) {
         const savedGain = clamp(saved.masterGainDb, DB_MIN, DB_MAX);
         setMasterGainDb(savedGain);
@@ -2002,11 +2015,11 @@ export default function App() {
         } else {
           nativeState = state;
         }
-        if (Number.isFinite(nativeState?.inputBufferMs)) {
-          setCaptureBufferMs(nativeState.inputBufferMs);
+        if (Number.isFinite(nativeState?.bufferMarginMs)) {
+          setBufferMarginMs(nativeState.bufferMarginMs);
         }
-        if (Number.isFinite(nativeState?.outputBufferMs)) {
-          setOutputBufferMs(nativeState.outputBufferMs);
+        if (typeof nativeState?.highPerformanceMode === "boolean") {
+          setHighPerformanceMode(nativeState.highPerformanceMode);
         }
         if (typeof nativeState?.inputDeviceMode === "string" && nativeState.inputDeviceMode) {
           setInputDeviceMode(nativeState.inputDeviceMode);
@@ -2245,8 +2258,12 @@ export default function App() {
         fontKey: saved?.fontKey || FONT_PRESETS[fontIndex]?.key,
         fontSizeKey: saved?.fontSizeKey || FONT_SIZE_PRESETS[fontSizeIndex]?.key,
         uiScaleKey: saved?.uiScaleKey || UI_SCALE_PRESETS[uiScaleIndex]?.key,
-        inputBufferMs: Number.isFinite(saved?.inputBufferMs) ? saved.inputBufferMs : captureBufferMs,
-        outputBufferMs: Number.isFinite(saved?.outputBufferMs) ? saved.outputBufferMs : outputBufferMs,
+        bufferMarginMs: Number.isFinite(nativeState?.bufferMarginMs)
+          ? nativeState.bufferMarginMs
+          : (Number.isFinite(saved?.bufferMarginMs) ? saved.bufferMarginMs : bufferMarginMs),
+        highPerformanceMode: typeof nativeState?.highPerformanceMode === "boolean"
+          ? nativeState.highPerformanceMode
+          : (typeof saved?.highPerformanceMode === "boolean" ? saved.highPerformanceMode : highPerformanceMode),
         masterGainDb: Number.isFinite(saved?.masterGainDb) ? clamp(saved.masterGainDb, DB_MIN, DB_MAX) : masterGainDb,
         controlsCollapsed: typeof saved?.controlsCollapsed === "boolean" ? saved.controlsCollapsed : controlsCollapsed,
         showAllDevices: typeof saved?.showAllDevices === "boolean" ? saved.showAllDevices : showAllDevices,
@@ -2424,8 +2441,8 @@ export default function App() {
     fontIndex,
     fontSizeIndex,
     uiScaleIndex,
-    captureBufferMs,
-    outputBufferMs,
+    bufferMarginMs,
+    highPerformanceMode,
     masterGainDb,
     controlsCollapsed,
     showAllDevices,
@@ -2651,11 +2668,8 @@ export default function App() {
 
   useEffect(() => {
     return () => {
-      if (captureBufferApplyTimerRef.current) {
-        clearTimeout(captureBufferApplyTimerRef.current);
-      }
-      if (outputBufferApplyTimerRef.current) {
-        clearTimeout(outputBufferApplyTimerRef.current);
+      if (bufferMarginApplyTimerRef.current) {
+        clearTimeout(bufferMarginApplyTimerRef.current);
       }
       if (masterGainSyncTimerRef.current) {
         clearTimeout(masterGainSyncTimerRef.current);
@@ -3057,8 +3071,7 @@ export default function App() {
     if (activeQuickPicker === "font") return FONT_PRESETS;
     if (activeQuickPicker === "fontSize") return FONT_SIZE_PRESETS;
     if (activeQuickPicker === "uiScale") return UI_SCALE_PRESETS;
-    if (activeQuickPicker === "captureBuffer") return CAPTURE_BUFFER_OPTIONS.map((value) => ({ key: String(value), label: `${value}ms` }));
-    if (activeQuickPicker === "outputBuffer") return OUTPUT_BUFFER_OPTIONS.map((value) => ({ key: String(value), label: `${value}ms` }));
+    if (activeQuickPicker === "bufferMargin") return BUFFER_MARGIN_OPTIONS.map((value) => ({ key: String(value), label: `${value}ms` }));
     if (activeQuickPicker === "startup") {
       return [
         { key: "enable", label: "ON" },
@@ -3074,8 +3087,7 @@ export default function App() {
     if (activeQuickPicker === "font") return FONT_PRESETS[fontIndex]?.key;
     if (activeQuickPicker === "fontSize") return FONT_SIZE_PRESETS[fontSizeIndex]?.key;
     if (activeQuickPicker === "uiScale") return UI_SCALE_PRESETS[uiScaleIndex]?.key;
-    if (activeQuickPicker === "captureBuffer") return String(captureBufferMs);
-    if (activeQuickPicker === "outputBuffer") return String(outputBufferMs);
+    if (activeQuickPicker === "bufferMargin") return String(bufferMarginMs);
     if (activeQuickPicker === "startup") return startupAtBoot ? "enable" : "disable";
     return "";
   })();
@@ -3086,67 +3098,35 @@ export default function App() {
     if (type === "font") setFontIndex(Math.max(0, FONT_PRESETS.findIndex((p) => p.key === key)));
     if (type === "fontSize") setFontSizeIndex(Math.max(0, FONT_SIZE_PRESETS.findIndex((p) => p.key === key)));
     if (type === "uiScale") setUiScaleIndex(Math.max(0, UI_SCALE_PRESETS.findIndex((p) => p.key === key)));
-    if (type === "captureBuffer") {
+    if (type === "bufferMargin") {
       if (locked) return;
       const next = Number(key);
       if (Number.isFinite(next)) {
-        const selected = clamp(Math.round(next / 5) * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
-        setCaptureBufferMs(selected);
-        persistState(buildPersistedState({ inputBufferMs: selected }));
+        const selected = snapBufferMargin(next);
+        setBufferMarginMs(selected);
+        persistState(buildPersistedState({ bufferMarginMs: selected }));
 
         if (hasNativeBridge) {
-          pendingCaptureBufferRef.current = selected;
-          if (captureBufferApplyTimerRef.current) {
-            clearTimeout(captureBufferApplyTimerRef.current);
+          pendingBufferMarginRef.current = selected;
+          if (bufferMarginApplyTimerRef.current) {
+            clearTimeout(bufferMarginApplyTimerRef.current);
           }
-          captureBufferApplyTimerRef.current = setTimeout(() => {
-            const requested = pendingCaptureBufferRef.current;
+          // Debounced: the engine restarts its pipeline on every change, so settle first.
+          bufferMarginApplyTimerRef.current = setTimeout(() => {
+            const requested = pendingBufferMarginRef.current;
             if (!Number.isFinite(requested)) return;
-            setIsApplyingCaptureBuffer(true);
-            window.__nativeBridgeInvoke("setInputBufferMs", { bufferMs: requested })
+            setIsApplyingBufferMargin(true);
+            window.__nativeBridgeInvoke("setBufferMarginMs", { marginMs: requested })
               .then((state) => {
-                const applied = Number.isFinite(state?.inputBufferMs) ? state.inputBufferMs : requested;
-                if (pendingCaptureBufferRef.current !== requested) return;
-                pendingCaptureBufferRef.current = null;
-                setCaptureBufferMs(applied);
-                persistState(buildPersistedState({ inputBufferMs: applied }));
+                const applied = Number.isFinite(state?.bufferMarginMs) ? state.bufferMarginMs : requested;
+                if (pendingBufferMarginRef.current !== requested) return;
+                pendingBufferMarginRef.current = null;
+                setBufferMarginMs(applied);
+                persistState(buildPersistedState({ bufferMarginMs: applied }));
               })
               .catch(() => {})
               .finally(() => {
-                setIsApplyingCaptureBuffer(false);
-              });
-          }, 500);
-        }
-      }
-    }
-    if (type === "outputBuffer") {
-      if (locked) return;
-      const next = Number(key);
-      if (Number.isFinite(next)) {
-        const selected = snapOutputBuffer(next);
-        setOutputBufferMs(selected);
-        persistState(buildPersistedState({ outputBufferMs: selected }));
-
-        if (hasNativeBridge) {
-          pendingOutputBufferRef.current = selected;
-          if (outputBufferApplyTimerRef.current) {
-            clearTimeout(outputBufferApplyTimerRef.current);
-          }
-          outputBufferApplyTimerRef.current = setTimeout(() => {
-            const requested = pendingOutputBufferRef.current;
-            if (!Number.isFinite(requested)) return;
-            setIsApplyingOutputBuffer(true);
-            window.__nativeBridgeInvoke("setOutputBufferMs", { bufferMs: requested })
-              .then((state) => {
-                const applied = Number.isFinite(state?.outputBufferMs) ? state.outputBufferMs : requested;
-                if (pendingOutputBufferRef.current !== requested) return;
-                pendingOutputBufferRef.current = null;
-                setOutputBufferMs(applied);
-                persistState(buildPersistedState({ outputBufferMs: applied }));
-              })
-              .catch(() => {})
-              .finally(() => {
-                setIsApplyingOutputBuffer(false);
+                setIsApplyingBufferMargin(false);
               });
           }, 500);
         }
@@ -3180,18 +3160,32 @@ export default function App() {
     setWheelVisualOffsetPx(Math.round(masterGainDbRef.current / 0.5) * GLOBAL_GAIN_DRAG_PX_PER_STEP);
   };
 
-  const applyBufferDelta = (deltaMs) => {
-    if (locked || !Number.isFinite(deltaMs)) return;
-    const snapped = clamp(Math.round((captureBufferMs + deltaMs) / 5) * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
-    if (snapped === captureBufferMs) return;
-    applyQuickSelection("captureBuffer", String(snapped));
+  const applyBufferMarginSteps = (steps) => {
+    if (locked || !Number.isFinite(steps) || steps === 0) return;
+    const next = stepBufferMargin(bufferMarginMs, steps);
+    if (next === bufferMarginMs) return;
+    applyQuickSelection("bufferMargin", String(next));
   };
 
-  const applyOutputBufferDelta = (deltaMs) => {
-    if (locked || !Number.isFinite(deltaMs)) return;
-    const snapped = snapOutputBuffer(outputBufferMs + deltaMs);
-    if (snapped === outputBufferMs) return;
-    applyQuickSelection("outputBuffer", String(snapped));
+  const handleToggleHighPerformance = async () => {
+    if (!hasNativeBridge || locked || isApplyingHighPerf) return;
+    const next = !highPerformanceMode;
+    pendingHighPerfRef.current = next;
+    setHighPerformanceMode(next);
+    setIsApplyingHighPerf(true);
+    try {
+      const state = await window.__nativeBridgeInvoke("setHighPerformanceMode", { enabled: next });
+      const applied = typeof state?.highPerformanceMode === "boolean" ? state.highPerformanceMode : next;
+      const appliedMargin = Number.isFinite(state?.bufferMarginMs) ? state.bufferMarginMs : bufferMarginMs;
+      setHighPerformanceMode(applied);
+      setBufferMarginMs(appliedMargin);
+      persistState(buildPersistedState({ highPerformanceMode: applied, bufferMarginMs: appliedMargin }));
+    } catch (_) {
+      setHighPerformanceMode(!next);
+    } finally {
+      pendingHighPerfRef.current = null;
+      setIsApplyingHighPerf(false);
+    }
   };
 
   const buildNativeRoutesPayload = (matrix, options = {}) => {
@@ -3428,7 +3422,7 @@ export default function App() {
   const nativeMeterDataFresh = !hasNativeBridge
     || (
       nativeMeterLastUpdateRef.current > 0
-      && (performance.now() - nativeMeterLastUpdateRef.current) <= Math.max(1, Number(captureBufferMs) || 1)
+      && (performance.now() - nativeMeterLastUpdateRef.current) <= NATIVE_METER_FRESH_MS
     );
   const autoScaleLevels = (levels, scaleMapRef, scaleKey) => {
     const source = Array.isArray(levels) ? levels : [];
@@ -3759,9 +3753,34 @@ export default function App() {
   })();
   const sourceLatencyLabel = sourceLatencyEffectiveMs != null ? `${sourceLatencyEffectiveMs}ms` : "0ms";
   const destinationLatencyLabel = destinationLatencyEffectiveMs != null ? `${destinationLatencyEffectiveMs}ms` : "0ms";
-  // Input tile "Latency" is a MEASUREMENT (capture driver + measured ring queue), not an
-  // echo of the buffer knob. Fall back to the knob value only when no measurement exists.
-  const inputPathLatencyLabel = inputLatencyMs != null ? `${inputLatencyMs}ms` : `${captureBufferMs}ms`;
+  // Input tile "Latency" is a MEASUREMENT (capture period + measured ring queue), never an
+  // echo of a knob.
+  const inputPathLatencyLabel = inputLatencyMs != null ? `${inputLatencyMs}ms` : "0ms";
+  const devicePeriods = [...Object.values(nativeInputChannelMeta), ...Object.values(nativeOutputChannelMeta)]
+    .map((meta) => meta?.periodMs)
+    .filter((v) => Number.isFinite(v));
+  const devicePeriodSummary = devicePeriods.length > 0
+    ? (() => {
+      const min = Math.min(...devicePeriods);
+      const max = Math.max(...devicePeriods);
+      return Math.abs(max - min) < 0.05 ? `${min}ms` : `${min}-${max}ms`;
+    })()
+    : null;
+  const bufferMarginTitle = (() => {
+    const mode = highPerformanceMode ? "high-performance" : "standard";
+    const prefix = isApplyingBufferMargin ? "Applying buffer margin" : "Buffer safety margin";
+    const latency = nativeTotalLatencyMs != null ? `${nativeTotalLatencyMs}ms` : "n/a";
+    const periods = devicePeriodSummary ? ` Device periods: ${devicePeriodSummary}.` : "";
+    return `${prefix} ${bufferMarginMs}ms (${mode} mode). Added on top of the device periods for every buffer. Pipeline latency now: ${latency}.${periods} Drag or wheel: 1ms steps below 10ms, 5ms above. Middle-click resets.`;
+  })();
+  const highPerfTitle = (() => {
+    if (!hasNativeBridge) return "High-performance mode needs the desktop app";
+    const periods = devicePeriodSummary ? ` Device periods: ${devicePeriodSummary}.` : "";
+    if (isApplyingHighPerf) return "Switching transport...";
+    return highPerformanceMode
+      ? `High-performance mode ON: own WASAPI transport at the driver's minimum period, Pro Audio threads, exact-depth output.${periods} Click for standard mode.`
+      : `High-performance mode OFF: standard transport at the ~10ms system period.${periods} Click to switch to the low-latency transport.`;
+  })();
   const inputJitterLabel = inputJitterMs != null ? `${inputJitterMs}ms` : (jitterMs != null ? `${jitterMs}ms` : "0ms");
   const outputVarianceLabel = (() => {
     if (!hasNativeBridge) {
@@ -4095,18 +4114,18 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className={`corner-control-btn corner-control-btn--buffer corner-control-buffer-left corner-buffer-wheel ${isApplyingCaptureBuffer ? "active" : ""}`}
+                  className={`corner-control-btn corner-control-btn--buffer corner-control-buffer corner-buffer-wheel ${isApplyingBufferMargin ? "active" : ""}`}
                   onMouseDown={(event) => {
                     event.stopPropagation();
                     if (locked) return;
-                    if (inputBufferDragSuppressClickRef.current) {
-                      inputBufferDragSuppressClickRef.current = false;
+                    if (bufferDragSuppressClickRef.current) {
+                      bufferDragSuppressClickRef.current = false;
                       return;
                     }
-                    // Reset on middle-click (button === 1)
+                    // Reset on middle-click (button === 1) to the active mode's default.
                     if (event.button === 1) {
                       event.preventDefault();
-                      applyQuickSelection("captureBuffer", String(CAPTURE_BUFFER_DEFAULT));
+                      applyQuickSelection("bufferMargin", String(highPerformanceMode ? BUFFER_MARGIN_HP_DEFAULT : BUFFER_MARGIN_DEFAULT));
                     }
                   }}
                   onContextMenu={(event) => {
@@ -4117,128 +4136,52 @@ export default function App() {
                     if (locked) return;
                     if (event.button !== 0) return;
                     event.currentTarget.setPointerCapture(event.pointerId);
-                    inputBufferDragRef.current = {
+                    bufferDragRef.current = {
                       startY: event.clientY,
-                      startMs: captureBufferMs,
-                      startOffsetPx: inputBufferWheelOffsetPx,
+                      startMs: bufferMarginMs,
+                      startOffsetPx: bufferWheelOffsetPx,
                     };
-                    inputBufferDragSuppressClickRef.current = false;
+                    bufferDragSuppressClickRef.current = false;
                   }}
                   onPointerMove={(event) => {
-                    if (!inputBufferDragRef.current || locked) return;
-                    const dragPx = event.clientY - inputBufferDragRef.current.startY;
-                    setInputBufferWheelOffsetPx(inputBufferDragRef.current.startOffsetPx + dragPx);
-                    const deltaSteps = Math.trunc((inputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                    const next = clamp(inputBufferDragRef.current.startMs + deltaSteps * 5, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
-                    if (next !== captureBufferMs) {
-                      applyBufferDelta(next - captureBufferMs);
-                      inputBufferDragSuppressClickRef.current = true;
+                    if (!bufferDragRef.current || locked) return;
+                    const dragPx = event.clientY - bufferDragRef.current.startY;
+                    setBufferWheelOffsetPx(bufferDragRef.current.startOffsetPx + dragPx);
+                    const deltaSteps = Math.trunc((bufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    const next = stepBufferMargin(bufferDragRef.current.startMs, deltaSteps);
+                    if (next !== bufferMarginMs) {
+                      applyQuickSelection("bufferMargin", String(next));
+                      bufferDragSuppressClickRef.current = true;
                     }
                   }}
                   onPointerUp={() => {
-                    inputBufferDragRef.current = null;
-                    setInputBufferWheelOffsetPx(Math.round(captureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    bufferDragRef.current = null;
+                    setBufferWheelOffsetPx(bufferMarginWheelOffsetPx(bufferMarginMs));
                   }}
                   onPointerCancel={() => {
-                    inputBufferDragRef.current = null;
-                    inputBufferDragSuppressClickRef.current = false;
-                    setInputBufferWheelOffsetPx(Math.round(captureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
+                    bufferDragRef.current = null;
+                    bufferDragSuppressClickRef.current = false;
+                    setBufferWheelOffsetPx(bufferMarginWheelOffsetPx(bufferMarginMs));
                   }}
                   onWheel={(event) => {
                     if (locked) return;
                     event.preventDefault();
                     event.stopPropagation();
                     // Clear any active drag state
-                    inputBufferDragRef.current = null;
-                    const delta = event.deltaY < 0 ? 5 : -5;
-                    const nextCaptureBufferMs = clamp(captureBufferMs + delta, CAPTURE_BUFFER_MIN, CAPTURE_BUFFER_MAX);
+                    bufferDragRef.current = null;
+                    const steps = event.deltaY < 0 ? 1 : -1;
                     // Snap visual offset immediately to prevent drag appearance
-                    setInputBufferWheelOffsetPx(Math.round(nextCaptureBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                    applyBufferDelta(delta);
+                    setBufferWheelOffsetPx(bufferMarginWheelOffsetPx(stepBufferMargin(bufferMarginMs, steps)));
+                    applyBufferMarginSteps(steps);
                   }}
-                  title={`${isApplyingCaptureBuffer ? "Applying" : "Input buffer"} ${captureBufferMs}ms. Drag/wheel for 5ms steps, click to reset.`}
-                  aria-label="Adjust input buffer"
+                  title={bufferMarginTitle}
+                  aria-label="Adjust buffer safety margin"
                   disabled={locked}
                 >
-                  <div className="corner-gain-wheel-drum" aria-hidden="true" style={{ backgroundPositionY: `${inputBufferWheelOffsetPx}px` }} />
+                  <div className="corner-gain-wheel-drum" aria-hidden="true" style={{ backgroundPositionY: `${bufferWheelOffsetPx}px` }} />
                   <span className="buffer-readout buffer-readout--compact" aria-hidden="true">
-                    <span className="buffer-readout-label">IN</span>
-                    <span className="buffer-readout-value">{`${captureBufferMs}ms`}</span>
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  className={`corner-control-btn corner-control-btn--buffer corner-control-buffer-right corner-buffer-wheel ${isApplyingOutputBuffer ? "active" : ""}`}
-                  onMouseDown={(event) => {
-                    event.stopPropagation();
-                    if (locked) return;
-                    if (outputBufferDragSuppressClickRef.current) {
-                      outputBufferDragSuppressClickRef.current = false;
-                      return;
-                    }
-                    // Reset on middle-click (button === 1)
-                    if (event.button === 1) {
-                      event.preventDefault();
-                      applyQuickSelection("outputBuffer", String(OUTPUT_BUFFER_DEFAULT));
-                    }
-                  }}
-                  onContextMenu={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                  }}
-                  onPointerDown={(event) => {
-                    if (locked) return;
-                    if (event.button !== 0) return;
-                    event.currentTarget.setPointerCapture(event.pointerId);
-                    outputBufferDragRef.current = {
-                      startY: event.clientY,
-                      startMs: outputBufferMs,
-                      startOffsetPx: outputBufferWheelOffsetPx,
-                    };
-                    outputBufferDragSuppressClickRef.current = false;
-                  }}
-                  onPointerMove={(event) => {
-                    if (!outputBufferDragRef.current || locked) return;
-                    const dragPx = event.clientY - outputBufferDragRef.current.startY;
-                    setOutputBufferWheelOffsetPx(outputBufferDragRef.current.startOffsetPx + dragPx);
-                    const deltaSteps = Math.trunc((outputBufferDragRef.current.startY - event.clientY) / BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                    const step = outputBufferStepFor(outputBufferDragRef.current.startMs);
-                    const next = snapOutputBuffer(outputBufferDragRef.current.startMs + deltaSteps * step);
-                    if (next !== outputBufferMs) {
-                      applyOutputBufferDelta(next - outputBufferMs);
-                      outputBufferDragSuppressClickRef.current = true;
-                    }
-                  }}
-                  onPointerUp={() => {
-                    outputBufferDragRef.current = null;
-                    setOutputBufferWheelOffsetPx(Math.round(outputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                  }}
-                  onPointerCancel={() => {
-                    outputBufferDragRef.current = null;
-                    outputBufferDragSuppressClickRef.current = false;
-                    setOutputBufferWheelOffsetPx(Math.round(outputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                  }}
-                  onWheel={(event) => {
-                    if (locked) return;
-                    event.preventDefault();
-                    event.stopPropagation();
-                    // Clear any active drag state
-                    outputBufferDragRef.current = null;
-                    const step = outputBufferStepFor(outputBufferMs);
-                    const delta = event.deltaY < 0 ? step : -step;
-                    const nextOutputBufferMs = snapOutputBuffer(outputBufferMs + delta);
-                    // Snap visual offset immediately to prevent drag appearance
-                    setOutputBufferWheelOffsetPx(Math.round(nextOutputBufferMs / 5) * BUFFER_WHEEL_DRAG_PX_PER_STEP);
-                    applyOutputBufferDelta(delta);
-                  }}
-                  title={`${isApplyingOutputBuffer ? "Applying" : "Output buffer"} ${outputBufferMs}ms. ${outputBufferMs <= 5 ? "1ms" : "5ms"} steps. Click to reset.`}
-                  aria-label="Adjust output buffer"
-                  disabled={locked}
-                >
-                  <div className="corner-gain-wheel-drum" aria-hidden="true" style={{ backgroundPositionY: `${outputBufferWheelOffsetPx}px` }} />
-                  <span className="buffer-readout buffer-readout--compact" aria-hidden="true">
-                    <span className="buffer-readout-label">OUT</span>
-                    <span className="buffer-readout-value">{`${outputBufferMs}ms`}</span>
+                    <span className="buffer-readout-label">{highPerformanceMode ? "BUF ⚡" : "BUF"}</span>
+                    <span className="buffer-readout-value">{`${bufferMarginMs}ms`}</span>
                   </span>
                 </button>
                 <div
@@ -4328,7 +4271,17 @@ export default function App() {
                   onClick={handleToggleViewMode}
                   disabled={locked}
                 >
-                  <span aria-hidden="true">⌗</span>
+                  <span aria-hidden="true">≣</span>
+                </button>
+                <button
+                  type="button"
+                  className={`corner-control-btn corner-control-hiperf ${highPerformanceMode ? "active" : ""}`}
+                  onClick={handleToggleHighPerformance}
+                  disabled={!hasNativeBridge || locked || isApplyingHighPerf}
+                  title={highPerfTitle}
+                  aria-label="Toggle high-performance mode"
+                >
+                  <span aria-hidden="true">⚡</span>
                 </button>
                 <button
                   type="button"
@@ -4340,7 +4293,7 @@ export default function App() {
                   aria-label="Toggle all device visibility"
                   disabled={locked}
                 >
-                  <span aria-hidden="true">≣</span>
+                  <span aria-hidden="true">{showAllDevices ? "👁" : "🙈"}</span>
                 </button>
                 <button
                   type="button"

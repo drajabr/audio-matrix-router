@@ -82,6 +82,14 @@ dotnet run --project AudioMatrixRouter
 - Gain is stored per crosspoint and restored from config.
 - Route edits can be locked to prevent accidental changes.
 
+## Latency And Buffering
+
+The corner panel has one buffering knob, **BUF**, and one transport toggle, **⚡**.
+
+- **BUF** is a safety margin in milliseconds (0 to 100). The engine derives every buffer from the real device periods plus this margin: output depth is two render periods plus the margin, and each input's ring target is its capture period plus the master's render period plus the margin. Lower is tighter; raise it if you hear dropouts. Drag or scroll the wheel (1 ms steps below 10 ms, 5 ms above), middle-click to reset. Changing it restarts the audio pipeline.
+- **⚡ High-performance mode** swaps the standard NAudio transport for the app's own WASAPI layer: shared-mode streams at the driver's minimum period (often 2 to 3 ms instead of 10 ms), event-driven loopback capture, "Pro Audio" MMCSS threads, and an output that holds exactly the configured depth. Each mode remembers its own margin (defaults: 20 ms standard, 4 ms high-performance). Drivers that refuse small periods fall back to the system period per device; the tooltips report the periods actually negotiated.
+- The latency readouts are measurements of the live pipeline (capture period, ring queue, output depth plus one period, per-device delay), not an echo of the knob.
+
 ## Startup And Tray Behavior
 
 - Closing the window minimizes to tray by default.
@@ -102,6 +110,7 @@ Saved fields include:
 - Window position/size and start-minimized preference.
 - Selected input and output devices.
 - Active crosspoints and gain values.
+- Buffer margin per mode and the high-performance mode switch (older inputBufferMs/outputBufferMs values are migrated on load).
 - Lock state.
 
 ## CI/CD

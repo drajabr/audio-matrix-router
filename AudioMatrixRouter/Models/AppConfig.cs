@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Diagnostics;
 using System.Text;
 
@@ -61,8 +62,19 @@ public class AppConfig
     public List<DormantRouteConfig> DormantRoutes { get; set; } = [];
     public bool Locked { get; set; }
     public bool StartupAtBoot { get; set; }
-    public int InputBufferMs { get; set; } = 40;
-    public int OutputBufferMs { get; set; } = 40;
+
+    /// <summary>Safety margin (ms) added on top of the device periods in standard mode.</summary>
+    public int? BufferMarginMs { get; set; }
+    /// <summary>Safety margin (ms) used while high-performance mode is active.</summary>
+    public int? HighPerfBufferMarginMs { get; set; }
+    /// <summary>Own low-latency WASAPI transport (IAudioClient3 minimum period, MMCSS) instead of NAudio.</summary>
+    public bool HighPerformanceMode { get; set; }
+
+    // Legacy (pre single-knob) fields: read for migration only, never written back.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? InputBufferMs { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? OutputBufferMs { get; set; }
     public string InputMasterDeviceId { get; set; } = "";
     public string OutputMasterDeviceId { get; set; } = "";
     public string InputDeviceMode { get; set; } = "both";
@@ -82,6 +94,30 @@ public class AppConfig
     /// installs): Save() swallowed the exception and the user's routes/devices vanished
     /// on the next launch. %APPDATA% is always writable for the current user.
     /// </summary>
+    /// <summary>
+    /// Standard-mode margin, migrating old configs: the previous OUT knob held the render
+    /// buffer (2 × 10 ms period + margin), so margin = OUT − 20.
+    /// </summary>
+    public int ResolveStandardMarginMs()
+    {
+        if (BufferMarginMs.HasValue)
+        {
+            return Math.Clamp(BufferMarginMs.Value, Audio.AudioEngine.MarginMinMs, Audio.AudioEngine.MarginMaxMs);
+        }
+        if (OutputBufferMs.HasValue && OutputBufferMs.Value > 0)
+        {
+            return Math.Clamp(OutputBufferMs.Value - 20, Audio.AudioEngine.MarginMinMs, Audio.AudioEngine.MarginMaxMs);
+        }
+        return Audio.AudioEngine.DefaultStandardMarginMs;
+    }
+
+    public int ResolveHighPerfMarginMs()
+    {
+        return HighPerfBufferMarginMs.HasValue
+            ? Math.Clamp(HighPerfBufferMarginMs.Value, Audio.AudioEngine.MarginMinMs, Audio.AudioEngine.MarginMaxMs)
+            : Audio.AudioEngine.DefaultHighPerfMarginMs;
+    }
+
     public static string GetConfigPath()
     {
         var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
@@ -172,8 +208,9 @@ public class AppConfig
             Window = new WindowConfig { X = winX, Y = winY, Width = winW, Height = winH, StartMinimized = startMinimized },
             Locked = locked,
             StartupAtBoot = startupAtBoot,
-            InputBufferMs = engine.InputBufferMs,
-            OutputBufferMs = engine.OutputBufferMs,
+            BufferMarginMs = engine.StandardBufferMarginMs,
+            HighPerfBufferMarginMs = engine.HighPerfBufferMarginMs,
+            HighPerformanceMode = engine.HighPerformanceMode,
             InputMasterDeviceId = engine.GetInputMasterDevice()?.Info.Id ?? "",
             OutputMasterDeviceId = engine.GetOutputMasterDevice()?.Info.Id ?? "",
             InputDeviceMode = inputDeviceMode is "input" or "loopback" or "both" ? inputDeviceMode : "both",
@@ -298,8 +335,7 @@ public class AppConfig
 
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
-        engine.SetInputBufferMs(InputBufferMs > 0 ? InputBufferMs : 40);
-        engine.SetOutputBufferMs(OutputBufferMs > 0 ? OutputBufferMs : 40);
+        engine.ConfigureBuffering(ResolveStandardMarginMs(), ResolveHighPerfMarginMs(), HighPerformanceMode);
 
         // Honor the user's configured active device lists exactly as saved, in saved order.
         // If a saved device is unavailable on this machine right now, skip it at runtime,

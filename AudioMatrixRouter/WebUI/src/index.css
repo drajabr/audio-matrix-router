@@ -697,14 +697,14 @@ textarea {
   font-size: var(--font-size-xs);
 }
 
-.corner-control-buffer-left {
-  grid-column: 2;
+.corner-control-buffer {
+  grid-column: 2 / span 2;
   grid-row: 1;
 }
 
-.corner-control-buffer-right {
-  grid-column: 3;
-  grid-row: 1;
+.corner-control-hiperf {
+  grid-column: 4;
+  grid-row: 3;
 }
 
 .corner-control-global-mute {

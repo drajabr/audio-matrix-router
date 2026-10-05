@@ -30,8 +30,10 @@ namespace AudioMatrixRouter.Audio;
 ///     integrator honest at the caps.
 ///
 ///   * The only barrier is the START barrier: outputs emit silence until every consumer's
-///     ring fill reaches its target, then all timelines zero together and playback starts
-///     phase-aligned. Underruns afterwards do NOT re-arm a global hold (the old global
+///     rings have reached their per-input fill targets (fill surplus >= 0), then all
+///     timelines zero together and playback starts phase-aligned. Because the barrier
+///     releases exactly at the ASRC fill targets, steady-state latency is reached at
+///     release instead of the servo crawling to it afterwards. Underruns afterwards do NOT re-arm a global hold (the old global
 ///     refill hold silenced every healthy output and re-anchored phase, amplifying a
 ///     single device's hiccup into a system-wide desync event).
 /// </summary>
@@ -55,8 +57,6 @@ public sealed class OutputSyncCoordinator
     private readonly Dictionary<string, OutputState> _states = new(StringComparer.Ordinal);
     private string _masterConsumerId;
     private int _engineSampleRate;
-    private int _baseMasterTargetFrames;
-    private int _maxMasterTargetFrames;
     private bool _startBarrierActive = true;
     private long _totalUnderruns;
     private static readonly double s_ticksPerSecond = Stopwatch.Frequency;
@@ -64,8 +64,8 @@ public sealed class OutputSyncCoordinator
     private sealed class OutputState
     {
         public int DeviceSampleRate;
-        public int HoldTargetFrames;        // engine frames of ring fill required to release barrier
-        public int BufferedFrames = -1;     // last reported ring fill (engine frames); -1 = no report yet
+        public int FillSurplusFrames;       // min over sources of (ring fill - that input's target), engine frames
+        public bool HasFillReport;          // false until the render thread has reported once
         public bool HasActiveRoutes;
         public long FramesRendered;         // device frames pushed to WASAPI
         public double TimelinePos;          // engine-rate source frames consumed since barrier release
@@ -81,12 +81,10 @@ public sealed class OutputSyncCoordinator
         public long UnderrunsSinceStart;
     }
 
-    public OutputSyncCoordinator(string masterConsumerId, int engineSampleRate, int baseMasterTargetFrames, int maxMasterTargetFrames)
+    public OutputSyncCoordinator(string masterConsumerId, int engineSampleRate)
     {
         _masterConsumerId = masterConsumerId ?? string.Empty;
         _engineSampleRate = Math.Max(1, engineSampleRate);
-        _baseMasterTargetFrames = Math.Max(1, baseMasterTargetFrames);
-        _maxMasterTargetFrames = Math.Max(_baseMasterTargetFrames, maxMasterTargetFrames);
     }
 
     public string GetMasterConsumerId() => _masterConsumerId;
@@ -100,16 +98,7 @@ public sealed class OutputSyncCoordinator
         }
     }
 
-    public void SetMasterBufferTarget(int baseMasterTargetFrames, int maxMasterTargetFrames)
-    {
-        lock (_lock)
-        {
-            _baseMasterTargetFrames = Math.Max(1, baseMasterTargetFrames);
-            _maxMasterTargetFrames = Math.Max(_baseMasterTargetFrames, maxMasterTargetFrames);
-        }
-    }
-
-    public void RegisterConsumer(string consumerId, int deviceSampleRate, int outputBufferMs)
+    public void RegisterConsumer(string consumerId, int deviceSampleRate)
     {
         lock (_lock)
         {
@@ -119,13 +108,8 @@ public sealed class OutputSyncCoordinator
                 _states[consumerId] = s;
             }
             if (deviceSampleRate > 0) s.DeviceSampleRate = deviceSampleRate;
-            s.HoldTargetFrames = Math.Max(1,
-                (int)Math.Round(_engineSampleRate * (Math.Max(1, outputBufferMs) / 1000.0)));
         }
     }
-
-    public void UpdateConsumerTiming(string consumerId, int deviceSampleRate, int outputBufferMs)
-        => RegisterConsumer(consumerId, deviceSampleRate, outputBufferMs);
 
     public void RemoveConsumer(string consumerId)
     {
@@ -155,7 +139,8 @@ public sealed class OutputSyncCoordinator
     {
         foreach (var s in _states.Values)
         {
-            s.BufferedFrames = -1;
+            s.FillSurplusFrames = 0;
+            s.HasFillReport = false;
             s.TimelinePos = 0;
             s.LastReportTicks = 0;
             s.SmoothedErrorFrames = 0;
@@ -172,8 +157,9 @@ public sealed class OutputSyncCoordinator
 
     /// <summary>
     /// True while outputs should emit silence waiting for the start prefill. Releases when
-    /// every consumer that has reported a fill measurement meets its target; at release all
-    /// timelines are zeroed together so phase zero == identical ring cursors.
+    /// every consumer that has reported a fill measurement has non-negative fill surplus
+    /// (all of its rings at or above their targets); at release all timelines are zeroed
+    /// together so phase zero == identical ring cursors.
     /// </summary>
     public bool ShouldHoldForGlobalRefill()
     {
@@ -185,9 +171,9 @@ public sealed class OutputSyncCoordinator
             bool anyReported = false;
             foreach (var s in _states.Values)
             {
-                if (s.BufferedFrames < 0) continue; // render thread not alive yet — don't block on it
+                if (!s.HasFillReport) continue; // render thread not alive yet — don't block on it
                 anyReported = true;
-                if (s.BufferedFrames < Math.Max(1, s.HoldTargetFrames)) return true;
+                if (s.FillSurplusFrames < 0) return true;
             }
             if (!anyReported) return true;
 
@@ -206,13 +192,18 @@ public sealed class OutputSyncCoordinator
         }
     }
 
-    public void ReportBufferedFrames(string consumerId, int bufferedFrames)
+    /// <summary>
+    /// Reports min over this consumer's live sources of (ring fill - that input's fill
+    /// target). Negative while any ring is still below target.
+    /// </summary>
+    public void ReportFillSurplusFrames(string consumerId, int surplusFrames)
     {
         lock (_lock)
         {
             if (_states.TryGetValue(consumerId, out var s))
             {
-                s.BufferedFrames = Math.Max(0, bufferedFrames);
+                s.FillSurplusFrames = surplusFrames;
+                s.HasFillReport = true;
             }
         }
     }
@@ -400,8 +391,8 @@ public sealed class OutputSyncCoordinator
             if (consumerId == _masterConsumerId) return 0;
             if (!_states.TryGetValue(consumerId, out var s)) return 0;
             if (!_states.TryGetValue(_masterConsumerId, out var m)) return 0;
-            if (s.BufferedFrames < 0 || m.BufferedFrames < 0) return 0;
-            return s.BufferedFrames - m.BufferedFrames;
+            if (!s.HasFillReport || !m.HasFillReport) return 0;
+            return s.FillSurplusFrames - m.FillSurplusFrames;
         }
     }
 
@@ -469,12 +460,12 @@ public class MixingSampleProvider : ISampleProvider
     private double _currentTrimPpm; // trim applied this block (updated post-block from coordinator)
     private int _delayWriteIndex;
     private int _deviceDelayMs;
-    private int _outputBufferMs;
     private long _underrunCount;
     private readonly float[] _peakLevels;
     private readonly ConcurrentDictionary<string, long> _inputSyncDiscardedFramesByDevice = new(StringComparer.Ordinal);
 
-    public record struct CaptureSource(string DeviceId, RingBuffer Buffer, int GlobalChannelOffset, int Channels, bool IsMasterInput);
+    /// <param name="FillTargetFrames">Ring fill (engine frames) this input's ASRC servo holds; the start barrier releases when every ring is at or above its target.</param>
+    public record struct CaptureSource(string DeviceId, RingBuffer Buffer, int GlobalChannelOffset, int Channels, bool IsMasterInput, int FillTargetFrames);
 
     public MixingSampleProvider(
         RoutingMatrix matrix,
@@ -483,7 +474,6 @@ public class MixingSampleProvider : ISampleProvider
         int outputChannels,
         int sampleRate,
         int outputDelayMs,
-        int outputBufferMs,
         string consumerId,
         OutputSyncCoordinator syncCoordinator)
     {
@@ -499,9 +489,8 @@ public class MixingSampleProvider : ISampleProvider
         _waveFormat = WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, outputChannels);
         _peakLevels = new float[outputChannels];
         _deviceDelayMs = Math.Clamp(outputDelayMs, 0, 5000);
-        _outputBufferMs = Math.Clamp(outputBufferMs, 10, 200);
         _pendingSkipPerSource = new long[Math.Max(1, sources.Count)];
-        _syncCoordinator.RegisterConsumer(_consumerId, _sampleRate, _outputBufferMs);
+        _syncCoordinator.RegisterConsumer(_consumerId, _sampleRate);
         // Pin this consumer's cursor on every ring NOW (before captures produce data) so
         // all consumers share an identical zero reference.
         foreach (var src in _sources)
@@ -566,16 +555,6 @@ public class MixingSampleProvider : ISampleProvider
         RebuildDelayBuffer();
     }
 
-    public void SetOutputBufferMs(int bufferMs)
-    {
-        int clamped = Math.Clamp(bufferMs, 10, 200);
-        if (_outputBufferMs != clamped)
-        {
-            _outputBufferMs = clamped;
-            _syncCoordinator.UpdateConsumerTiming(_consumerId, _sampleRate, _outputBufferMs);
-        }
-    }
-
     /// <summary>Kept for API compatibility; reference timing is the output master.</summary>
     public void SetInputMasterDevice(string deviceId)
     {
@@ -604,7 +583,7 @@ public class MixingSampleProvider : ISampleProvider
         float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
 
         _syncCoordinator.ReportConsumerRouteActivity(_consumerId, HasAnyActiveRouteForThisOutputCore(front, matOutCh));
-        _syncCoordinator.ReportBufferedFrames(_consumerId, GetBufferedFramesForConsumer());
+        _syncCoordinator.ReportFillSurplusFrames(_consumerId, GetFillSurplusFramesForConsumer());
 
         // Start barrier only: prefill all outputs, release together, timelines zero together.
         if (_syncCoordinator.ShouldHoldForGlobalRefill())
@@ -859,23 +838,28 @@ public class MixingSampleProvider : ISampleProvider
         _syncCoordinator.RemoveConsumer(_consumerId);
     }
 
-    private int GetBufferedFramesForConsumer()
+    /// <summary>
+    /// Min over live sources of (available - that source's fill target). Negative while
+    /// any producing ring is still filling toward its target; a consumer with no producing
+    /// rings yet reports -1 so the barrier keeps holding until captures deliver.
+    /// </summary>
+    private int GetFillSurplusFramesForConsumer()
     {
-        if (_sources.Count == 0) return 0;
+        if (_sources.Count == 0) return -1;
         int min = int.MaxValue;
         bool anyLive = false;
         foreach (var source in _sources)
         {
             // Rings whose producer has never written (capture failed to start, device
             // dead on arrival) must not hold the start barrier hostage or drag the fill
-            // measurement to zero forever. Once a ring has produced at least one frame
+            // measurement down forever. Once a ring has produced at least one frame
             // it participates normally.
             if (source.Buffer.GetWritePositionFrames() == 0) continue;
             anyLive = true;
-            int available = source.Buffer.GetAvailableFrames(_consumerId);
-            if (available < min) min = available;
+            int surplus = source.Buffer.GetAvailableFrames(_consumerId) - Math.Max(1, source.FillTargetFrames);
+            if (surplus < min) min = surplus;
         }
-        if (!anyLive || min == int.MaxValue) return 0;
+        if (!anyLive || min == int.MaxValue) return -1;
         return min;
     }
 
