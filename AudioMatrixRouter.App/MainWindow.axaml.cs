@@ -729,6 +729,7 @@ public partial class MainWindow : Window
         LockBtn.Classes.Set("active", _snapshot.Locked);
         LockBtn.Content = _snapshot.Locked ? "🔒" : "🔓";
         ShowAllBtn.Classes.Set("active", _showAll);
+        ToolTip.SetTip(ShowAllBtn, _showAll ? "Hide unconfigured devices" : "Show all discovered devices");
         ViewBtn.Classes.Set("active", _viewMode == "channel");
         ToolTip.SetTip(ViewBtn, _viewMode == "channel" ? "Switch to Device View" : "Switch to Channel View");
         MuteBtn.Classes.Set("danger", _mutedAll);

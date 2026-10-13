@@ -407,11 +407,11 @@
             <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
                     Content="⇄" FontSize="{DynamicResource FsMd}" />
 
-            <!-- row 4: show-all · transient mute (wide) · view toggle -->
-            <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="⌗" />
+            <!-- row 4: show-all (eye) · transient mute (wide) · view toggle (grid: device blocks ↔ split channels) -->
+            <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="👁" />
             <Button Name="MuteBtn" Classes="key" Grid.Row="3" Grid.Column="1"
                     Grid.ColumnSpan="2" Content="🔊" FontSize="{DynamicResource FsMd}" />
-            <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⥮" />
+            <Button Name="ViewBtn" Classes="key" Grid.Row="3" Grid.Column="3" Content="⌗" />
           </Grid>
         </Border>
 
