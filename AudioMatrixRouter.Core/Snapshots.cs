@@ -27,6 +27,8 @@ public sealed class UiSnapshot
     public int OutputBufferMs { get; set; }
     /// <summary>The user's exclusive-mode toggle (requested; see MetricsSnapshot.ExclusiveActive for effect).</summary>
     public bool ExclusiveMode { get; set; }
+    /// <summary>The user's raw-stream (APO bypass) toggle.</summary>
+    public bool RawMode { get; set; }
     public string InputDeviceMode { get; set; } = "both";
     public List<DeviceSnapshot> Inputs { get; set; } = [];
     public List<DeviceSnapshot> Outputs { get; set; } = [];
@@ -52,6 +54,8 @@ public sealed class DeviceMetrics
     public long PostRecoveryUnderruns { get; set; }
     /// <summary>Outputs: ring re-anchors forced by a live input staying starved.</summary>
     public long StarvationReanchors { get; set; }
+    /// <summary>This endpoint's stream bypasses its APO chain.</summary>
+    public bool Raw { get; set; }
     public double? LatencyMs { get; set; }
     public double? SyncErrorMs { get; set; }
     public double? AppliedPpm { get; set; }
@@ -83,6 +87,8 @@ public sealed class MetricsSnapshot
     public bool ExclusiveActive { get; set; }
     /// <summary>Why exclusive mode is requested but not in effect (empty otherwise).</summary>
     public string ExclusiveBlockedReason { get; set; } = "";
+    /// <summary>True while any endpoint of the running session is a raw stream.</summary>
+    public bool RawActive { get; set; }
     public List<DeviceMetrics> Inputs { get; set; } = [];
     public List<DeviceMetrics> Outputs { get; set; } = [];
     public List<RouteLatency> RouteLatencies { get; set; } = [];

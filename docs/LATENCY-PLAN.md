@@ -4,7 +4,26 @@
 the health tick), L2 event-driven loopback with keep-alive (`WasapiCaptureClient.CaptureMode.EventLoopback`),
 L3 AUTO decay memory, L4 per-input ring targets (`RingBuffer.FillTargetFrames`, fill-surplus barrier), and the
 L5 ⚡ exclusive toggle (`AppConfig.ExclusiveMode`, rungs R0/C0 in the WASAPI clients, all-or-nothing across
-outputs). Phase D (raw mode, MMCSS critical, mixed exclusive/shared outputs) remains open.
+outputs). Phase D: L6 raw streams shipped as the RAW key (`AppConfig.RawStreams`, per-endpoint refusal
+logged), L7 MMCSS critical priority is on for every audio thread. Mixed exclusive/shared outputs are resolved
+as a non-lever: outputs must keep equal FIFO depth to stay aligned, so compensating an exclusive output to a
+shared one's depth returns the shared total; and the ring gulp is sized for the worst (shared) output anyway.
+The all-or-nothing rule therefore costs nothing, and the toggle's tooltip names the output that blocks it.
+
+**Field result on the real device set (VB-Cable mic + VB-Cable loopback → three NVIDIA HDMI sinks), v0.6.1:**
+
+| Run | Exclusive total | Underruns |
+|---|---|---|
+| Engine only (harness), 24 s | 46 ms | 0 |
+| App hidden in the tray, 75 s | 46 to 49 ms | 0 raises |
+| App window visible, GPU rendering | climbed to the 40 ms headroom cap and the safety tier | 96 → 2060 per 10 s |
+| App window visible, software rendering, 2-period margin | 49 ms floor, settled at ~64 after one transient burst | 704 once, then 7, then quiet |
+
+The window's GPU rendering was the culprit: NVIDIA driver activity jitters every audio timer on the machine
+(HDMI audio sits on the GPU; the virtual cable's engine timer degraded from 5 to 13 ms gaps the moment the window
+was visible). Neither a 10 Hz metrics poll, 67 gen0 collections, nor full-core CPU load reproduced it in the
+harness. The app therefore renders in software by default (`AppConfig.GpuRendering` restores GPU rendering),
+the exclusive ring margin is two render periods, and the AUTO loop steps by half a cadence.
 
 Measured on the development machine after implementation (Intel mic + VB-Cable loopback → Realtek, AUTO,
 14 s runs, app process posture):

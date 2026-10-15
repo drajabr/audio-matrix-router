@@ -252,6 +252,38 @@ internal static class WasapiActivation
 }
 
 /// <summary>
+/// AUDCLNT_STREAMOPTIONS_RAW via IAudioClient2::SetClientProperties, before Initialize:
+/// the stream bypasses the endpoint's APO chain (enhancements, virtual surround,
+/// loudness) except always-on processing. Matters only where such APOs sit in the
+/// path; refused on endpoints that do not support raw, which is not an error.
+/// </summary>
+internal static class WasapiRaw
+{
+    private const int AUDCLNT_STREAMOPTIONS_RAW = 0x1;
+
+    public static int Apply(IAudioClient3 client3)
+    {
+        IntPtr props = Marshal.AllocHGlobal(16);
+        try
+        {
+            Marshal.WriteInt32(props, 0, 16);   // cbSize
+            Marshal.WriteInt32(props, 4, 0);    // bIsOffload = FALSE
+            Marshal.WriteInt32(props, 8, 0);    // eCategory = AudioCategory_Other
+            Marshal.WriteInt32(props, 12, AUDCLNT_STREAMOPTIONS_RAW);
+            return client3.SetClientProperties(props);
+        }
+        catch (COMException ex)
+        {
+            return ex.HResult;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(props);
+        }
+    }
+}
+
+/// <summary>
 /// Exclusive-mode negotiation shared by the render and capture clients: pick the
 /// first PCM format the driver accepts exactly, then Initialize event-driven with
 /// buffer == period at the device's minimum period (or an aligned period handed

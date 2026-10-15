@@ -25,7 +25,10 @@ internal static class MmcssHelper
         try
         {
             uint taskIndex = 0;
-            _ = AvSetMmThreadCharacteristics("Pro Audio", ref taskIndex);
+            var handle = AvSetMmThreadCharacteristics("Pro Audio", ref taskIndex);
+            // CRITICAL within the Pro Audio class: the scheduling slot ASIO drivers use.
+            // At 2-3 ms exclusive periods a single pre-emption is most of a ring target.
+            if (handle != IntPtr.Zero) _ = AvSetMmThreadPriority(handle, AVRT_PRIORITY_CRITICAL);
         }
         catch
         {
@@ -33,8 +36,14 @@ internal static class MmcssHelper
         }
     }
 
+    private const int AVRT_PRIORITY_CRITICAL = 2;
+
     [DllImport("avrt.dll", CharSet = CharSet.Unicode, EntryPoint = "AvSetMmThreadCharacteristicsW")]
     private static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref uint taskIndex);
+
+    [DllImport("avrt.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AvSetMmThreadPriority(IntPtr handle, int priority);
 }
 
 /// <summary>

@@ -113,10 +113,10 @@ public static class LatencyBudget
         }
 
         // Exclusive: the FIFO holds exactly one period, so the jitter margin has to live
-        // in the ring (as does the safety tier). One render period of margin: at 3 ms
-        // gulps a 2 ms scheduling hiccup is most of the fill, and the field run showed
-        // a 2 ms margin creeping into underruns within seconds.
-        int safetyInRing = i.ExclusiveRender ? safety * period + period : 0;
+        // in the ring (as does the safety tier). Two render periods of margin: at 3 ms
+        // gulps one period left ~3 ms of slack against a late capture thread, and the
+        // app with its window open still booked a dozen underruns per 10 s.
+        int safetyInRing = i.ExclusiveRender ? (safety + 2) * period : 0;
         int ringFloor = padding + cadence + headroom + safetyInRing;
         int ringTarget = auto ? ringFloor : Math.Max(ringFloor, knob - cadence - renderLatency);
         ringTarget = Math.Min(ringTarget, MaxRingTargetMs);
@@ -139,7 +139,7 @@ public static class LatencyBudget
         int cadence = CadenceMs(inputCadenceMs);
         int headroom = Math.Clamp(i.AutoHeadroomMs, 0, MaxAutoHeadroomMs);
         int safety = Math.Clamp(i.SafetyPeriods, 0, 2);
-        int safetyInRing = i.ExclusiveRender ? (safety + 1) * PeriodMs(i.RenderPeriodMs) : 0;
+        int safetyInRing = i.ExclusiveRender ? (safety + 2) * PeriodMs(i.RenderPeriodMs) : 0;
         int floor = budget.RenderPaddingMs + cadence + headroom + safetyInRing;
         int knob = Math.Clamp(i.KnobMs, AutoKnob, MaxKnobMs);
         int target = budget.IsAuto ? floor : Math.Max(floor, knob - cadence - budget.RenderLatencyMs);

@@ -404,9 +404,11 @@
                                   Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"
                                   PxPerStep="24" Suffix="dB" />
 
-            <!-- row 3: input-mode cycle (icon-only: 🎤 input · 🔊 loopback · ⇄ both) -->
+            <!-- row 3: input-mode cycle (icon-only: 🎤 input · 🔊 loopback · ⇄ both) · raw-stream toggle -->
             <Button Name="InputModeBtn" Classes="key" Grid.Row="2" Grid.Column="0"
                     Content="⇄" FontSize="{DynamicResource FsMd}" />
+            <Button Name="RawBtn" Classes="key" Grid.Row="2" Grid.Column="3"
+                    Content="RAW" FontSize="{DynamicResource FsXs}" />
 
             <!-- row 4: show-all (eye) · transient mute (wide) · view toggle (grid: device blocks ↔ split channels) -->
             <Button Name="ShowAllBtn" Classes="key" Grid.Row="3" Grid.Column="0" Content="👁" />

@@ -43,6 +43,7 @@ public partial class MainWindow : Window
     private readonly DispatcherTimer _uiHeartbeat;
     private string _latencyCaption = "LATENCY";
     private string _exclusiveTip = "";
+    private string _rawTip = "";
     private readonly DispatcherTimer _gainApplyTimer;
     private readonly DispatcherTimer _bufferApplyTimer;
     private bool _showAll;
@@ -705,6 +706,14 @@ public partial class MainWindow : Window
             RefreshSnapshotAndRebuild();
         };
 
+        RawBtn.Click += (_, _) =>
+        {
+            if (_snapshot.Locked) return;
+            try { _controller.SetRawMode(!_snapshot.RawMode); }
+            catch (Exception ex) { ShowBanner(ex.Message); }
+            RefreshSnapshotAndRebuild();
+        };
+
         MuteBtn.Click += (_, _) =>
         {
             // Transient: deliberately NOT persisted and works while locked.
@@ -743,6 +752,8 @@ public partial class MainWindow : Window
         ToolTip.SetTip(ViewBtn, _viewMode == "channel" ? "Switch to Device View" : "Switch to Channel View");
         ExclBtn.Classes.Set("active", _snapshot.ExclusiveMode);
         UpdateExclusiveTooltip(null);
+        RawBtn.Classes.Set("active", _snapshot.RawMode);
+        UpdateRawTooltip(null);
         MuteBtn.Classes.Set("danger", _mutedAll);
         // speaker-with-wave ↔ muted speaker: near-identical glyph widths, no jump
         MuteBtn.Content = _mutedAll ? "🔇" : "🔊";
@@ -1631,12 +1642,43 @@ public partial class MainWindow : Window
         ToolTip.SetTip(ExclBtn, tip);
     }
 
+    private void UpdateRawTooltip(MetricsSnapshot? metrics)
+    {
+        string tip;
+        if (!_snapshot.RawMode)
+        {
+            tip = "Processed streams: the endpoints' audio enhancements (APOs) stay in the path. Click for RAW " +
+                  "streams, which bypass enhancements such as loudness equalisation or virtual surround; " +
+                  "lowers latency only where such processing adds delay. Exclusive streams are always raw.";
+        }
+        else if (metrics is { Running: true, RawActive: true })
+        {
+            tip = "RAW streams ON: endpoint enhancements are bypassed on every endpoint that allowed it. Click for processed streams.";
+        }
+        else if (metrics is { Running: true, ExclusiveActive: true })
+        {
+            tip = "RAW requested; exclusive streams already bypass all processing. Click to turn RAW off.";
+        }
+        else if (metrics is { Running: true })
+        {
+            tip = "RAW requested but refused by every endpoint (no raw support, or the legacy backend). Click to turn RAW off.";
+        }
+        else
+        {
+            tip = "RAW streams requested (applies when the engine runs). Click to turn RAW off.";
+        }
+        if (tip == _rawTip) return;
+        _rawTip = tip;
+        ToolTip.SetTip(RawBtn, tip);
+    }
+
     private void OnMetricsTick()
     {
         MetricsSnapshot metrics;
         try { metrics = _controller.GetMetrics(); }
         catch { return; }
         UpdateExclusiveTooltip(metrics);
+        UpdateRawTooltip(metrics);
 
         // Peaks into the model arrays: auto-scale per device, then the pow-0.72 display
         // curve (App.jsx autoScaleLevels + shapeMeterLevel).

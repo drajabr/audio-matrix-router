@@ -190,11 +190,20 @@ internal static class Program
             ? "[Host] power throttling disabled (execution speed + timer resolution)"
             : "[Host] power throttling opt-out not available on this OS");
 
+        var bootConfig = AppConfig.Load();
         if (!args.Any(a => string.Equals(a, "--no-watchdog", StringComparison.OrdinalIgnoreCase))
-            && (AppConfig.Load()?.KeepAlive ?? true))
+            && (bootConfig?.KeepAlive ?? true))
         {
             Watchdog.Spawn();
         }
+
+        // Rendering backend. GPU rendering of the window drives the NVIDIA display
+        // driver, and that driver's DPC activity jitters every audio timer on the box
+        // (HDMI audio sits on the GPU; the virtual cable's engine timer and the 3 ms
+        // exclusive streams all degraded the moment the window was visible). Software
+        // rendering costs nothing visible for this UI and keeps the GPU idle.
+        s_gpuRendering = bootConfig?.GpuRendering ?? false;
+        EngineLog.Write(s_gpuRendering ? "[Host] GPU rendering (config gpuRendering=true)" : "[Host] software rendering");
 
         try
         {
@@ -243,8 +252,16 @@ internal static class Program
         string.Equals(arg, "--startup", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(arg, "--minimized", StringComparison.OrdinalIgnoreCase));
 
+    private static bool s_gpuRendering;
+
     public static AppBuilder BuildAvaloniaApp() => AppBuilder.Configure<App>()
         .UsePlatformDetect()
+        .With(new Win32PlatformOptions
+        {
+            RenderingMode = s_gpuRendering
+                ? new[] { Win32RenderingMode.AngleEgl, Win32RenderingMode.Software }
+                : new[] { Win32RenderingMode.Software },
+        })
         .WithInterFont()
         .LogToTrace();
 }

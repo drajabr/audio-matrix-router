@@ -133,6 +133,13 @@ Saved fields include:
     only level). An output that feeds a loopback input stays shared, and exclusive is all-or-nothing across
     outputs so they keep equal FIFO depth; the key's tooltip says why it is not in effect when it is not.
     Requires "Allow applications to take exclusive control" in the device's Sound settings (the Windows default).
+  - RAW (off by default): shared streams ask the endpoint to bypass its audio enhancements (APOs such as
+    loudness equalisation or virtual surround). It lowers latency only where such processing adds delay and
+    changes the sound wherever enhancements were on; endpoints that refuse raw keep their processed stream.
+    Exclusive streams are raw by nature. The audio threads run at MMCSS "Pro Audio" critical priority.
+  - The window renders in software. GPU rendering drives the NVIDIA display driver, whose activity jitters every
+    audio timer on the machine (HDMI audio lives on the GPU) and broke 3 ms exclusive streams whenever the window
+    was visible. `"gpuRendering": true` in config.json restores GPU rendering.
 
 - Underruns counting up:
 	- Leave LATENCY on AUTO and let the headroom loop settle, or raise it manually. Check the log for

@@ -33,6 +33,10 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
     private readonly EndpointTier _requestedTier;
     private readonly string _label;
     private readonly bool _exclusiveWanted;
+    private readonly bool _rawWanted;
+    private bool _rawDisabled;
+    /// <summary>True when the shared stream was opened with AUDCLNT_STREAMOPTIONS_RAW.</summary>
+    public bool RawApplied { get; private set; }
     private bool _exclusive;
     private int _exclusiveAttempts;
     private long _exclusiveAlignedPeriod;
@@ -93,13 +97,14 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
     public event Action<int>? Faulted;
 
     public WasapiRenderClient(string endpointId, int requestedBufferMs, EndpointTier requestedTier, string label,
-        bool exclusiveWanted = false)
+        bool exclusiveWanted = false, bool rawWanted = false)
     {
         _endpointId = endpointId;
         _requestedBufferMs = Math.Clamp(requestedBufferMs, 2, 500);
         _requestedTier = requestedTier;
         _label = label;
         _exclusiveWanted = exclusiveWanted;
+        _rawWanted = rawWanted;
     }
 
     /// <summary>Spins up the audio thread, performs activation + the init ladder ON
@@ -496,6 +501,19 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                     continue; // shared ladder on a fresh client
                 }
                 int sharedAttempt = attempt - _exclusiveAttempts;
+
+                // Raw (APO bypass) is a stream property set before Initialize on the fresh
+                // client of every shared rung; a refusal is final for this endpoint.
+                if (_rawWanted && !_rawDisabled && client3 is not null)
+                {
+                    int rhr = WasapiRaw.Apply(client3);
+                    if (rhr == WasapiConstants.S_OK) RawApplied = true;
+                    else
+                    {
+                        _rawDisabled = true;
+                        WasapiDiagnostics.Log($"[WASAPI] out {_label}: raw mode refused (0x{rhr:X8}) — processed stream");
+                    }
+                }
 
                 bool smallPeriodWanted = _requestedTier is EndpointTier.MinPeriod or EndpointTier.DoublePeriod
                                          && client3 is not null

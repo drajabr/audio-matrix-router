@@ -32,6 +32,8 @@ public class ActiveDevice
     public string ExclusiveRefusal { get; set; } = string.Empty;
     /// <summary>Set when this capture could not sustain its exclusive period (session).</summary>
     public bool ExclusiveCaptureDemoted { get; set; }
+    /// <summary>The endpoint's shared stream bypasses its APO chain (raw mode).</summary>
+    public bool RawApplied { get; set; }
     /// <summary>True until the first measured cadence replaces the start-up prior.</summary>
     public bool CadenceIsPrior { get; set; }
     // Read back from WASAPI after Initialize (0 = read-back unavailable): the REAL
@@ -164,6 +166,25 @@ public class AudioEngine : IDisposable
     private bool _exclusiveRenderActive;   // every started output runs exclusive (budget branch)
     private string? _pendingExclusiveBlock; // reason carried into the shared re-start
 
+    // ===== raw-mode streams (opt-in) =====
+    // AUDCLNT_STREAMOPTIONS_RAW skips the endpoint's APO chain (enhancements, virtual
+    // surround, loudness equalisation). Latency changes only where such APOs add
+    // delay; the sound changes wherever enhancements were on. Shared rungs only.
+    private bool _rawMode;
+    public bool RawMode => _rawMode;
+    /// <summary>True while any started endpoint of the running session is a raw stream.</summary>
+    public bool RawActive => _running && (_inputDevices.Any(d => d.RawApplied) || _outputDevices.Any(d => d.RawApplied));
+
+    public bool SetRawMode(bool enabled)
+    {
+        if (_rawMode == enabled) return true;
+        _rawMode = enabled;
+        Wasapi.WasapiDiagnostics.Log($"[Engine] raw mode {(enabled ? "ON" : "off")}");
+        if (_running) FullRestart();
+        StateChanged?.Invoke();
+        return true;
+    }
+
     public bool ExclusiveMode => _exclusiveMode;
     /// <summary>True while the running session has every output on an exclusive stream.</summary>
     public bool ExclusiveActive => _running && _exclusiveRenderActive;
@@ -294,7 +315,11 @@ public class AudioEngine : IDisposable
 
         long now = Environment.TickCount64;
         if (windowSum > 0) _lastUnderrunSeenAt = now;
-        int step = (int)Math.Ceiling(_worstCaptureCadenceMs > 0 ? _worstCaptureCadenceMs : 10);
+        // Step = half the worst cadence (min 2 ms, max one cadence): a bursty 17 ms cable
+        // used to jump the ring by a full 17 ms on six underruns; half-steps converge
+        // nearer the real floor, and a second step is only ten seconds away if needed.
+        double cadence = _worstCaptureCadenceMs > 0 ? _worstCaptureCadenceMs : 10;
+        int step = (int)Math.Clamp(Math.Ceiling(cadence / 2), 2, Math.Ceiling(cadence));
 
         if (now - _runningSince < AutoStartGraceMs)
         {
@@ -1658,9 +1683,10 @@ public class AudioEngine : IDisposable
             try
             {
                 rc = new Wasapi.WasapiRenderClient(
-                    dev.Info.Id, latencyMs, dev.RequestedRenderTier, dev.Info.Name, exclusiveWanted);
+                    dev.Info.Id, latencyMs, dev.RequestedRenderTier, dev.Info.Name, exclusiveWanted, _rawMode);
                 rc.Init(dev.MixProvider!);
                 AdoptRender(dev, rc, latencyMs);
+                dev.RawApplied = rc is Wasapi.WasapiRenderClient rawRc && rawRc.RawApplied;
                 if (rc is Wasapi.WasapiRenderClient wrcRefusal && exclusiveWanted && !wrcRefusal.IsExclusive)
                     dev.ExclusiveRefusal = string.IsNullOrEmpty(wrcRefusal.ExclusiveRefusal) ? "could not open exclusive" : wrcRefusal.ExclusiveRefusal;
                 return true;
@@ -1682,6 +1708,7 @@ public class AudioEngine : IDisposable
             render = new NAudioRenderEndpoint(mmDevice, latencyMs, dev.Info.SampleRate);
             render.Init(dev.MixProvider!);
             AdoptRender(dev, render, latencyMs);
+            dev.RawApplied = false;
             if (exclusiveWanted) dev.ExclusiveRefusal = "legacy backend (NAudio) cannot open exclusive";
             return true;
         }
@@ -1749,7 +1776,8 @@ public class AudioEngine : IDisposable
                     : Wasapi.WasapiCaptureClient.CaptureMode.EventMic,
                 dev.RequestedCaptureTier,
                 dev.Info.Name,
-                exclusiveWanted);
+                exclusiveWanted,
+                _rawMode);
         }
         dev.Capture = custom ?? new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
             Math.Max(40, _inputBufferMs), dev.Info.SampleRate, dev.Info.Channels);
@@ -1828,6 +1856,7 @@ public class AudioEngine : IDisposable
         dev.RingBuffer.ProducerCadenceMs = dev.CaptureCadenceMs;
         if (dev.Capture is Wasapi.WasapiCaptureClient exclusiveClient && exclusiveWanted && exclusiveClient.Tier != EndpointTier.Exclusive)
             dev.ExclusiveRefusal = string.IsNullOrEmpty(exclusiveClient.ExclusiveRefusal) ? "could not open exclusive" : exclusiveClient.ExclusiveRefusal;
+        dev.RawApplied = dev.Capture is Wasapi.WasapiCaptureClient rawClient && rawClient.RawApplied;
         dev.Capture.Faulted += hr => OnEndpointFaulted(dev.Info.Name, hr);
         dev.TierDiscontinuityBaseline = 0;
         return true;
@@ -2088,7 +2117,7 @@ public class AudioEngine : IDisposable
             $"capture cadence {_worstCaptureCadenceMs:0.##} ms, render period {_worstRenderPeriodMs:0.##} ms, " +
             $"render buffer {_minRealRenderBufferMs} ms (requested {b.RenderBufferRequestMs}), padding {b.RenderPaddingMs} ms, " +
             $"ring target {b.RingTargetMs} ms (floor {b.RingFloorMs}, headroom {_autoHeadroomMs}, safety {_safetyPeriods}), " +
-            $"effective total {b.EffectiveTotalMs} ms (floor {b.FloorTotalMs}), exclusive {(_exclusiveRenderActive ? "ON" : "off")}; " +
+            $"effective total {b.EffectiveTotalMs} ms (floor {b.FloorTotalMs}), exclusive {(_exclusiveRenderActive ? "ON" : "off")}, raw {(_rawMode ? (RawActive ? "ON" : "requested, refused") : "off")}; " +
             string.Join(", ", started.Select(d => $"'{d.Info.Name}' {d.Render?.Tier} buf {d.RealRenderBufferMs} ms period {d.RenderPeriodMs} ms")) +
             "; inputs " + string.Join(", ", _inputDevices.Where(d => d.Capture != null)
                 .Select(d => $"'{d.Info.Name}' {d.Capture?.Tier} cadence {d.EffectiveCadenceMs:0.##} ms ring {d.FillTargetFrames * 1000 / Math.Max(1, _engineSampleRate)} ms")));

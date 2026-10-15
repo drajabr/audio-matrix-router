@@ -33,6 +33,10 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
     private readonly EndpointTier _requestedTier;
     private readonly string _label;
     private readonly bool _exclusiveWanted;
+    private readonly bool _rawWanted;
+    private bool _rawDisabled;
+    /// <summary>True when the shared stream was opened with AUDCLNT_STREAMOPTIONS_RAW.</summary>
+    public bool RawApplied { get; private set; }
     private readonly CadenceTracker _cadence = new();
 
     // Keep-alive render stream for EventLoopback (owned by the capture thread).
@@ -73,13 +77,14 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
     public event Action<int>? Faulted;
 
     public WasapiCaptureClient(string endpointId, CaptureMode mode, EndpointTier requestedTier, string label,
-        bool exclusiveWanted = false)
+        bool exclusiveWanted = false, bool rawWanted = false)
     {
         _endpointId = endpointId;
         _mode = mode;
         _requestedTier = requestedTier;
         _label = label;
         _exclusiveWanted = exclusiveWanted && mode == CaptureMode.EventMic;
+        _rawWanted = rawWanted && mode == CaptureMode.EventMic; // loopback taps the processed mix by definition
     }
 
     /// <summary>Starts the audio thread, which activates + initializes + begins
@@ -409,6 +414,17 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                     continue; // shared ladder on a fresh client
                 }
                 int sharedAttempt = attempt - _exclusiveAttempts;
+
+                if (_rawWanted && !_rawDisabled && client3 is not null)
+                {
+                    int rhr = WasapiRaw.Apply(client3);
+                    if (rhr == WasapiConstants.S_OK) RawApplied = true;
+                    else
+                    {
+                        _rawDisabled = true;
+                        WasapiDiagnostics.Log($"[WASAPI] in {_label}: raw mode refused (0x{rhr:X8}) — processed stream");
+                    }
+                }
 
                 bool smallPeriodWanted = _requestedTier is EndpointTier.MinPeriod or EndpointTier.DoublePeriod
                                          && client3 is not null

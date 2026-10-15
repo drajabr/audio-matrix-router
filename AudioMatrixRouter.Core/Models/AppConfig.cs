@@ -106,6 +106,13 @@ public class AppConfig
     /// driver's minimum period). Other apps cannot use those outputs while routing and
     /// the matrix gain is the only volume control. Off by default.</summary>
     public bool ExclusiveMode { get; set; }
+    /// <summary>Opt-in raw streams (AUDCLNT_STREAMOPTIONS_RAW): bypass the endpoints'
+    /// audio enhancements. Off by default.</summary>
+    public bool RawStreams { get; set; }
+    /// <summary>Render the window on the GPU. Off by default: GPU driver activity
+    /// jitters the audio timers (HDMI audio lives on the GPU), which breaks 3 ms
+    /// exclusive streams while the window is visible. Software rendering is free here.</summary>
+    public bool GpuRendering { get; set; }
     public string UiPreferencesJson { get; set; } = "";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
@@ -236,6 +243,8 @@ public class AppConfig
             KeepSystemAwakeWhileRunning = previousConfig?.KeepSystemAwakeWhileRunning ?? false,
             EngineBackend = engine.Backend,
             ExclusiveMode = engine.ExclusiveMode,
+            RawStreams = engine.RawMode,
+            GpuRendering = previousConfig?.GpuRendering ?? false,
             // Persist the durable preference, else the flag the user's choice set — a
             // master that is currently offline (or parked) must survive the save or it
             // would never be promoted again. Deliberately NOT the runtime master:
@@ -436,6 +445,7 @@ public class AppConfig
     {
         engine.SetBackend(EngineBackend);
         engine.SetExclusiveMode(ExclusiveMode);
+        engine.SetRawMode(RawStreams);
         engine.SetInputBufferMs(InputBufferMs > 0 ? InputBufferMs : 10);
         engine.SetOutputBufferMs(Math.Max(0, OutputBufferMs)); // 0 = AUTO
 

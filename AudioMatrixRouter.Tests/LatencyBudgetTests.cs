@@ -17,14 +17,14 @@ public class LatencyBudgetTests
         var b = LatencyBudget.Compute(new LatencyBudgetInput(0, 3, 3, 3, 0, 0, ExclusiveRender: true));
         Assert.Equal(3, b.RenderPaddingMs);
         Assert.Equal(6, b.RenderLatencyMs);
-        Assert.Equal(9, b.RingFloorMs);               // gulp 3 + cadence 3 + one period of jitter margin
-        Assert.Equal(18, b.EffectiveTotalMs);         // 3 + 9 + 6
+        Assert.Equal(12, b.RingFloorMs);              // gulp 3 + cadence 3 + two periods of jitter margin
+        Assert.Equal(21, b.EffectiveTotalMs);         // 3 + 12 + 6
         Assert.False(b.NeedsReallocation);
 
         // Safety tier cannot pad the exclusive FIFO; it lands in the ring instead.
         var safe = LatencyBudget.Compute(new LatencyBudgetInput(0, 3, 3, 3, 0, 1, ExclusiveRender: true));
         Assert.Equal(3, safe.RenderPaddingMs);
-        Assert.Equal(12, safe.RingFloorMs);
+        Assert.Equal(15, safe.RingFloorMs);
         Assert.False(safe.NeedsReallocation);
     }
 
