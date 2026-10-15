@@ -11,10 +11,25 @@ public class SyncCoordinatorTests
         c.RegisterConsumer("m", 48000, 40);
         c.RegisterConsumer("f", 48000, 40);
         c.SetReleaseFillTargetMs(20);
-        c.ReportBufferedFrames("m", 2000);
-        c.ReportBufferedFrames("f", 2000);
+        // Surplus semantics: (fill − that ring's own target) per consumer; ≥ 0 releases.
+        c.ReportFillSurplusFrames("m", 2000 - 960);
+        c.ReportFillSurplusFrames("f", 2000 - 960);
         Assert.False(c.ShouldHoldForGlobalRefill());
         return c;
+    }
+
+    [Fact]
+    public void Barrier_HoldsWhileAnyConsumerReportsNegativeSurplus()
+    {
+        var c = new OutputSyncCoordinator("m", 48000, 960, 9600);
+        c.RegisterConsumer("m", 48000, 40);
+        c.RegisterConsumer("f", 48000, 40);
+        c.SetReleaseFillTargetMs(20);
+        c.ReportFillSurplusFrames("m", 50);
+        c.ReportFillSurplusFrames("f", -1);          // one ring still below its own target
+        Assert.True(c.ShouldHoldForGlobalRefill());
+        c.ReportFillSurplusFrames("f", 0);
+        Assert.False(c.ShouldHoldForGlobalRefill());
     }
 
     [Fact]

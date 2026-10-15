@@ -25,6 +25,8 @@ public sealed class UiSnapshot
     public bool StartupAtBoot { get; set; }
     public int InputBufferMs { get; set; }
     public int OutputBufferMs { get; set; }
+    /// <summary>The user's exclusive-mode toggle (requested; see MetricsSnapshot.ExclusiveActive for effect).</summary>
+    public bool ExclusiveMode { get; set; }
     public string InputDeviceMode { get; set; } = "both";
     public List<DeviceSnapshot> Inputs { get; set; } = [];
     public List<DeviceSnapshot> Outputs { get; set; } = [];
@@ -43,9 +45,13 @@ public sealed class DeviceMetrics
     public long SyncCorrections { get; set; }
     /// <summary>Real WASAPI engine period this endpoint runs at, ms (0 = n/a).</summary>
     public double PeriodMs { get; set; }
+    /// <summary>Inputs: the cadence the budget uses (max of period and the measured recurring gap).</summary>
+    public double CadenceMs { get; set; }
     /// <summary>Achieved period tier ("MinPeriod", "DefaultPeriod", "Legacy"...).</summary>
     public string TierName { get; set; } = "";
     public long PostRecoveryUnderruns { get; set; }
+    /// <summary>Outputs: ring re-anchors forced by a live input staying starved.</summary>
+    public long StarvationReanchors { get; set; }
     public double? LatencyMs { get; set; }
     public double? SyncErrorMs { get; set; }
     public double? AppliedPpm { get; set; }
@@ -73,6 +79,10 @@ public sealed class MetricsSnapshot
     public int AutoHeadroomMs { get; set; }
     /// <summary>Safety tier engaged (extra render period) because headroom alone was not enough.</summary>
     public bool SafetyTier { get; set; }
+    /// <summary>True while every output of the running session is an exclusive-mode stream.</summary>
+    public bool ExclusiveActive { get; set; }
+    /// <summary>Why exclusive mode is requested but not in effect (empty otherwise).</summary>
+    public string ExclusiveBlockedReason { get; set; } = "";
     public List<DeviceMetrics> Inputs { get; set; } = [];
     public List<DeviceMetrics> Outputs { get; set; } = [];
     public List<RouteLatency> RouteLatencies { get; set; } = [];

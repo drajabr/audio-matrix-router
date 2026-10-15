@@ -23,6 +23,17 @@ public class ActiveDevice
     public int RenderLatencyMs { get; set; }
     /// <summary>Real capture delivery cadence, ms (from the endpoint; loopback 10).</summary>
     public double CaptureCadenceMs { get; set; }
+    /// <summary>Cadence the budget uses for this input: max(nominal period, worst MEASURED
+    /// recurring gap). Raised live by the health tick; never lowered within a session.</summary>
+    public double EffectiveCadenceMs { get; set; }
+    /// <summary>This input's own ring fill target (engine frames), from its effective cadence.</summary>
+    public int FillTargetFrames { get; set; }
+    /// <summary>Why this endpoint did not open exclusive (empty when it did, or was not asked).</summary>
+    public string ExclusiveRefusal { get; set; } = string.Empty;
+    /// <summary>Set when this capture could not sustain its exclusive period (session).</summary>
+    public bool ExclusiveCaptureDemoted { get; set; }
+    /// <summary>True until the first measured cadence replaces the start-up prior.</summary>
+    public bool CadenceIsPrior { get; set; }
     // Read back from WASAPI after Initialize (0 = read-back unavailable): the REAL
     // allocated render buffer and engine period, not the requested values.
     public int RealRenderBufferMs { get; set; }
@@ -144,6 +155,38 @@ public class AudioEngine : IDisposable
             : "auto";
     }
 
+    // ===== exclusive mode (opt-in, off by default) =====
+    // Outputs are all-or-nothing per start: the sync coordinator assumes equal FIFO
+    // depth on every output, and a 3 ms exclusive FIFO beside a 12 ms shared one would
+    // play 9 ms early. Captures are independent (each ring has its own target).
+    private bool _exclusiveMode;
+    private bool _exclusiveDemoted;        // an output could not sustain its exclusive period this session
+    private bool _exclusiveRenderActive;   // every started output runs exclusive (budget branch)
+    private string? _pendingExclusiveBlock; // reason carried into the shared re-start
+
+    public bool ExclusiveMode => _exclusiveMode;
+    /// <summary>True while the running session has every output on an exclusive stream.</summary>
+    public bool ExclusiveActive => _running && _exclusiveRenderActive;
+    /// <summary>Why exclusive mode is requested but not in effect (empty otherwise).</summary>
+    public string ExclusiveBlockedReason { get; private set; } = string.Empty;
+
+    /// <summary>Opt in/out of exclusive-mode streams. Applied at the next start; a running
+    /// engine restarts. Resets the AUTO loop's memory because the floor changes.</summary>
+    public bool SetExclusiveMode(bool enabled)
+    {
+        if (_exclusiveMode == enabled) return true;
+        _exclusiveMode = enabled;
+        _exclusiveDemoted = false;
+        foreach (var d in _inputDevices) d.ExclusiveCaptureDemoted = false;
+        _autoHeadroomMs = 0;
+        _learnedMinHeadroomMs = 0;
+        _safetyPeriods = 0;
+        Wasapi.WasapiDiagnostics.Log($"[Engine] exclusive mode {(enabled ? "ON" : "off")}");
+        if (_running) FullRestart();
+        StateChanged?.Invoke();
+        return true;
+    }
+
     /// <summary>An endpoint died mid-stream (device invalidated / stalled). Raised
     /// from an audio thread — the host must marshal and drive recovery from there
     /// (AppController debounces into ReloadEngine). Never restarts inline.</summary>
@@ -186,6 +229,7 @@ public class AudioEngine : IDisposable
         {
             ProcessHeartbeat.Beat();
             if (!_running) return;
+            EvaluateMeasuredCadence();
             EvaluateAdaptiveDegrade();
             EvaluateAutoHeadroom();
             CheckEndpointHealth();
@@ -218,6 +262,14 @@ public class AudioEngine : IDisposable
     private long _lastAutoChangeAt;
     private long _atMaxSince;
     private long _lastUnderrunSeenAt;
+    // Decay memory: the headroom level at which the last storm happened is unsafe for
+    // this session; decay stops one step above it instead of walking back into the
+    // storm every five minutes (the 54 → 84 → 54 cycle seen in the field).
+    private int _learnedMinHeadroomMs;
+    // Start-up transient (barrier release, first re-anchors) books a handful of
+    // underruns that are not a sizing problem; the loop ignores the first seconds.
+    private const int AutoStartGraceMs = 3000;
+    private long _runningSince;
 
     private void ResetAutoWindow()
     {
@@ -244,10 +296,19 @@ public class AudioEngine : IDisposable
         if (windowSum > 0) _lastUnderrunSeenAt = now;
         int step = (int)Math.Ceiling(_worstCaptureCadenceMs > 0 ? _worstCaptureCadenceMs : 10);
 
+        if (now - _runningSince < AutoStartGraceMs)
+        {
+            ResetAutoWindow();
+            _lastUnderrunTotal = total;
+            return;
+        }
+
         if (windowSum >= AutoRaiseThreshold && now - _lastAutoChangeAt >= AutoCooldownMs)
         {
             if (_autoHeadroomMs < LatencyBudget.MaxAutoHeadroomMs)
             {
+                _learnedMinHeadroomMs = Math.Max(_learnedMinHeadroomMs,
+                    Math.Min(LatencyBudget.MaxAutoHeadroomMs, _autoHeadroomMs + step));
                 _autoHeadroomMs = Math.Min(LatencyBudget.MaxAutoHeadroomMs, _autoHeadroomMs + step);
                 _lastAutoChangeAt = now;
                 _atMaxSince = _autoHeadroomMs >= LatencyBudget.MaxAutoHeadroomMs ? now : 0;
@@ -270,12 +331,77 @@ public class AudioEngine : IDisposable
             && now - _lastUnderrunSeenAt >= AutoDecayAfterMs
             && now - _lastAutoChangeAt >= AutoDecayAfterMs)
         {
-            if (_safetyPeriods > 0) _safetyPeriods = 0;
-            else _autoHeadroomMs = Math.Max(0, _autoHeadroomMs - step);
+            if (_safetyPeriods > 0)
+            {
+                _safetyPeriods = 0;
+            }
+            else
+            {
+                int next = Math.Max(_learnedMinHeadroomMs, _autoHeadroomMs - step);
+                if (next == _autoHeadroomMs)
+                {
+                    // Sitting on the learned floor: nothing to give back this session.
+                    _lastAutoChangeAt = now;
+                    return;
+                }
+                _autoHeadroomMs = next;
+            }
             _lastAutoChangeAt = now;
             _atMaxSince = 0;
             ApplyBudgetLive("auto headroom decay after 5 clean minutes");
         }
+    }
+
+    // ----- measured cadence -----
+    // The budget's capture term must be what the producer DOES, not its stream period:
+    // a virtual cable delivers in ~16 ms bursts behind a 10 ms period, and a 22 ms ring
+    // floor sized for 10 ms starves on every burst (the underrun storms that drove the
+    // AUTO loop to +40 ms). Each client keeps a gap histogram; a gap that recurs is
+    // adopted as that input's cadence, live, and never lowered within the session.
+    private void EvaluateMeasuredCadence()
+    {
+        bool changed = false;
+        double worst = 0;
+        foreach (var dev in _inputDevices.ToArray())
+        {
+            var cap = dev.Capture;
+            if (cap is null) continue;
+            double nominal = cap.ActualPeriodMs > 0 ? cap.ActualPeriodMs : 10;
+            double measured = cap.MeasuredCadenceMs;
+            double effective = Math.Max(nominal, Math.Ceiling(measured));
+            // The start-up prior (loopbacks: twice the period, because virtual cables
+            // burst) is replaced by the first real measurement in either direction;
+            // after that the cadence only ever rises within the session.
+            bool replacePrior = dev.CadenceIsPrior && measured > 0;
+            if (replacePrior) dev.CadenceIsPrior = false;
+            if (effective > dev.EffectiveCadenceMs + 0.5 || (replacePrior && Math.Abs(effective - dev.EffectiveCadenceMs) > 0.5))
+            {
+                Wasapi.WasapiDiagnostics.Log($"[Engine] measured cadence '{dev.Info.Name}': " +
+                    $"{dev.EffectiveCadenceMs:0.##} → {effective:0.##} ms (stream period {nominal:0.##} ms)");
+                dev.EffectiveCadenceMs = effective;
+                dev.CaptureCadenceMs = effective;
+                dev.CaptureLatencyMs = (int)Math.Ceiling(effective);
+                dev.InputAsrc?.SetCadenceMs(effective);
+                if (dev.RingBuffer is { } ring) ring.ProducerCadenceMs = effective;
+                changed = true;
+            }
+            if (dev.EffectiveCadenceMs > worst) worst = dev.EffectiveCadenceMs;
+        }
+        if (!changed) return;
+
+        // Worst over the inputs' effective cadences. It can drop once, when a loopback
+        // prior is replaced by its measurement; after that it only rises.
+        double delta = worst - _worstCaptureCadenceMs;
+        _worstCaptureCadenceMs = worst;
+        // Headroom the AUTO loop added for this very burstiness now lives in the floor:
+        // hand it back so the honest floor does not stack on top of the guessed one.
+        if (delta > 0 && _autoHeadroomMs > 0)
+        {
+            int give = (int)Math.Min(_autoHeadroomMs, Math.Ceiling(delta));
+            _autoHeadroomMs -= give;
+            _learnedMinHeadroomMs = Math.Max(0, _learnedMinHeadroomMs - give);
+        }
+        ApplyBudgetLive($"measured cadence {worst:0.##} ms");
     }
 
     // ----- endpoint health -----
@@ -317,13 +443,25 @@ public class AudioEngine : IDisposable
             foreach (var dev in _outputDevices)
             {
                 if (dev.Render is null) continue;
-                if (dev.Render.Tier is not (EndpointTier.MinPeriod or EndpointTier.DoublePeriod)) continue;
+                if (dev.Render.Tier is not (EndpointTier.Exclusive or EndpointTier.MinPeriod or EndpointTier.DoublePeriod)) continue;
                 double elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - dev.TierStartTimestamp) / freq;
                 if (elapsed > WindowSec) continue;
                 anyEvaluating = true;
 
                 long delta = (dev.MixProvider?.UnderrunCount ?? 0) - dev.TierUnderrunBaseline;
-                if (delta > Threshold && dev.TierDegradeCount < 2)
+                // Exclusive callbacks come 3-5x more often, and a ring-sizing problem
+                // (the AUTO loop's job) must not read as "the device cannot sustain its
+                // period": demand a sustained burst before giving exclusive up.
+                const long ExclusiveThreshold = 150;
+                if (delta > ExclusiveThreshold && dev.Render.Tier == EndpointTier.Exclusive && !_exclusiveDemoted
+                    && _autoHeadroomMs >= LatencyBudget.MaxAutoHeadroomMs)
+                {
+                    // All-or-nothing: one output off exclusive means every output goes shared.
+                    _exclusiveDemoted = true;
+                    Wasapi.WasapiDiagnostics.Log($"[Engine] adaptive degrade: '{dev.Info.Name}' could not sustain its exclusive period — exclusive off for this session");
+                    demoted = true;
+                }
+                else if (delta > Threshold && dev.Render.Tier != EndpointTier.Exclusive && dev.TierDegradeCount < 2)
                 {
                     dev.RequestedRenderTier = dev.RequestedRenderTier == EndpointTier.MinPeriod
                         ? EndpointTier.DoublePeriod
@@ -337,12 +475,18 @@ public class AudioEngine : IDisposable
             {
                 var cap = dev.Capture;
                 if (cap is null) continue;
-                if (cap.Tier is not (EndpointTier.MinPeriod or EndpointTier.DoublePeriod)) continue;
+                if (cap.Tier is not (EndpointTier.Exclusive or EndpointTier.MinPeriod or EndpointTier.DoublePeriod)) continue;
                 anyEvaluating = true;
 
                 long delta = cap.DiscontinuityCount + Interlocked.Read(ref dev.InputOverflowCount)
                              - dev.TierDiscontinuityBaseline;
-                if (delta > Threshold && dev.TierDegradeCount < 2)
+                if (delta > 50 && cap.Tier == EndpointTier.Exclusive && !dev.ExclusiveCaptureDemoted)
+                {
+                    dev.ExclusiveCaptureDemoted = true;
+                    Wasapi.WasapiDiagnostics.Log($"[Engine] adaptive degrade: capture '{dev.Info.Name}' could not sustain its exclusive period — shared for this session");
+                    demoted = true;
+                }
+                else if (delta > Threshold && cap.Tier != EndpointTier.Exclusive && dev.TierDegradeCount < 2)
                 {
                     dev.RequestedCaptureTier = dev.RequestedCaptureTier == EndpointTier.MinPeriod
                         ? EndpointTier.DoublePeriod
@@ -1189,7 +1333,7 @@ public class AudioEngine : IDisposable
 
     public bool Start() => StartCore(null, 0);
 
-    private bool StartCore(ActiveDevice? masterOverride, int attempt)
+    private bool StartCore(ActiveDevice? masterOverride, int attempt, bool allowExclusive = true)
     {
         if (_running) return true;
         if (_inputDevices.Count == 0 || _outputDevices.Count == 0) return false;
@@ -1279,6 +1423,20 @@ public class AudioEngine : IDisposable
                     d.IsMasterDevice))
                 .ToList();
 
+            // Exclusive eligibility. Outputs that feed a loopback input must stay shared:
+            // an exclusive stream bypasses the engine the loopback taps (it would go
+            // silent). All-or-nothing across outputs (equal FIFO depth, see the field).
+            var loopbackSourceIds = new HashSet<string>(
+                _inputDevices.Where(d => d.IsLoopback)
+                    .Select(d => d.Info.Id.StartsWith("loop:", StringComparison.Ordinal) ? d.Info.Id.Substring(5) : d.Info.Id),
+                StringComparer.Ordinal);
+            bool wantExclusive = allowExclusive && _exclusiveMode && !_exclusiveDemoted;
+            _exclusiveRenderActive = false;
+            ExclusiveBlockedReason = !_exclusiveMode ? string.Empty
+                : _exclusiveDemoted ? "an output could not sustain its exclusive period this session"
+                : !allowExclusive ? (_pendingExclusiveBlock ?? "exclusive unavailable")
+                : string.Empty;
+
             // ===== 4. Providers + renders (consumer cursors pinned on EMPTY rings) =====
             var startedOutputs = new List<ActiveDevice>();
             bool formatChanged = false;
@@ -1307,7 +1465,9 @@ public class AudioEngine : IDisposable
                     dev.ConsumerId,
                     _syncCoordinator);
 
-                if (!TryInitRender(dev, mmDevice, RenderBufferRequestMs))
+                bool exclusiveForThisOutput = wantExclusive && !loopbackSourceIds.Contains(dev.Info.Id);
+                if (!exclusiveForThisOutput && wantExclusive) dev.ExclusiveRefusal = "is a loopback source";
+                if (!TryInitRender(dev, mmDevice, RenderBufferRequestMs, exclusiveForThisOutput))
                 {
                     try { dev.MixProvider?.DetachConsumer(); } catch { }
                     dev.MixProvider = null;
@@ -1342,7 +1502,7 @@ public class AudioEngine : IDisposable
                 Stop();
                 RecalcChannelOffsets();
                 RestoreRoutedCrosspoints(routeSnapshot);
-                return StartCore(null, attempt + 1);
+                return StartCore(null, attempt + 1, allowExclusive);
             }
 
             // Startup is not valid without at least one active render endpoint.
@@ -1368,12 +1528,28 @@ public class AudioEngine : IDisposable
                 if (runtimeMaster.Info.SampleRate != _engineSampleRate && attempt < 1)
                 {
                     Stop();
-                    return StartCore(runtimeMaster, attempt + 1);
+                    return StartCore(runtimeMaster, attempt + 1, allowExclusive);
                 }
 
                 _syncCoordinator.SetMasterConsumer(runtimeMaster.Info.Id);
                 _syncCoordinator.ArmGlobalRefillHold();
                 masterOutput = runtimeMaster;
+            }
+
+            if (wantExclusive)
+            {
+                var notExclusive = startedOutputs.Where(d => d.Render?.Tier != EndpointTier.Exclusive).ToList();
+                if (notExclusive.Count > 0)
+                {
+                    var first = notExclusive[0];
+                    string why = $"'{first.Info.Name}' {(string.IsNullOrEmpty(first.ExclusiveRefusal) ? "could not open exclusive" : first.ExclusiveRefusal)}";
+                    Wasapi.WasapiDiagnostics.Log($"[Engine] exclusive mode unavailable this start — {why}; reopening every output shared");
+                    _pendingExclusiveBlock = why;
+                    Stop();
+                    return StartCore(masterOverride, 0, allowExclusive: false);
+                }
+                _exclusiveRenderActive = true;
+                _pendingExclusiveBlock = null;
             }
 
             // Preferred consumer for ring trim ordering + the input ASRC fill reference.
@@ -1394,7 +1570,7 @@ public class AudioEngine : IDisposable
                 // the now-known period.
                 Wasapi.WasapiDiagnostics.Log($"[Engine] render buffers too small for padding {_budget.RenderPaddingMs} ms — reopening");
                 Stop();
-                return StartCore(masterOutput, attempt + 1);
+                return StartCore(masterOutput, attempt + 1, allowExclusive);
             }
             ApplyRenderPadding(startedOutputs);
             _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
@@ -1406,26 +1582,24 @@ public class AudioEngine : IDisposable
             foreach (var dev in _inputDevices)
             {
                 if (dev.RingBuffer == null) continue;
-                if (!CreateAndStartCapture(dev, inputFillTargetFrames, masterOutput.Info.Id))
+                bool exclusiveCapture = _exclusiveMode && !dev.IsLoopback && !dev.ExclusiveCaptureDemoted;
+                if (!CreateAndStartCapture(dev, inputFillTargetFrames, masterOutput.Info.Id, exclusiveCapture))
                 {
                     continue;
                 }
             }
 
-            // Real cadences are known now (small-period mics can be < 10 ms):
-            // recompute the fill target and retarget every servo + the barrier
-            // BEFORE release — the rings are still pre-filling, so this is glitch-free.
+            // Real cadences are known now (small-period mics can be < 10 ms, exclusive
+            // ones 3 ms): recompute the budget and give every input ITS OWN fill target
+            // + retarget the barrier BEFORE release — the rings are still pre-filling,
+            // so this is glitch-free.
             _worstCaptureCadenceMs = _inputDevices
                 .Where(d => d.Capture != null)
-                .Select(d => d.CaptureCadenceMs)
+                .Select(d => d.EffectiveCadenceMs > 0 ? d.EffectiveCadenceMs : d.CaptureCadenceMs)
                 .DefaultIfEmpty(10)
                 .Max();
             _budget = ComputeBudget();
-            int refinedFillFrames = CalculateInputFillTargetFrames();
-            foreach (var dev in _inputDevices)
-            {
-                dev.InputAsrc?.SetTargetFillFrames(refinedFillFrames);
-            }
+            ApplyInputFillTargets(_inputDevices);
             _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
 
             LogBudget("start", startedOutputs);
@@ -1437,6 +1611,7 @@ public class AudioEngine : IDisposable
             }
 
             _running = true;
+            _runningSince = Environment.TickCount64;
             StateChanged?.Invoke();
             return true;
         }
@@ -1472,7 +1647,7 @@ public class AudioEngine : IDisposable
         return true;
     }
 
-    private bool TryInitRender(ActiveDevice dev, MMDevice mmDevice, int latencyMs)
+    private bool TryInitRender(ActiveDevice dev, MMDevice mmDevice, int latencyMs, bool exclusiveWanted = false)
     {
         // "auto" backend: our IAudioClient3 client (small-period ladder inside it).
         // A total failure of the custom client falls through to NAudio — the belt
@@ -1483,9 +1658,11 @@ public class AudioEngine : IDisposable
             try
             {
                 rc = new Wasapi.WasapiRenderClient(
-                    dev.Info.Id, latencyMs, dev.RequestedRenderTier, dev.Info.Name);
+                    dev.Info.Id, latencyMs, dev.RequestedRenderTier, dev.Info.Name, exclusiveWanted);
                 rc.Init(dev.MixProvider!);
                 AdoptRender(dev, rc, latencyMs);
+                if (rc is Wasapi.WasapiRenderClient wrcRefusal && exclusiveWanted && !wrcRefusal.IsExclusive)
+                    dev.ExclusiveRefusal = string.IsNullOrEmpty(wrcRefusal.ExclusiveRefusal) ? "could not open exclusive" : wrcRefusal.ExclusiveRefusal;
                 return true;
             }
             catch (Exception ex)
@@ -1505,6 +1682,7 @@ public class AudioEngine : IDisposable
             render = new NAudioRenderEndpoint(mmDevice, latencyMs, dev.Info.SampleRate);
             render.Init(dev.MixProvider!);
             AdoptRender(dev, render, latencyMs);
+            if (exclusiveWanted) dev.ExclusiveRefusal = "legacy backend (NAudio) cannot open exclusive";
             return true;
         }
         catch (Exception ex)
@@ -1533,12 +1711,18 @@ public class AudioEngine : IDisposable
             : requestedMs;
     }
 
-    private bool CreateAndStartCapture(ActiveDevice dev, int fillTargetFrames, string masterConsumerId)
+    private bool CreateAndStartCapture(ActiveDevice dev, int fillTargetFrames, string masterConsumerId,
+        bool exclusiveWanted = false)
     {
         if (dev.RingBuffer == null)
         {
             return false;
         }
+        // The ring's own target must exist before its producer writes a frame, or the
+        // barrier (per-ring surplus) could release on an empty ring.
+        dev.RingBuffer.FillTargetFrames = fillTargetFrames;
+        dev.FillTargetFrames = fillTargetFrames;
+        dev.ExclusiveRefusal = string.Empty;
 
         var mmDevice = _enumerator.GetDevice(dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
             ? dev.Info.Id.Substring("loop:".Length)
@@ -1551,7 +1735,7 @@ public class AudioEngine : IDisposable
         // Endpoint buffer DEPTH is not latency — the delivery cadence drains it every
         // period regardless. A 1-period-deep buffer silently DROPPED a packet whenever
         // the capture thread was one period late; 4+ periods of depth costs nothing.
-        // Loopbacks use the polled 20 ms / ~10 ms-cadence mode.
+        // Loopbacks open event-driven with a keep-alive stream (polled is the fallback).
         string endpointId = dev.IsLoopback && dev.Info.Id.StartsWith("loop:", StringComparison.Ordinal)
             ? dev.Info.Id.Substring("loop:".Length)
             : dev.Info.Id;
@@ -1561,10 +1745,11 @@ public class AudioEngine : IDisposable
             custom = new Wasapi.WasapiCaptureClient(
                 endpointId,
                 dev.IsLoopback
-                    ? Wasapi.WasapiCaptureClient.CaptureMode.PolledLoopback
+                    ? Wasapi.WasapiCaptureClient.CaptureMode.EventLoopback
                     : Wasapi.WasapiCaptureClient.CaptureMode.EventMic,
                 dev.RequestedCaptureTier,
-                dev.Info.Name);
+                dev.Info.Name,
+                exclusiveWanted);
         }
         dev.Capture = custom ?? new NAudioCaptureEndpoint(mmDevice, dev.IsLoopback,
             Math.Max(40, _inputBufferMs), dev.Info.SampleRate, dev.Info.Channels);
@@ -1630,11 +1815,19 @@ public class AudioEngine : IDisposable
             }
         }
 
-        // Latency contribution = delivery cadence (one period), NOT buffer depth.
+        // Latency contribution = delivery cadence (one period), NOT buffer depth. The
+        // nominal period seeds the effective cadence; the health tick raises it to the
+        // measured recurring gap once the producer has shown its real behaviour.
         dev.CaptureCadenceMs = dev.Capture.ActualPeriodMs;
-        dev.CaptureLatencyMs = (int)Math.Ceiling(dev.CaptureCadenceMs);
+        // Loopback prior: virtual cables deliver in bursts of roughly twice the period;
+        // start there and let the first measurement settle the real value (within ~1 s).
+        dev.EffectiveCadenceMs = dev.IsLoopback ? 2 * dev.CaptureCadenceMs : dev.CaptureCadenceMs;
+        dev.CadenceIsPrior = dev.IsLoopback;
+        dev.CaptureLatencyMs = (int)Math.Ceiling(dev.EffectiveCadenceMs);
         asrc.SetCadenceMs(dev.CaptureCadenceMs);
         dev.RingBuffer.ProducerCadenceMs = dev.CaptureCadenceMs;
+        if (dev.Capture is Wasapi.WasapiCaptureClient exclusiveClient && exclusiveWanted && exclusiveClient.Tier != EndpointTier.Exclusive)
+            dev.ExclusiveRefusal = string.IsNullOrEmpty(exclusiveClient.ExclusiveRefusal) ? "could not open exclusive" : exclusiveClient.ExclusiveRefusal;
         dev.Capture.Faulted += hr => OnEndpointFaulted(dev.Info.Name, hr);
         dev.TierDiscontinuityBaseline = 0;
         return true;
@@ -1787,14 +1980,36 @@ public class AudioEngine : IDisposable
 
     private int RenderBufferRequestMs => LatencyBudget.RenderBufferRequestMs(_outputBufferMs, _worstRenderPeriodMs);
 
-    private LatencyBudgetResult ComputeBudget() => LatencyBudget.Compute(new LatencyBudgetInput(
+    private LatencyBudgetInput BudgetInput() => new(
         _outputBufferMs, _worstCaptureCadenceMs, _worstRenderPeriodMs, _minRealRenderBufferMs,
-        _autoHeadroomMs, _safetyPeriods));
+        _autoHeadroomMs, _safetyPeriods, _exclusiveRenderActive);
+
+    private LatencyBudgetResult ComputeBudget() => LatencyBudget.Compute(BudgetInput());
 
     private int InputFillTargetMs => Math.Max(1, _budget.RingTargetMs);
 
     private int CalculateInputFillTargetFrames() =>
         Math.Max(64, _engineSampleRate * InputFillTargetMs / 1000);
+
+    /// <summary>This input's own ring target from its own cadence (worst-input budget otherwise).</summary>
+    private int FillTargetFramesFor(ActiveDevice input)
+    {
+        double cadence = input.EffectiveCadenceMs > 0 ? input.EffectiveCadenceMs : _worstCaptureCadenceMs;
+        int ms = LatencyBudget.RingTargetForCadenceMs(BudgetInput(), _budget, cadence);
+        return Math.Max(64, _engineSampleRate * Math.Max(1, ms) / 1000);
+    }
+
+    private void ApplyInputFillTargets(IEnumerable<ActiveDevice> inputs)
+    {
+        foreach (var input in inputs)
+        {
+            if (input.RingBuffer is null) continue;
+            int frames = FillTargetFramesFor(input);
+            input.FillTargetFrames = frames;
+            input.RingBuffer.FillTargetFrames = frames;
+            input.InputAsrc?.SetTargetFillFrames(frames);
+        }
+    }
 
     private void ApplyRenderPadding(IEnumerable<ActiveDevice> outputs)
     {
@@ -1831,23 +2046,36 @@ public class AudioEngine : IDisposable
         var inputs = _inputDevices.ToArray();
         ApplyRenderPadding(outputs);
 
-        int frames = CalculateInputFillTargetFrames();
+        // Per input: its own new target; a decrease is a backlog trim on THAT ring, an
+        // increase is one equal hold on every output sized to the largest increase
+        // (rings with a smaller increase overshoot by the difference, which the servo
+        // removes gently — inaudible, and far cheaper than unequal holds breaking phase).
+        int thresholdFrames = 5 * _engineSampleRate / 1000;
+        int maxIncreaseFrames = 0;
         foreach (var input in inputs)
         {
-            input.InputAsrc?.SetTargetFillFrames(frames);
+            if (input.RingBuffer is null) continue;
+            int oldFrames = input.FillTargetFrames;
+            int newFrames = FillTargetFramesFor(input);
+            input.FillTargetFrames = newFrames;
+            input.RingBuffer.FillTargetFrames = newFrames;
+            input.InputAsrc?.SetTargetFillFrames(newFrames);
+            int deltaFrames = newFrames - oldFrames;
+            if (oldFrames > 0 && deltaFrames <= -thresholdFrames)
+            {
+                input.RingBuffer.TrimBacklogBy(-deltaFrames);
+            }
+            else if (oldFrames > 0 && deltaFrames >= thresholdFrames)
+            {
+                maxIncreaseFrames = Math.Max(maxIncreaseFrames, deltaFrames);
+            }
         }
         _syncCoordinator.SetReleaseFillTargetMs(InputFillTargetMs);
-
-        int deltaMs = next.RingTargetMs - old.RingTargetMs;
-        int deltaFrames = Math.Abs(deltaMs) * _engineSampleRate / 1000;
-        if (deltaMs <= -5)
+        if (maxIncreaseFrames > 0)
         {
-            foreach (var input in inputs) input.RingBuffer?.TrimBacklogBy(deltaFrames);
+            foreach (var output in outputs) output.MixProvider?.HoldFor(maxIncreaseFrames);
         }
-        else if (deltaMs >= 5)
-        {
-            foreach (var output in outputs) output.MixProvider?.HoldFor(deltaFrames);
-        }
+        _ = old;
 
         LogBudget($"retarget: {reason}", outputs.Where(d => d.Render != null));
         try { StateChanged?.Invoke(); } catch { }
@@ -1860,10 +2088,10 @@ public class AudioEngine : IDisposable
             $"capture cadence {_worstCaptureCadenceMs:0.##} ms, render period {_worstRenderPeriodMs:0.##} ms, " +
             $"render buffer {_minRealRenderBufferMs} ms (requested {b.RenderBufferRequestMs}), padding {b.RenderPaddingMs} ms, " +
             $"ring target {b.RingTargetMs} ms (floor {b.RingFloorMs}, headroom {_autoHeadroomMs}, safety {_safetyPeriods}), " +
-            $"effective total {b.EffectiveTotalMs} ms (floor {b.FloorTotalMs}); " +
+            $"effective total {b.EffectiveTotalMs} ms (floor {b.FloorTotalMs}), exclusive {(_exclusiveRenderActive ? "ON" : "off")}; " +
             string.Join(", ", started.Select(d => $"'{d.Info.Name}' {d.Render?.Tier} buf {d.RealRenderBufferMs} ms period {d.RenderPeriodMs} ms")) +
             "; inputs " + string.Join(", ", _inputDevices.Where(d => d.Capture != null)
-                .Select(d => $"'{d.Info.Name}' {d.Capture?.Tier} {d.CaptureCadenceMs:0.##} ms")));
+                .Select(d => $"'{d.Info.Name}' {d.Capture?.Tier} cadence {d.EffectiveCadenceMs:0.##} ms ring {d.FillTargetFrames * 1000 / Math.Max(1, _engineSampleRate)} ms")));
     }
 
     private (int BaseMasterTargetFrames, int MaxMasterTargetFrames) CalculateSyncTargetFrames()

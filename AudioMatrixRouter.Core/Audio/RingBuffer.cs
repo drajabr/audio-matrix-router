@@ -64,6 +64,16 @@ public class RingBuffer
     /// <summary>Nominal delivery cadence of this ring's producer, ms (set by the engine).</summary>
     public double ProducerCadenceMs { get; set; } = 10;
 
+    private int _fillTargetFrames;
+    /// <summary>Ring fill (engine frames) this input's servo holds. Per input, because
+    /// each producer has its own cadence; the start barrier releases when every live
+    /// ring is at or above its own target. Set by the engine, read by every consumer.</summary>
+    public int FillTargetFrames
+    {
+        get => Volatile.Read(ref _fillTargetFrames);
+        set => Volatile.Write(ref _fillTargetFrames, Math.Max(1, value));
+    }
+
     /// <summary>True when the producer has written at all.</summary>
     public bool HasProducerWritten => Interlocked.Read(ref _lastWriteTicks) != 0;
 

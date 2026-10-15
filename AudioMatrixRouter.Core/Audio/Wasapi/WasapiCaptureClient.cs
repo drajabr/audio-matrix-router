@@ -9,9 +9,15 @@ namespace AudioMatrixRouter.Audio.Wasapi;
 ///   EventMic      — event-driven; IAudioClient3 small periods when the driver
 ///                   supports them (same ladder as the render client), draining
 ///                   ALL packets per wake.
-///   PolledLoopback — IAudioClient3 small periods do NOT support loopback streams,
-///                   and event-driven loopback doesn't signal reliably; this mode
-///                   reproduces the proven polled path (20 ms buffer, ~10 ms poll).
+///   EventLoopback — event-driven loopback. A loopback tap only signals while the
+///                   endpoint's engine runs, so a silent shared render stream is kept
+///                   open on the same endpoint (the keep-alive) and topped up from this
+///                   thread. Removes the polling race (gap tail 30-42 ms → the engine's
+///                   own 10 ms). Falls back to PolledLoopback if the open fails.
+///   PolledLoopback — the proven polled path (20 ms buffer, ~10 ms poll); fallback.
+///
+/// Exclusive mode (opt-in): EventMic tries an exclusive event-driven stream at the
+/// device's minimum period first (3 ms on most HDA devices against 10 ms shared).
 ///
 /// Delivery is interleaved float32 (converted from the mix encoding when needed) at
 /// the endpoint's mix rate/channels via <see cref="DataAvailable"/> — buffer valid
@@ -20,12 +26,29 @@ namespace AudioMatrixRouter.Audio.Wasapi;
 /// </summary>
 internal sealed class WasapiCaptureClient : ICaptureEndpoint
 {
-    public enum CaptureMode { EventMic, PolledLoopback }
+    public enum CaptureMode { EventMic, EventLoopback, PolledLoopback }
 
     private readonly string _endpointId;
-    private readonly CaptureMode _mode;
+    private CaptureMode _mode;
     private readonly EndpointTier _requestedTier;
     private readonly string _label;
+    private readonly bool _exclusiveWanted;
+    private readonly CadenceTracker _cadence = new();
+
+    // Keep-alive render stream for EventLoopback (owned by the capture thread).
+    private IMMDeviceEnumerator? _kaEnumerator;
+    private IMMDevice? _kaDevice;
+    private IAudioClient? _kaClient;
+    private IAudioRenderClient? _kaRender;
+    private uint _kaFrames;
+
+    // Exclusive rung bookkeeping (see TryLadderInit).
+    private int _exclusiveAttempts;
+    private long _exclusiveAlignedPeriod;
+    private bool _exclusiveRetryPending;
+
+    /// <summary>Why the exclusive rung was not taken (empty when it was, or was not wanted).</summary>
+    public string ExclusiveRefusal { get; private set; } = "";
 
     private readonly AutoResetEvent _frameEvent = new(false);
     private readonly ManualResetEventSlim _stopRequest = new(false);
@@ -39,6 +62,7 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
     private long _discontinuities;
 
     public double ActualPeriodMs { get; private set; } = 10;
+    public double MeasuredCadenceMs => _cadence.WorstRecurringGapMs();
     public int ActualSampleRate { get; private set; }
     public int ActualChannels { get; private set; }
     public int ActualBufferMs { get; private set; }
@@ -48,12 +72,14 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
     public event CaptureDataHandler? DataAvailable;
     public event Action<int>? Faulted;
 
-    public WasapiCaptureClient(string endpointId, CaptureMode mode, EndpointTier requestedTier, string label)
+    public WasapiCaptureClient(string endpointId, CaptureMode mode, EndpointTier requestedTier, string label,
+        bool exclusiveWanted = false)
     {
         _endpointId = endpointId;
         _mode = mode;
         _requestedTier = requestedTier;
         _label = label;
+        _exclusiveWanted = exclusiveWanted && mode == CaptureMode.EventMic;
     }
 
     /// <summary>Starts the audio thread, which activates + initializes + begins
@@ -170,6 +196,8 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                     }
                 }
 
+                if (_kaRender is not null) TopUpKeepAlive();
+
                 // Drain EVERYTHING available this wake.
                 while (!_stopRequest.IsSet)
                 {
@@ -203,6 +231,7 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                             Interlocked.Increment(ref _discontinuities);
                         }
 
+                        _cadence.Record();
                         try { DataAvailable?.Invoke(scratch, (int)frames); }
                         catch { /* a consumer bug must not kill the capture loop */ }
                     }
@@ -229,8 +258,58 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
             if (_initOk && !_stopRequest.IsSet) Fault(WasapiConstants.AUDCLNT_E_STALLED);
             try { if (captureService is not null) Marshal.ReleaseComObject(captureService); } catch { }
             WasapiActivation.ReleaseActivation(enumerator, device, client);
+            StopKeepAlive();
             WasapiActivation.ExitComThread(comInit);
         }
+    }
+
+    // ----- keep-alive (EventLoopback) -----
+
+    private bool TryStartKeepAlive(IntPtr mixFmt)
+    {
+        StopKeepAlive();
+        int hr = WasapiActivation.TryActivate(_endpointId, out _kaEnumerator, out _kaDevice, out _kaClient, out _);
+        if (hr != WasapiConstants.S_OK || _kaClient is null) { StopKeepAlive(); return false; }
+        // Push-mode shared stream, 200 ms deep: the engine keeps processing (and the
+        // loopback tap keeps signalling) while a started stream exists, silent or not.
+        hr = _kaClient.Initialize(WasapiConstants.AUDCLNT_SHAREMODE_SHARED, 0, 200 * 10_000L, 0, mixFmt, IntPtr.Zero);
+        if (hr != WasapiConstants.S_OK) { StopKeepAlive(); return false; }
+        if (_kaClient.GetBufferSize(out _kaFrames) != WasapiConstants.S_OK || _kaFrames == 0) { StopKeepAlive(); return false; }
+        var iid = WasapiConstants.IID_IAudioRenderClient;
+        if (_kaClient.GetService(ref iid, out var svc) != WasapiConstants.S_OK || svc is null) { StopKeepAlive(); return false; }
+        _kaRender = (IAudioRenderClient)svc;
+        if (_kaRender.GetBuffer(_kaFrames, out _) == WasapiConstants.S_OK)
+        {
+            _kaRender.ReleaseBuffer(_kaFrames, WasapiConstants.BUFFERFLAGS_SILENT);
+        }
+        if (_kaClient.Start() != WasapiConstants.S_OK) { StopKeepAlive(); return false; }
+        return true;
+    }
+
+    private void TopUpKeepAlive()
+    {
+        var client = _kaClient;
+        var render = _kaRender;
+        if (client is null || render is null) return;
+        if (client.GetCurrentPadding(out var padding) != WasapiConstants.S_OK) return;
+        uint free = _kaFrames > padding ? _kaFrames - padding : 0;
+        if (free == 0) return;
+        if (render.GetBuffer(free, out _) == WasapiConstants.S_OK)
+        {
+            render.ReleaseBuffer(free, WasapiConstants.BUFFERFLAGS_SILENT);
+        }
+    }
+
+    private void StopKeepAlive()
+    {
+        try { _kaClient?.Stop(); } catch { }
+        try { if (_kaRender is not null) Marshal.ReleaseComObject(_kaRender); } catch { }
+        _kaRender = null;
+        WasapiActivation.ReleaseActivation(_kaEnumerator, _kaDevice, _kaClient);
+        _kaEnumerator = null;
+        _kaDevice = null;
+        _kaClient = null;
+        _kaFrames = 0;
     }
 
     private bool TryLadderInit(ref IMMDeviceEnumerator? enumerator, ref IMMDevice? device,
@@ -257,6 +336,28 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                 var info = WasapiFormat.Parse(mixFmt);
                 if (info.SampleRate <= 0 || info.Channels <= 0) return false;
 
+                if (_mode == CaptureMode.EventLoopback)
+                {
+                    if (TryStartKeepAlive(mixFmt))
+                    {
+                        hr = client.Initialize(WasapiConstants.AUDCLNT_SHAREMODE_SHARED,
+                            WasapiConstants.STREAMFLAGS_EVENTCALLBACK | WasapiConstants.STREAMFLAGS_LOOPBACK,
+                            40 * 10_000L, 0, mixFmt, IntPtr.Zero);
+                        if (hr == WasapiConstants.S_OK)
+                        {
+                            Tier = EndpointTier.EventLoopback;
+                            ActualPeriodMs = client.GetDevicePeriod(out var lbPeriod, out _) == WasapiConstants.S_OK
+                                             && lbPeriod > 0 ? lbPeriod / 10_000.0 : 10;
+                            return FinishInit(client, mixFmt, info, ref captureService, ref converter,
+                                setEvent: true);
+                        }
+                        StopKeepAlive();
+                    }
+                    WasapiDiagnostics.Log($"[WASAPI] in {_label}: event-driven loopback unavailable (0x{hr:X8}) — polled fallback");
+                    _mode = CaptureMode.PolledLoopback;
+                    continue; // fresh client for the polled rung
+                }
+
                 if (_mode == CaptureMode.PolledLoopback)
                 {
                     // 20 ms buffer → poll every ~10 ms; no events for loopback taps.
@@ -269,10 +370,50 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                         setEvent: false);
                 }
 
+                // ---- C0: exclusive event-driven stream at the device minimum period ----
+                if (_exclusiveWanted && (_exclusiveAttempts == 0 || _exclusiveRetryPending) && _exclusiveAttempts < 2)
+                {
+                    _exclusiveAttempts++;
+                    bool retry = _exclusiveRetryPending;
+                    _exclusiveRetryPending = false;
+                    hr = WasapiExclusive.TryInitialize(client, info.SampleRate, info.Channels,
+                        retry ? _exclusiveAlignedPeriod : 0, out var exFmt, out var exInfo, out var usedPeriod, out var fmtLabel);
+                    if (hr == WasapiConstants.S_OK)
+                    {
+                        Tier = EndpointTier.Exclusive;
+                        ActualPeriodMs = usedPeriod / 10_000.0;
+                        bool ok;
+                        try
+                        {
+                            ok = FinishInit(client, exFmt, exInfo, ref captureService, ref converter, setEvent: true);
+                        }
+                        finally
+                        {
+                            Marshal.FreeCoTaskMem(exFmt);
+                        }
+                        if (ok)
+                        {
+                            WasapiDiagnostics.Log($"[WASAPI] in {_label}: EXCLUSIVE {fmtLabel} period {ActualPeriodMs:0.##} ms");
+                            return true;
+                        }
+                        ExclusiveRefusal = "exclusive stream opened but could not be serviced";
+                        continue;
+                    }
+                    if (hr == WasapiConstants.AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && !retry)
+                    {
+                        _exclusiveAlignedPeriod = WasapiExclusive.AlignedPeriod100ns(client, info.SampleRate);
+                        if (_exclusiveAlignedPeriod > 0) { _exclusiveRetryPending = true; continue; }
+                    }
+                    ExclusiveRefusal = WasapiConstants.DescribeExclusiveFailure(hr);
+                    WasapiDiagnostics.Log($"[WASAPI] in {_label}: exclusive rung skipped — {ExclusiveRefusal}");
+                    continue; // shared ladder on a fresh client
+                }
+                int sharedAttempt = attempt - _exclusiveAttempts;
+
                 bool smallPeriodWanted = _requestedTier is EndpointTier.MinPeriod or EndpointTier.DoublePeriod
                                          && client3 is not null
                                          && info.Encoding != MixEncoding.Other
-                                         && attempt == 0;
+                                         && sharedAttempt == 0;
                 if (smallPeriodWanted)
                 {
                     hr = client3!.GetSharedModeEnginePeriod(mixFmt,
@@ -314,7 +455,7 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
                         setEvent: true);
                 }
 
-                if (attempt >= 2) return false;
+                if (sharedAttempt >= 2) return false;
             }
             finally
             {
@@ -351,7 +492,7 @@ internal sealed class WasapiCaptureClient : ICaptureEndpoint
 
     private void Fault(int hr)
     {
-        if (_mode == CaptureMode.PolledLoopback && hr == 0) return; // idle loopback is legal
+        if (_mode is CaptureMode.PolledLoopback or CaptureMode.EventLoopback && hr == 0) return; // idle loopback is legal
         if (Interlocked.Exchange(ref _faultLatch, 1) != 0) return;
         try { Faulted?.Invoke(hr); } catch { }
     }

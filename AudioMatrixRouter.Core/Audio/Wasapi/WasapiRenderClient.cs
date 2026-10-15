@@ -9,6 +9,9 @@ namespace AudioMatrixRouter.Audio.Wasapi;
 /// Event-driven shared-mode WASAPI render endpoint with IAudioClient3 small-period
 /// support and a per-device fallback ladder:
 ///
+///   R0 (opt-in, exclusive mode) exclusive event-driven stream at the device's
+///      minimum period with the first PCM format the driver accepts exactly; the
+///      driver double-buffers one period and every event writes a whole period
 ///   R1 InitializeSharedAudioStream at the tier's period (min or 2x min, quantized
 ///      to min + k*fundamental)
 ///   R2 on ENGINE_PERIODICITY_LOCKED: retry ONCE at the period another app locked
@@ -29,6 +32,15 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
     private readonly int _requestedBufferMs;
     private readonly EndpointTier _requestedTier;
     private readonly string _label;
+    private readonly bool _exclusiveWanted;
+    private bool _exclusive;
+    private int _exclusiveAttempts;
+    private long _exclusiveAlignedPeriod;
+    private bool _exclusiveRetryPending;
+
+    /// <summary>Why the exclusive rung was not taken (empty when it was, or was not wanted).</summary>
+    public string ExclusiveRefusal { get; private set; } = "";
+    public bool IsExclusive => _exclusive;
 
     private readonly AutoResetEvent _frameEvent = new(false);
     private readonly ManualResetEventSlim _stopRequest = new(false);
@@ -61,6 +73,7 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
     {
         get
         {
+            if (_exclusive) return ActualBufferMs; // one period in flight, by construction
             int t = _targetPaddingFrames;
             if (t <= 0 || ActualSampleRate <= 0) return ActualBufferMs;
             return (int)Math.Round(t * 1000.0 / ActualSampleRate);
@@ -69,6 +82,7 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
 
     public void SetTargetPaddingMs(int paddingMs)
     {
+        if (_exclusive) return; // nothing to top up: every event writes a whole period
         if (ActualSampleRate <= 0) return;
         int frames = (int)Math.Round(paddingMs * ActualSampleRate / 1000.0);
         uint buffer = _bufferFrames;
@@ -78,12 +92,14 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
 
     public event Action<int>? Faulted;
 
-    public WasapiRenderClient(string endpointId, int requestedBufferMs, EndpointTier requestedTier, string label)
+    public WasapiRenderClient(string endpointId, int requestedBufferMs, EndpointTier requestedTier, string label,
+        bool exclusiveWanted = false)
     {
         _endpointId = endpointId;
         _requestedBufferMs = Math.Clamp(requestedBufferMs, 2, 500);
         _requestedTier = requestedTier;
         _label = label;
+        _exclusiveWanted = exclusiveWanted;
     }
 
     /// <summary>Spins up the audio thread, performs activation + the init ladder ON
@@ -188,6 +204,15 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
             // real buffer and period.
             _playRequest.Wait();
             if (_stopRequest.IsSet) return;
+
+            if (_exclusive)
+            {
+                RunExclusiveLoop(client!, renderService!, converter!, bufferFrames, ref scratch);
+                try { client!.Stop(); } catch { }
+                try { client!.Reset(); } catch { }
+                if (!_stopRequest.IsSet) Fault(WasapiConstants.AUDCLNT_E_STALLED);
+                return;
+            }
 
             // Pre-roll: queue TARGET frames of silence so the FIFO depth is deterministic
             // at t0 and the first period can never glitch. (Not the whole buffer: that
@@ -319,6 +344,89 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
         }
     }
 
+    /// <summary>
+    /// Exclusive event-driven loop: the driver owns two period-sized buffers; each
+    /// event means one is free, and we fill it completely. No padding target, no
+    /// top-up arithmetic. Liveness = events keep coming (a padding probe on timeout
+    /// turns a dead device into a fault).
+    /// </summary>
+    private void RunExclusiveLoop(IAudioClient client, IAudioRenderClient renderService,
+        SampleConverter converter, uint bufferFrames, ref float[] scratch)
+    {
+        if (renderService.GetBuffer(bufferFrames, out _) == WasapiConstants.S_OK)
+        {
+            renderService.ReleaseBuffer(bufferFrames, WasapiConstants.BUFFERFLAGS_SILENT);
+        }
+
+        int hr = client.Start();
+        if (hr != WasapiConstants.S_OK)
+        {
+            Fault(hr);
+            return;
+        }
+
+        int channels = ActualChannels;
+        int timeoutMs = Math.Max(250, (int)Math.Ceiling(ActualPeriodMs * 20));
+        var waits = new WaitHandle[] { _frameEvent, _stopRequest.WaitHandle };
+        int consecutiveBufferErrors = 0;
+        long lastEventTicks = Stopwatch.GetTimestamp();
+        double ticksPerMs = Stopwatch.Frequency / 1000.0;
+
+        while (!_stopRequest.IsSet)
+        {
+            int signaled = WaitHandle.WaitAny(waits, timeoutMs);
+            if (signaled == 1) break;
+            if (signaled == WaitHandle.WaitTimeout)
+            {
+                int phr = client.GetCurrentPadding(out _);
+                if (IsFatal(phr)) { Fault(phr); break; }
+                if ((Stopwatch.GetTimestamp() - lastEventTicks) / ticksPerMs > StallMs)
+                {
+                    WasapiDiagnostics.Log($"[WASAPI] render {_label}: no exclusive buffer event for {StallMs:0} ms — stalled");
+                    Fault(WasapiConstants.AUDCLNT_E_STALLED);
+                    break;
+                }
+                continue;
+            }
+            lastEventTicks = Stopwatch.GetTimestamp();
+
+            hr = renderService.GetBuffer(bufferFrames, out var dataPtr);
+            if (hr == WasapiConstants.AUDCLNT_E_BUFFER_ERROR)
+            {
+                if (++consecutiveBufferErrors >= 3) { Fault(hr); break; }
+                continue;
+            }
+            if (hr != WasapiConstants.S_OK)
+            {
+                if (IsFatal(hr)) { Fault(hr); break; }
+                continue;
+            }
+            consecutiveBufferErrors = 0;
+
+            int samples = (int)bufferFrames * channels;
+            if (scratch.Length < samples)
+            {
+                scratch = new float[Math.Max(samples, Math.Max(256, scratch.Length * 2))];
+            }
+
+            bool silent = false;
+            try
+            {
+                int read = _provider!.Read(scratch, 0, samples);
+                if (read < samples) Array.Clear(scratch, read, samples - read);
+            }
+            catch
+            {
+                Interlocked.Increment(ref _providerErrors);
+                silent = true;
+            }
+
+            if (!silent) converter.WriteToDevice(scratch, samples, dataPtr);
+            hr = renderService.ReleaseBuffer(bufferFrames, silent ? WasapiConstants.BUFFERFLAGS_SILENT : 0u);
+            if (IsFatal(hr)) { Fault(hr); break; }
+        }
+    }
+
     private bool TryLadderInit(ref IMMDeviceEnumerator? enumerator, ref IMMDevice? device,
         ref IAudioClient? client, out IAudioClient3? client3,
         out IAudioRenderClient? renderService, out SampleConverter? converter,
@@ -348,10 +456,51 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                 var info = WasapiFormat.Parse(mixFmt);
                 if (info.SampleRate <= 0 || info.Channels <= 0) return false;
 
+                // ---- R0: exclusive event-driven stream at the device minimum period ----
+                if (_exclusiveWanted && (_exclusiveAttempts == 0 || _exclusiveRetryPending) && _exclusiveAttempts < 2)
+                {
+                    _exclusiveAttempts++;
+                    bool retry = _exclusiveRetryPending;
+                    _exclusiveRetryPending = false;
+                    hr = WasapiExclusive.TryInitialize(client, info.SampleRate, info.Channels,
+                        retry ? _exclusiveAlignedPeriod : 0, out var exFmt, out var exInfo, out var usedPeriod, out var fmtLabel);
+                    if (hr == WasapiConstants.S_OK)
+                    {
+                        bool ok;
+                        try
+                        {
+                            ok = FinishInit(client, null, exFmt, exInfo, ref renderService, ref converter, ref bufferFrames);
+                        }
+                        finally
+                        {
+                            Marshal.FreeCoTaskMem(exFmt);
+                        }
+                        if (ok)
+                        {
+                            _exclusive = true;
+                            Tier = EndpointTier.Exclusive;
+                            ActualPeriodMs = usedPeriod / 10_000.0;
+                            WasapiDiagnostics.Log($"[WASAPI] out {_label}: EXCLUSIVE {fmtLabel} period {ActualPeriodMs:0.##} ms buffer {bufferFrames} frames");
+                            return true;
+                        }
+                        ExclusiveRefusal = "exclusive stream opened but could not be serviced";
+                        continue;
+                    }
+                    if (hr == WasapiConstants.AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED && !retry)
+                    {
+                        _exclusiveAlignedPeriod = WasapiExclusive.AlignedPeriod100ns(client, info.SampleRate);
+                        if (_exclusiveAlignedPeriod > 0) { _exclusiveRetryPending = true; continue; }
+                    }
+                    ExclusiveRefusal = WasapiConstants.DescribeExclusiveFailure(hr);
+                    WasapiDiagnostics.Log($"[WASAPI] out {_label}: exclusive rung skipped — {ExclusiveRefusal}");
+                    continue; // shared ladder on a fresh client
+                }
+                int sharedAttempt = attempt - _exclusiveAttempts;
+
                 bool smallPeriodWanted = _requestedTier is EndpointTier.MinPeriod or EndpointTier.DoublePeriod
                                          && client3 is not null
                                          && info.Encoding != MixEncoding.Other
-                                         && attempt == 0;
+                                         && sharedAttempt == 0;
 
                 if (smallPeriodWanted)
                 {
@@ -428,7 +577,7 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                         ref renderService, ref converter, ref bufferFrames);
                 }
 
-                if (hr == WasapiConstants.AUDCLNT_E_UNSUPPORTED_FORMAT && attempt < 3)
+                if (hr == WasapiConstants.AUDCLNT_E_UNSUPPORTED_FORMAT && sharedAttempt < 3)
                 {
                     // Rare: mix format rejected for streaming — hand Windows our float
                     // format and let it convert. Fresh client first.
@@ -455,7 +604,7 @@ internal sealed class WasapiRenderClient : IRenderEndpoint
                     }
                 }
 
-                if (attempt >= 3) return false; // R4: out of rungs
+                if (sharedAttempt >= 3) return false; // R4: out of rungs
             }
             finally
             {

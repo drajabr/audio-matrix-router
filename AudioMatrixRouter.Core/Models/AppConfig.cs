@@ -102,6 +102,10 @@ public class AppConfig
     /// <summary>"auto" = custom IAudioClient3 clients with per-device fallback;
     /// "legacy" = NAudio backend (operator kill-switch).</summary>
     public string EngineBackend { get; set; } = "auto";
+    /// <summary>Opt-in exclusive-mode WASAPI streams (outputs and microphones at the
+    /// driver's minimum period). Other apps cannot use those outputs while routing and
+    /// the matrix gain is the only volume control. Off by default.</summary>
+    public bool ExclusiveMode { get; set; }
     public string UiPreferencesJson { get; set; } = "";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
@@ -231,6 +235,7 @@ public class AppConfig
             KeepAlive = previousConfig?.KeepAlive ?? true,
             KeepSystemAwakeWhileRunning = previousConfig?.KeepSystemAwakeWhileRunning ?? false,
             EngineBackend = engine.Backend,
+            ExclusiveMode = engine.ExclusiveMode,
             // Persist the durable preference, else the flag the user's choice set — a
             // master that is currently offline (or parked) must survive the save or it
             // would never be promoted again. Deliberately NOT the runtime master:
@@ -430,6 +435,7 @@ public class AppConfig
     public void ApplyToEngine(Audio.AudioEngine engine)
     {
         engine.SetBackend(EngineBackend);
+        engine.SetExclusiveMode(ExclusiveMode);
         engine.SetInputBufferMs(InputBufferMs > 0 ? InputBufferMs : 10);
         engine.SetOutputBufferMs(Math.Max(0, OutputBufferMs)); // 0 = AUTO
 

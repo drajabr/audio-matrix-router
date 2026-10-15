@@ -42,6 +42,7 @@ public partial class MainWindow : Window
     private int? _pendingBufferMs;
     private readonly DispatcherTimer _uiHeartbeat;
     private string _latencyCaption = "LATENCY";
+    private string _exclusiveTip = "";
     private readonly DispatcherTimer _gainApplyTimer;
     private readonly DispatcherTimer _bufferApplyTimer;
     private bool _showAll;
@@ -696,6 +697,14 @@ public partial class MainWindow : Window
             UpdateCornerVisuals();
         };
 
+        ExclBtn.Click += (_, _) =>
+        {
+            if (_snapshot.Locked) return;
+            try { _controller.SetExclusiveMode(!_snapshot.ExclusiveMode); }
+            catch (Exception ex) { ShowBanner(ex.Message); }
+            RefreshSnapshotAndRebuild();
+        };
+
         MuteBtn.Click += (_, _) =>
         {
             // Transient: deliberately NOT persisted and works while locked.
@@ -732,6 +741,8 @@ public partial class MainWindow : Window
         ToolTip.SetTip(ShowAllBtn, _showAll ? "Hide unconfigured devices" : "Show all discovered devices");
         ViewBtn.Classes.Set("active", _viewMode == "channel");
         ToolTip.SetTip(ViewBtn, _viewMode == "channel" ? "Switch to Device View" : "Switch to Channel View");
+        ExclBtn.Classes.Set("active", _snapshot.ExclusiveMode);
+        UpdateExclusiveTooltip(null);
         MuteBtn.Classes.Set("danger", _mutedAll);
         // speaker-with-wave ↔ muted speaker: near-identical glyph widths, no jump
         MuteBtn.Content = _mutedAll ? "🔇" : "🔊";
@@ -1588,11 +1599,44 @@ public partial class MainWindow : Window
     // metrics (100ms) → peaks, dock, status line
     // =====================================================================
 
+    /// <summary>
+    /// The ⚡ key's tooltip states what exclusive mode means, and when it is requested
+    /// but not in effect, exactly why (loopback source, Windows setting, device in use).
+    /// </summary>
+    private void UpdateExclusiveTooltip(MetricsSnapshot? metrics)
+    {
+        string tip;
+        if (!_snapshot.ExclusiveMode)
+        {
+            tip = "Shared mode: the system's engine periods (10 ms on most devices). Click for exclusive mode — " +
+                  "outputs and microphones open at the driver's minimum period (often 3 ms). While routing, other " +
+                  "apps cannot play to those outputs and the matrix gain is the only volume control.";
+        }
+        else if (metrics is { Running: true, ExclusiveActive: true })
+        {
+            tip = "Exclusive mode ON: every output runs an exclusive stream at its minimum period. Other apps " +
+                  "cannot use these outputs while routing; Windows volume does not apply. Click for shared mode.";
+        }
+        else if (metrics is { Running: true } && !string.IsNullOrEmpty(metrics.ExclusiveBlockedReason))
+        {
+            tip = $"Exclusive mode requested but not in effect: {metrics.ExclusiveBlockedReason}. " +
+                  "Running shared. Click for shared mode.";
+        }
+        else
+        {
+            tip = "Exclusive mode requested (applies when the engine runs). Click for shared mode.";
+        }
+        if (tip == _exclusiveTip) return;
+        _exclusiveTip = tip;
+        ToolTip.SetTip(ExclBtn, tip);
+    }
+
     private void OnMetricsTick()
     {
         MetricsSnapshot metrics;
         try { metrics = _controller.GetMetrics(); }
         catch { return; }
+        UpdateExclusiveTooltip(metrics);
 
         // Peaks into the model arrays: auto-scale per device, then the pow-0.72 display
         // curve (App.jsx autoScaleLevels + shapeMeterLevel).
@@ -1611,7 +1655,9 @@ public partial class MainWindow : Window
         // Tier/period transparency: which WASAPI rung each side achieved.
         var inTier = metrics.Inputs.FirstOrDefault(d => d.PeriodMs > 0);
         if (inTier is not null)
-            ToolTip.SetTip(MetricInLatency, $"Capture cadence {inTier.PeriodMs:0.##}ms · {inTier.TierName}");
+            ToolTip.SetTip(MetricInLatency, inTier.CadenceMs > inTier.PeriodMs + 0.5
+                ? $"Capture cadence {inTier.CadenceMs:0.##}ms measured (stream period {inTier.PeriodMs:0.##}ms) · {inTier.TierName}"
+                : $"Capture cadence {inTier.PeriodMs:0.##}ms · {inTier.TierName}");
         var outTier = metrics.Outputs.FirstOrDefault(d => d.PeriodMs > 0);
         if (outTier is not null)
             ToolTip.SetTip(MetricOutLatency, $"Engine period {outTier.PeriodMs:0.##}ms · {outTier.TierName}");

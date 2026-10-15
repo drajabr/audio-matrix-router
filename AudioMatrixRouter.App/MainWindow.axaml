@@ -396,8 +396,9 @@
                                   PxPerStep="10" Caption="LATENCY" ValueScale="0.72" />
             <Button Name="LockBtn" Classes="key" Grid.Row="0" Grid.Column="3" Content="🔓" />
 
-            <!-- row 2: reload · master gain drum (2×2, big value + small dB suffix) -->
+            <!-- row 2: reload · master gain drum (2×2, big value + small dB suffix) · exclusive-mode toggle -->
             <Button Name="ReloadBtn" Classes="key" Grid.Row="1" Grid.Column="0" Content="↻" />
+            <Button Name="ExclBtn" Classes="key" Grid.Row="1" Grid.Column="3" Content="⚡" />
             <controls:DrumControl Name="GainDrum" Grid.Row="1" Grid.Column="1"
                                   Grid.RowSpan="2" Grid.ColumnSpan="2" Margin="2"
                                   Minimum="-60" Maximum="12" Step="0.5" DefaultValue="0"

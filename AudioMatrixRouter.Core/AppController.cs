@@ -560,6 +560,7 @@ public sealed class AppController : IDisposable
             StartupAtBoot = _startupAtBoot,
             InputBufferMs = Engine.InputBufferMs,
             OutputBufferMs = Engine.OutputBufferMs,
+            ExclusiveMode = Engine.ExclusiveMode,
             InputDeviceMode = _inputDeviceMode,
             Inputs = inputs,
             Outputs = outputs,
@@ -621,6 +622,7 @@ public sealed class AppController : IDisposable
                     : (d.RingBuffer?.TotalFramesDropped ?? 0),
                 SyncCorrections = syncCorrectionsByInput.GetValueOrDefault(d.Info.Id),
                 PeriodMs = d.Capture is { } cap ? Math.Round(cap.ActualPeriodMs, 2) : 0,
+                CadenceMs = Math.Round(d.EffectiveCadenceMs, 2),
                 TierName = d.Capture?.Tier.ToString() ?? ""
             });
         }
@@ -643,6 +645,7 @@ public sealed class AppController : IDisposable
                 FastCatchUpActive = d.MixProvider?.FastCatchUpActive ?? false,
                 FastCatchUpDutyPercent = d.MixProvider?.FastCatchUpDutyPercent ?? 0,
                 PostRecoveryUnderruns = d.MixProvider?.PostRecoveryUnderruns ?? 0,
+                StarvationReanchors = d.MixProvider?.StarvationReanchors ?? 0,
                 PeriodMs = d.Render is { } rnd ? Math.Round(rnd.ActualPeriodMs, 2) : 0,
                 TierName = d.Render?.Tier.ToString() ?? ""
             });
@@ -678,6 +681,8 @@ public sealed class AppController : IDisposable
             LatencyFloorMs = Engine.IsRunning ? budget.FloorTotalMs : 0,
             AutoHeadroomMs = Engine.AutoHeadroomMs,
             SafetyTier = Engine.SafetyTier,
+            ExclusiveActive = Engine.ExclusiveActive,
+            ExclusiveBlockedReason = Engine.ExclusiveBlockedReason,
             Inputs = inputMetrics,
             Outputs = outputMetrics,
             RouteLatencies = routeLatencies
@@ -891,6 +896,14 @@ public sealed class AppController : IDisposable
     public void SetOutputBufferMs(int ms)
     {
         Engine.SetOutputBufferMs(ms);
+        ScheduleSave();
+        RaiseStateChanged();
+    }
+
+    /// <summary>The ⚡ key: exclusive-mode streams on or off (restarts a running engine).</summary>
+    public void SetExclusiveMode(bool enabled)
+    {
+        Engine.SetExclusiveMode(enabled);
         ScheduleSave();
         RaiseStateChanged();
     }

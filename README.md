@@ -121,8 +121,18 @@ Saved fields include:
 
 - Latency: one LATENCY drum. Its lowest position is AUTO: the engine runs at the floor the devices allow
   (about 54 ms end to end on 10 ms shared-mode endpoints) and adds headroom by itself when an input underruns,
-  then takes it back after five clean minutes. Turn the drum up for a manual end-to-end target. The caption
-  always shows the effective value; a trailing + means auto headroom is in effect.
+  then takes it back after five clean minutes, never below the level that last caused a storm in this session.
+  Turn the drum up for a manual end-to-end target. The caption always shows the effective value; a trailing +
+  means auto headroom is in effect.
+  - The capture term of the budget is MEASURED: each input's worst recurring delivery gap (virtual cables
+    deliver in ~16 ms bursts behind a 10 ms period), so the floor is honest per input and every input holds
+    its own ring target. Loopback inputs are event-driven with a silent keep-alive stream; polling is the fallback.
+  - ⚡ Exclusive mode (off by default): outputs and microphones open exclusive-mode streams at the driver's
+    minimum period (3 ms on most devices instead of 10 ms), which roughly halves the end-to-end latency. While
+    routing, other apps cannot play to those outputs and Windows volume does not apply (the matrix gain is the
+    only level). An output that feeds a loopback input stays shared, and exclusive is all-or-nothing across
+    outputs so they keep equal FIFO depth; the key's tooltip says why it is not in effect when it is not.
+    Requires "Allow applications to take exclusive control" in the device's Sound settings (the Windows default).
 
 - Underruns counting up:
 	- Leave LATENCY on AUTO and let the headroom loop settle, or raise it manually. Check the log for

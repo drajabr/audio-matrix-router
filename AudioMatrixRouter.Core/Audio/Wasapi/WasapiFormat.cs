@@ -71,6 +71,40 @@ internal static class WasapiFormat
         _ => MixEncoding.Other,
     };
 
+    /// <summary>
+    /// Builds an integer-PCM WAVEFORMATEXTENSIBLE in CoTaskMem (caller frees with
+    /// Marshal.FreeCoTaskMem). <paramref name="containerBits"/> is the sample size on
+    /// the wire (16, 24 or 32); <paramref name="validBits"/> the significant bits
+    /// (24-in-32 is the HDA favourite). Used by the exclusive-mode rung, where the
+    /// engine's float mix format is not an option.
+    /// </summary>
+    public static IntPtr BuildPcmFormat(int sampleRate, int channels, int containerBits, int validBits)
+    {
+        const int size = 40;
+        IntPtr fmt = Marshal.AllocCoTaskMem(size);
+        int blockAlign = channels * containerBits / 8;
+        Marshal.WriteInt16(fmt, 0, unchecked((short)WAVE_FORMAT_EXTENSIBLE));
+        Marshal.WriteInt16(fmt, 2, (short)channels);
+        Marshal.WriteInt32(fmt, 4, sampleRate);
+        Marshal.WriteInt32(fmt, 8, sampleRate * blockAlign);
+        Marshal.WriteInt16(fmt, 12, (short)blockAlign);
+        Marshal.WriteInt16(fmt, 14, (short)containerBits);
+        Marshal.WriteInt16(fmt, 16, 22);
+        Marshal.WriteInt16(fmt, 18, (short)validBits);
+        Marshal.WriteInt32(fmt, 20, channels == 1 ? 0x4 : channels == 2 ? 0x3 : 0);
+        Marshal.Copy(SubtypePcm.ToByteArray(), 0, fmt + 24, 16);
+        return fmt;
+    }
+
+    /// <summary>The exclusive-mode format candidates, best first. Each is (container
+    /// bits, valid bits, label); the encoding the converter needs follows the container.</summary>
+    public static readonly (int Container, int Valid, string Label)[] ExclusiveCandidates =
+    [
+        (32, 24, "pcm24-in-32"),
+        (24, 24, "pcm24"),
+        (16, 16, "pcm16"),
+    ];
+
     /// <summary>Builds an IEEE-float WAVEFORMATEXTENSIBLE in CoTaskMem (caller frees
     /// with Marshal.FreeCoTaskMem). Used for the default-period AUTOCONVERTPCM rung.</summary>
     public static IntPtr BuildFloatFormat(int sampleRate, int channels)

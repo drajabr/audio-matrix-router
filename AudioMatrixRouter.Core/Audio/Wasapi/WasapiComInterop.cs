@@ -19,6 +19,7 @@ internal static class WasapiConstants
 
     // AUDCLNT_SHAREMODE
     public const int AUDCLNT_SHAREMODE_SHARED = 0;
+    public const int AUDCLNT_SHAREMODE_EXCLUSIVE = 1;
 
     // AUDCLNT_STREAMFLAGS_*
     public const uint STREAMFLAGS_EVENTCALLBACK = 0x00040000;
@@ -35,6 +36,13 @@ internal static class WasapiConstants
     public const int E_NOINTERFACE = unchecked((int)0x80004002);
     public const int E_INVALIDARG = unchecked((int)0x80070057);
     public const int AUDCLNT_E_DEVICE_INVALIDATED = unchecked((int)0x88890004);
+    public const int AUDCLNT_E_DEVICE_IN_USE = unchecked((int)0x8889000A);
+    public const int AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED = unchecked((int)0x8889000E);
+    public const int AUDCLNT_E_ENDPOINT_CREATE_FAILED = unchecked((int)0x8889000F);
+    public const int AUDCLNT_E_BUFDURATION_PERIOD_NOT_EQUAL = unchecked((int)0x88890013);
+    public const int AUDCLNT_E_BUFFER_SIZE_ERROR = unchecked((int)0x88890016);
+    public const int AUDCLNT_E_CPUUSAGE_EXCEEDED = unchecked((int)0x88890017);
+    public const int AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED = unchecked((int)0x88890019);
     public const int AUDCLNT_E_UNSUPPORTED_FORMAT = unchecked((int)0x88890008);
     public const int AUDCLNT_E_BUFFER_ERROR = unchecked((int)0x88890018);
     public const int AUDCLNT_E_INVALID_DEVICE_PERIOD = unchecked((int)0x88890020);
@@ -50,6 +58,19 @@ internal static class WasapiConstants
     public static readonly Guid IID_IAudioClient3 = new("7ED4EE07-8E67-4CD4-8C1A-2B7A5987AD42");
     public static readonly Guid IID_IAudioRenderClient = new("F294ACFC-3146-4483-A7BF-ADDCA7C260E2");
     public static readonly Guid IID_IAudioCaptureClient = new("C8ADBD64-E71E-48A0-A4DE-185C395CD317");
+
+    /// <summary>Short human text for the exclusive-mode refusal codes (tooltip material).</summary>
+    public static string DescribeExclusiveFailure(int hr) => hr switch
+    {
+        AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => "refused by Windows: enable 'Allow applications to take exclusive control' in the device's Sound settings",
+        AUDCLNT_E_DEVICE_IN_USE => "device in use by another exclusive-mode application",
+        AUDCLNT_E_UNSUPPORTED_FORMAT => "no PCM format accepted in exclusive mode",
+        AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED => "driver rejected the aligned buffer size",
+        AUDCLNT_E_INVALID_DEVICE_PERIOD => "driver rejected its own minimum period",
+        AUDCLNT_E_CPUUSAGE_EXCEEDED => "Windows CPU-usage limit for exclusive streams exceeded",
+        AUDCLNT_E_ENDPOINT_CREATE_FAILED => "endpoint could not be created in exclusive mode",
+        _ => $"exclusive open failed (0x{hr:X8})",
+    };
 }
 
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"),
@@ -227,6 +248,70 @@ internal static class WasapiActivation
         try { if (client is not null) Marshal.ReleaseComObject(client); } catch { }
         try { if (device is not null) Marshal.ReleaseComObject(device); } catch { }
         try { if (enumerator is not null) Marshal.ReleaseComObject(enumerator); } catch { }
+    }
+}
+
+/// <summary>
+/// Exclusive-mode negotiation shared by the render and capture clients: pick the
+/// first PCM format the driver accepts exactly, then Initialize event-driven with
+/// buffer == period at the device's minimum period (or an aligned period handed
+/// back after AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED). A failed Initialize poisons the
+/// client, so the caller re-activates before any retry.
+/// </summary>
+internal static class WasapiExclusive
+{
+    public static int TryInitialize(IAudioClient client, int sampleRate, int channels,
+        long period100ns, out IntPtr fmt, out WasapiFormatInfo info, out long usedPeriod100ns,
+        out string formatLabel)
+    {
+        fmt = IntPtr.Zero;
+        info = default;
+        usedPeriod100ns = 0;
+        formatLabel = "";
+
+        long period = period100ns;
+        if (period <= 0)
+        {
+            int phr = client.GetDevicePeriod(out _, out var minPeriod);
+            if (phr != WasapiConstants.S_OK || minPeriod <= 0)
+                return phr != WasapiConstants.S_OK ? phr : WasapiConstants.AUDCLNT_E_INVALID_DEVICE_PERIOD;
+            period = minPeriod;
+        }
+
+        foreach (var (container, valid, label) in WasapiFormat.ExclusiveCandidates)
+        {
+            IntPtr candidate = WasapiFormat.BuildPcmFormat(sampleRate, channels, container, valid);
+            int shr = client.IsFormatSupported(WasapiConstants.AUDCLNT_SHAREMODE_EXCLUSIVE, candidate, out var closest);
+            if (closest != IntPtr.Zero) Marshal.FreeCoTaskMem(closest);
+            if (shr == WasapiConstants.S_OK)
+            {
+                fmt = candidate;
+                formatLabel = label;
+                break;
+            }
+            Marshal.FreeCoTaskMem(candidate);
+        }
+        if (fmt == IntPtr.Zero) return WasapiConstants.AUDCLNT_E_UNSUPPORTED_FORMAT;
+
+        int hr = client.Initialize(WasapiConstants.AUDCLNT_SHAREMODE_EXCLUSIVE,
+            WasapiConstants.STREAMFLAGS_EVENTCALLBACK, period, period, fmt, IntPtr.Zero);
+        if (hr != WasapiConstants.S_OK)
+        {
+            Marshal.FreeCoTaskMem(fmt);
+            fmt = IntPtr.Zero;
+            return hr;
+        }
+        info = WasapiFormat.Parse(fmt);
+        usedPeriod100ns = period;
+        return WasapiConstants.S_OK;
+    }
+
+    /// <summary>After AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED the (poisoned) client still answers
+    /// GetBufferSize with the aligned frame count; convert it back to a period.</summary>
+    public static long AlignedPeriod100ns(IAudioClient client, int sampleRate)
+    {
+        if (client.GetBufferSize(out var frames) != WasapiConstants.S_OK || frames == 0 || sampleRate <= 0) return 0;
+        return (long)Math.Round(10_000_000.0 * frames / sampleRate);
     }
 }
 

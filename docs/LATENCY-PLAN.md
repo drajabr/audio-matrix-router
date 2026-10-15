@@ -1,5 +1,28 @@
 # Latency plan: exclusive-mode toggle and the real floor
 
+**Status (v0.6.0):** Phases A, B, C0 and C are implemented. L1 measured cadence (`CadenceTracker`, raised live by
+the health tick), L2 event-driven loopback with keep-alive (`WasapiCaptureClient.CaptureMode.EventLoopback`),
+L3 AUTO decay memory, L4 per-input ring targets (`RingBuffer.FillTargetFrames`, fill-surplus barrier), and the
+L5 ⚡ exclusive toggle (`AppConfig.ExclusiveMode`, rungs R0/C0 in the WASAPI clients, all-or-nothing across
+outputs). Phase D (raw mode, MMCSS critical, mixed exclusive/shared outputs) remains open.
+
+Measured on the development machine after implementation (Intel mic + VB-Cable loopback → Realtek, AUTO,
+14 s runs, app process posture):
+
+| Configuration | Effective total | Mic route | Loopback route | Underruns after start-up |
+|---|---|---|---|---|
+| Shared (before) | 54 advertised, 64 to 84 real | — | — | storms every few minutes |
+| Shared (now) | 58 | 44 to 48 | 66 | 0 |
+| Exclusive, mic only | 18 | 15 to 19 | — | 0 |
+| Exclusive, mic + loopback | 46 | 16 to 19 | 44 to 55 | 0 |
+
+A root cause found during implementation, fixed in the provider and worth recording: the "skip late data to
+stay on the timeline" realign rule was self-sustaining. Once a live source fell one render gulp behind, every
+arriving frame was skipped and every block added a fresh shortfall, so the ring sat at zero with one underrun
+per block until something (a headroom hold) handed the producer a head start. That is the 54 → 84 → 54 cycle
+in the field log. A starved live source now re-anchors its ring to target for every consumer at once
+(`MixingSampleProvider.StarvationReanchors`).
+
 Companion to `FIX-PLAN.md`. Scope: lower end-to-end latency as far as the hardware allows, with every change
 either globally safe (on by default) or behind a toggle that is off by default. All numbers below were measured
 on the development machine on 2026-10-13 (Windows 11, NVIDIA HDMI sinks, Realtek, VB-Cable, Intel mic array)

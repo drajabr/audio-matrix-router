@@ -94,7 +94,8 @@ public sealed class OutputSyncCoordinator
     {
         public int DeviceSampleRate;
         public int HoldTargetFrames;        // engine frames of ring fill required to release barrier
-        public int BufferedFrames = -1;     // last reported ring fill (engine frames); -1 = no report yet
+        public int FillSurplusFrames;       // min over live rings of (fill - that ring's own target), engine frames
+        public bool HasFillReport;          // false until this consumer's render thread has reported
         public bool HasActiveRoutes;
         public long FramesRendered;         // device frames pushed to WASAPI
         public double LastBlockEngineFrames; // engine frames of the last reported block (projection cap)
@@ -154,7 +155,8 @@ public sealed class OutputSyncCoordinator
             }
             s.TimelinePos = pos;
             s.LastReportTicks = now;
-            s.BufferedFrames = -1;
+            s.FillSurplusFrames = 0;
+            s.HasFillReport = false;
             s.SmoothedErrorFrames = 0;
             s.ErrorInitialized = false;
             s.TrimPpm = 0;
@@ -293,7 +295,8 @@ public sealed class OutputSyncCoordinator
     {
         foreach (var s in _states.Values)
         {
-            s.BufferedFrames = -1;
+            s.FillSurplusFrames = 0;
+            s.HasFillReport = false;
             s.TimelinePos = 0;
             s.LastReportTicks = 0;
             s.SmoothedErrorFrames = 0;
@@ -349,9 +352,9 @@ public sealed class OutputSyncCoordinator
             bool anyReported = false;
             foreach (var s in _states.Values)
             {
-                if (s.BufferedFrames < 0) continue; // render thread not alive yet — don't block on it
+                if (!s.HasFillReport) continue; // render thread not alive yet — don't block on it
                 anyReported = true;
-                if (s.BufferedFrames < Math.Max(1, s.HoldTargetFrames)) return true;
+                if (s.FillSurplusFrames < 0) return true; // some live ring still below ITS target
             }
             if (!anyReported) return true;
 
@@ -390,13 +393,19 @@ public sealed class OutputSyncCoordinator
         }
     }
 
-    public void ReportBufferedFrames(string consumerId, int bufferedFrames)
+    /// <summary>
+    /// Reports min over this consumer's LIVE rings of (fill − that ring's own target),
+    /// in engine frames. Negative while any producing ring is still below its target;
+    /// the barrier releases when every consumer reports a non-negative surplus.
+    /// </summary>
+    public void ReportFillSurplusFrames(string consumerId, int surplusFrames)
     {
         lock (_lock)
         {
             if (_states.TryGetValue(consumerId, out var s))
             {
-                s.BufferedFrames = Math.Max(0, bufferedFrames);
+                s.FillSurplusFrames = surplusFrames;
+                s.HasFillReport = true;
             }
         }
     }
@@ -656,8 +665,8 @@ public sealed class OutputSyncCoordinator
             if (consumerId == _masterConsumerId) return 0;
             if (!_states.TryGetValue(consumerId, out var s)) return 0;
             if (!_states.TryGetValue(_masterConsumerId, out var m)) return 0;
-            if (s.BufferedFrames < 0 || m.BufferedFrames < 0) return 0;
-            return s.BufferedFrames - m.BufferedFrames;
+            if (!s.HasFillReport || !m.HasFillReport) return 0;
+            return s.FillSurplusFrames - m.FillSurplusFrames;
         }
     }
 
@@ -734,6 +743,19 @@ public class MixingSampleProvider : ISampleProvider
     // ring re-anchors every consumer (idle-resume / join), any pending skip on that
     // source is void: the cursor was placed deliberately and no longer lags a timeline.
     private int[] _anchorGenSeen;
+    // Consecutive blocks on which a LIVE source's pending skip could not be satisfied
+    // because its ring was empty. The realign rule ("skip late data to stay on the
+    // timeline") is self-sustaining once a source is one gulp behind: every arriving
+    // frame is skipped, every block adds a fresh shortfall, and a producer that runs
+    // at exactly realtime can never catch up (the ring sits at ~0 forever, one
+    // underrun per block — the storms seen in the field). After a few such blocks the
+    // ring is re-anchored to its target for EVERY consumer at once: one short silence
+    // on that input, outputs stay mutually aligned, and the ring is at target again.
+    private int[] _starvedBlocksPerSource = [];
+    private const int StarvationReanchorBlocks = 3;
+    private long _starvationReanchors;
+    /// <summary>Ring re-anchors performed because a live source stayed starved (telemetry).</summary>
+    public long StarvationReanchors => Interlocked.Read(ref _starvationReanchors);
     // Engine frames the ring force-advanced this consumer by (overflow trimming) since
     // the last coordinator report. A force-advance IS a skip: it is folded into the
     // timeline instead of being "paid back" by under-consuming, which re-filled the
@@ -912,7 +934,7 @@ public class MixingSampleProvider : ISampleProvider
         float muteLinear = _matrix.TransientMuteAll ? 0f : 1f;
 
         _syncCoordinator.ReportConsumerRouteActivity(_consumerId, HasAnyActiveRouteForThisOutputCore(front, matOutCh));
-        _syncCoordinator.ReportBufferedFrames(_consumerId, GetBufferedFramesForConsumer());
+        _syncCoordinator.ReportFillSurplusFrames(_consumerId, GetFillSurplusFramesForConsumer());
 
         // Start barrier only: prefill all outputs, release together, timelines zero together.
         if (_syncCoordinator.ShouldHoldForGlobalRefill())
@@ -1027,6 +1049,27 @@ public class MixingSampleProvider : ISampleProvider
                         _inputSyncDiscardedFramesByDevice.AddOrUpdate(src.DeviceId, skipped, (_, cur) => cur + skipped);
                     }
                 }
+
+                // Still owed a skip with a live producer: the deadlock described above.
+                if (_pendingSkipPerSource[srcIdx] > 0 && src.Buffer.IsProducerLive())
+                {
+                    if (++_starvedBlocksPerSource[srcIdx] >= StarvationReanchorBlocks)
+                    {
+                        src.Buffer.ReanchorAllConsumers(src.Buffer.FillTargetFrames);
+                        _anchorGenSeen[srcIdx] = src.Buffer.AnchorGeneration;
+                        _pendingSkipPerSource[srcIdx] = 0;
+                        _starvedBlocksPerSource[srcIdx] = 0;
+                        Interlocked.Increment(ref _starvationReanchors);
+                    }
+                }
+                else
+                {
+                    _starvedBlocksPerSource[srcIdx] = 0;
+                }
+            }
+            else
+            {
+                _starvedBlocksPerSource[srcIdx] = 0;
             }
 
             int srcSamples = sourceFramesNeeded * src.Channels;
@@ -1181,6 +1224,12 @@ public class MixingSampleProvider : ISampleProvider
         {
             _framesReadPerSource = new int[Math.Max(sourceCount, _framesReadPerSource.Length * 2)];
         }
+        if (_starvedBlocksPerSource.Length < sourceCount)
+        {
+            var grown = new int[Math.Max(sourceCount, _starvedBlocksPerSource.Length * 2)];
+            Array.Copy(_starvedBlocksPerSource, grown, _starvedBlocksPerSource.Length);
+            _starvedBlocksPerSource = grown;
+        }
         if (_pendingSkipPerSource.Length < sourceCount)
         {
             var grown = new long[Math.Max(sourceCount, _pendingSkipPerSource.Length * 2)];
@@ -1237,9 +1286,15 @@ public class MixingSampleProvider : ISampleProvider
         _syncCoordinator.RemoveConsumer(_consumerId);
     }
 
-    private int GetBufferedFramesForConsumer()
+    /// <summary>
+    /// Min over live rings of (available − that ring's <see cref="RingBuffer.FillTargetFrames"/>).
+    /// Each input has its own target (its own cadence), so a 2 ms microphone is not held
+    /// to a bursty virtual cable's floor. Returns −1 while no ring is producing, which
+    /// keeps the barrier closed until captures deliver (the watchdog bounds the wait).
+    /// </summary>
+    private int GetFillSurplusFramesForConsumer()
     {
-        if (_sources.Count == 0) return 0;
+        if (_sources.Count == 0) return -1;
         int min = int.MaxValue;
         bool anyLive = false;
         for (int i = 0; i < _sources.Count; i++)
@@ -1252,10 +1307,10 @@ public class MixingSampleProvider : ISampleProvider
             var ring = _sources[i].Buffer;
             if (!ring.HasProducerWritten || !ring.IsProducerLive(500)) continue;
             anyLive = true;
-            int available = ring.GetAvailableFrames(_consumerId);
-            if (available < min) min = available;
+            int surplus = ring.GetAvailableFrames(_consumerId) - Math.Max(1, ring.FillTargetFrames);
+            if (surplus < min) min = surplus;
         }
-        if (!anyLive || min == int.MaxValue) return 0;
+        if (!anyLive || min == int.MaxValue) return -1;
         return min;
     }
 

@@ -11,6 +11,49 @@ public class LatencyBudgetTests
         new(knob, 10, 10, 22, headroom, safety);
 
     [Fact]
+    public void Exclusive_RenderIsTwoPeriods_AndNeverReallocates()
+    {
+        // 3 ms exclusive endpoints, 3 ms exclusive microphone: buffer == period.
+        var b = LatencyBudget.Compute(new LatencyBudgetInput(0, 3, 3, 3, 0, 0, ExclusiveRender: true));
+        Assert.Equal(3, b.RenderPaddingMs);
+        Assert.Equal(6, b.RenderLatencyMs);
+        Assert.Equal(9, b.RingFloorMs);               // gulp 3 + cadence 3 + one period of jitter margin
+        Assert.Equal(18, b.EffectiveTotalMs);         // 3 + 9 + 6
+        Assert.False(b.NeedsReallocation);
+
+        // Safety tier cannot pad the exclusive FIFO; it lands in the ring instead.
+        var safe = LatencyBudget.Compute(new LatencyBudgetInput(0, 3, 3, 3, 0, 1, ExclusiveRender: true));
+        Assert.Equal(3, safe.RenderPaddingMs);
+        Assert.Equal(12, safe.RingFloorMs);
+        Assert.False(safe.NeedsReallocation);
+    }
+
+    [Fact]
+    public void MeasuredCadence_RaisesTheFloorHonestly()
+    {
+        // A virtual cable measured at 17 ms behind its 10 ms period.
+        var b = LatencyBudget.Compute(new LatencyBudgetInput(0, 17, 10, 22, 0, 0));
+        Assert.Equal(12 + 17, b.RingFloorMs);
+        Assert.Equal(17 + 29 + 22, b.EffectiveTotalMs);
+    }
+
+    [Fact]
+    public void PerInputRingTarget_UsesThatInputsCadence()
+    {
+        var input = new LatencyBudgetInput(0, 17, 10, 22, 0, 0); // worst input: 17 ms cable
+        var b = LatencyBudget.Compute(input);
+        Assert.Equal(29, b.RingTargetMs);                                  // worst input
+        Assert.Equal(12 + 2, LatencyBudget.RingTargetForCadenceMs(input, b, 2));   // a 2 ms mic beside it
+        Assert.Equal(29, LatencyBudget.RingTargetForCadenceMs(input, b, 17));
+
+        // Manual knob: every input lands on the same end-to-end total.
+        var manual = new LatencyBudgetInput(120, 17, 10, 22, 0, 0);
+        var m = LatencyBudget.Compute(manual);
+        int micRing = LatencyBudget.RingTargetForCadenceMs(manual, m, 2);
+        Assert.Equal(120, 2 + micRing + m.RenderLatencyMs);
+    }
+
+    [Fact]
     public void Auto_RunsAtTheFloor()
     {
         var b = LatencyBudget.Compute(Typical(0));
